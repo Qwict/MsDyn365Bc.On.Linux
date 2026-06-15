@@ -868,6 +868,24 @@ else
     log_step "Cleared test framework global entries (will re-publish via dev endpoint)"
 fi
 
+# Restore a precompiled application snapshot after clearing apps and before NST starts.
+if [ -n "${BC_RESTORE_SNAPSHOT:-}" ]; then
+    SNAP_BAK=${BC_RESTORE_SNAPSHOT}
+    case "$SNAP_BAK" in
+        */*) ;;
+        *) SNAP_BAK="/bc/app-snapshots/${SNAP_BAK}.bak" ;;
+    esac
+    if [ -f "$SNAP_BAK" ]; then
+        log_step "Restoring precompiled application snapshot: $SNAP_BAK"
+        SQL_SERVER="$SQL_SERVER" BC_DB_USER="$BC_DB_USER" BC_DB_PASSWORD="$BC_DB_PASSWORD" \
+            BC_DB_NAME="CRONUS" SQLCMD_TLS="$SQLCMD_TLS" \
+            python3 /bc/scripts/management-publish.py restore --bak "$SNAP_BAK"
+    else
+        log_step "ERROR: BC_RESTORE_SNAPSHOT was not found: $SNAP_BAK"
+        exit 1
+    fi
+fi
+
 # Service user for scripting/OData/dev endpoint/web client sign-in (SUPER access).
 # Username defaults to BCRUNNER (not ADMIN) so tests can freely create/delete/disable
 # an "ADMIN" user; override via BC_SERVER_USERNAME/BC_SERVER_PASSWORD (docker-compose.yml
