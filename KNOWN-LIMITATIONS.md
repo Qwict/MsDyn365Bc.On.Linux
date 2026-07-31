@@ -75,3 +75,47 @@ The Misc tests do not validate rendered image content.
 - Local benchmark run 2026-04-04 stack trace:
   `PipelinePerformanceComparison/benchmark-results/local-20260404/bc-container.log`
 - GitHub Actions run 23974655275 (same crash pattern, same offending test)
+
+## Data Encryption Mgmt. tests (Tests-Misc CU 132569) — 7 failures, by design
+
+**Root cause (was)**: `TenantEncryptionProviderFactory.GetTenantEncryptionProvider`
+(Nav.Ncl.dll) — the factory AL's `ENCRYPT`/`DECRYPT`, `IsolatedStorage(Encrypted=true)`,
+and Data Encryption Management (System App codeunit 1266/1279) all resolve their key
+through — is a completely separate path from Patch #7's
+`DefaultServerInstanceRsaEncryptionProviderFactory` (SQL connection-string password
+only). Left unpatched it returned a real `TenantRsaEncryptionProvider` whose
+`CreateKey()` threw `NavEncryptionNotCreatedException`
+("An encryption key is required to complete the request."), failing any AL code
+that touches encryption — not just this test codeunit.
+
+**Fix**: Patch #26 hooks the factory to always return the same pass-through
+`ISystemEncryptionProvider` proxy Patch #7 builds (`IsKeyPresent`/`IsKeyCreated`
+always `true`, `Encrypt`/`Decrypt` pass the value through unchanged,
+`CreateKey`/`DeleteKey`/`ImportKey`/`ExportKey` no-op). This is a deliberate
+"good enough to not crash" fake, not real cryptography — see the Patch #26 header
+comment in `StartupHook.cs`.
+
+**Caveat — applied on a 20s delay, not at Nav.Ncl load time**: at assembly-load
+time the target method has never been called, so its precode still points at a
+shared not-yet-JIT-compiled stub; JMP-hooking that address hijacked every *other*
+method resolving through the same shared stub on first call, observed as an
+unrelated NST boot crash (`PlatformNotSupportedException` in
+`NavDirectorySecurity.CreateSecurityForDomainDirectory`, reached via
+`NavSystemTenant..ctor` during system tenant bootstrap). Deferring the hook a few
+seconds avoids the collision. If you see boot crashes with an ACL/`TempPathHelper`
+stack trace, suspect this class of hook timing issue before anything else.
+
+**Residual failures (expected, not regressions)**: because "is a key present"
+always reports `true` and `Encrypt`/`Decrypt` don't actually transform data, 7 of
+21 subtests in CU 132569 still fail — they specifically assert the
+enabled/disabled toggle and that ciphertext differs from plaintext, which a
+pass-through fake structurally cannot satisfy:
+`EncryptThrowsErrorWhenEncryptionIsNotEnabled`,
+`DecryptThrowsErrorWhenEncryptionIsNotEnabled`, `EncryptDecryptText`,
+`TestEncryptionMgmtPageOpenWhenEncryptionIsDisabled`,
+`TestEncryptionMgmtPageOpenWhenEncryptionIsEnabled`,
+`TestEnableEncryptionInEncryptionMgmtPage`,
+`TestDisableEncryptionInEncryptionMgmtPage`. The other 14 subtests (hashing,
+blob content hash, etc.) pass. Real encryption semantics (actual AES/RSA,
+genuine key provisioning, toggle support) would need Patch #7's original
+"real work" scope — flagged as infra work, not attempted here.

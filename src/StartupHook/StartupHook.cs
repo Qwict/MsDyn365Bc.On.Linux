@@ -81,6 +81,20 @@ using System.Threading.Tasks;
 ///   breakpoint fails. Fix: return true (treat null session as closed/disposed) so the `||`
 ///   short-circuits before the bad dereference and ExecuteClientCall takes its safe path.
 ///
+/// Patch #26: TenantEncryptionProviderFactory.GetTenantEncryptionProvider (Nav.Ncl.dll)
+///   AL's ENCRYPT/DECRYPT, IsolatedStorage(Encrypted=true), and Data Encryption Management
+///   (System App codeunit 1266/1279) all resolve their key through this factory, which is a
+///   completely separate path from Patch #7's DefaultServerInstanceRsaEncryptionProviderFactory
+///   (that one only fakes the SQL connection-string password provider). Left unpatched, this
+///   factory returns a real TenantRsaEncryptionProvider whose CreateKey() depends on
+///   Windows-only key storage and throws SystemEncryptionEncryptionKeyNotCreated ("An
+///   encryption key is required to complete the request."), failing every Data Encryption
+///   Mgmt. test (EncryptDecryptText, TestEnableEncryptionInEncryptionMgmtPage, etc.).
+///   Fix: hook the factory to always return the same pass-through ISystemEncryptionProvider
+///   proxy Patch #7 already builds (extended to no-op CreateKey/DeleteKey/ImportKey/ExportKey
+///   too), so "encryption" always reports enabled/present and Encrypt/Decrypt round-trip as
+///   plain text. Good enough for tests to stop erroring; not real cryptography.
+///
 /// JMP hooks work ONLY on BC methods (JIT-compiled). BCL methods are ReadyToRun pre-compiled
 /// and cannot be patched this way.
 /// </summary>
@@ -290,6 +304,29 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
             PatchAzureADGraphQuery(args.LoadedAssembly);
+        }
+
+        // Patch #26: TenantEncryptionProviderFactory.GetTenantEncryptionProvider bypass.
+        //   See header comment for the full story — this is the factory AL ENCRYPT/DECRYPT,
+        //   IsolatedStorage(Encrypted=true), and Data Encryption Management actually use,
+        //   distinct from Patch #7's SQL-password-only factory.
+        //   Applied on a short delay, NOT synchronously here: at Nav.Ncl-load time this
+        //   method has never been called, so its precode still points at a shared
+        //   not-yet-JIT-compiled stub. JMP-hooking that address hijacks every OTHER
+        //   method that resolves through the same shared stub on first call — observed
+        //   as a totally unrelated crash during system tenant bootstrap (ACL/
+        //   TempPathHelper.InitializeFolders, PlatformNotSupportedException) that killed
+        //   the whole NST process. Deferring a few seconds lets normal boot activity
+        //   JIT-compile things first, so by the time we hook, the target's precode
+        //   resolves to its own unique compiled code instead of a shared trampoline.
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            var nclAssembly = args.LoadedAssembly;
+            _ = Task.Delay(TimeSpan.FromSeconds(20)).ContinueWith(_ =>
+            {
+                try { PatchTenantEncryptionProvider(nclAssembly); }
+                catch (Exception ex) { Console.WriteLine($"[StartupHook] Patch #26 deferred apply failed: {ex.GetType().Name}: {ex.Message}"); }
+            });
         }
 
         // Patch #20: SideService watchdog — the entrypoint replaces the Reporting Service
@@ -1970,12 +2007,20 @@ internal class StartupHook
                 "Encrypt" or "Decrypt" => args?[0], // pass-through
                 "get_IsKeyPresent" or "get_IsKeyCreated" => true,
                 "get_PublicKey" => "<RSAKeyValue><Modulus>xbzyD+SGxykyAv82XOEFtDzWEIok0MM5SAc+CS6Mq0W5LwiyXeakWyblq1XgYi3CDu700986ZVRi4KJjruZlzBeZ7IWXD4lEEpTCRuqoxasRTnwVpyVqGuHclJAnUpjeBS6HvaS/iesYWwxZcmlsmzJHvF3hXdDmLj+8GSKgo4IhschPCIpnoH8+FREX++VpwfZH1ejMk5Izds/ZI70Xc/OWfRfaYy3rtCFeZQ1R5T1AhlNJDgpn0a1oP86F8yDGYawB2GJKIewdcWE8usu4QesrFnlS1g/IJcFXe71/TiJjryqRJPk8ze3Jh9+atx57OnI4R3QvuM/lQ7YoN1RVjw==</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>",
+                // Patch #26: CreateKey/DeleteKey/ImportKey/ExportKey/Dispose are all void —
+                // IsKeyPresent/IsKeyCreated already report true, so callers never actually
+                // need these to do anything real.
+                "CreateKey" or "DeleteKey" or "ImportKey" or "ExportKey" or "Dispose" => null,
                 _ => null,
             };
             if (targetMethod?.Name == "Decrypt" || targetMethod?.Name == "Encrypt")
             {
                 _encryptionBypassed = true;
                 Console.WriteLine($"[StartupHook] Encryption.{targetMethod.Name}() called — bypass working");
+            }
+            else if (targetMethod?.Name == "CreateKey")
+            {
+                Console.WriteLine("[StartupHook] Patch #26: Encryption.CreateKey() called — no-op (already \"has a key\")");
             }
             return result;
         }
@@ -2484,6 +2529,90 @@ internal class StartupHook
     private static void Replacement_AzureADGraphQueryCtor(object self, object? session)
     {
         Console.WriteLine("[StartupHook] Patch #22: AzureADGraphQuery..ctor skipped (no Azure AD on Linux)");
+    }
+
+    // ========================================================================
+    // Patch #26: TenantEncryptionProviderFactory.GetTenantEncryptionProvider bypass.
+    // See header comment for the full story.
+    // ========================================================================
+
+    private static void PatchTenantEncryptionProvider(Assembly navNcl)
+    {
+        if (IsPatchDisabled("26")) return;
+        try
+        {
+            var factoryType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.Encryption.TenantEncryptionProviderFactory");
+            if (factoryType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #26: TenantEncryptionProviderFactory not found — skipping");
+                return;
+            }
+
+            var original = factoryType.GetMethod("GetTenantEncryptionProvider",
+                BindingFlags.Static | BindingFlags.Public);
+            if (original == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #26: GetTenantEncryptionProvider not found — skipping");
+                return;
+            }
+
+            if (!EnsureNoOpEncryptionProvider())
+            {
+                Console.WriteLine("[StartupHook] Patch #26: could not build pass-through encryption proxy — skipping");
+                return;
+            }
+
+            var replacement = typeof(StartupHook).GetMethod(
+                nameof(Replacement_GetTenantEncryptionProvider),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(original, replacement, "TenantEncryptionProviderFactory.GetTenantEncryptionProvider");
+            Console.WriteLine("[StartupHook] Patch #26: GetTenantEncryptionProvider hooked — AL encryption always \"enabled\", never real");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #26 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Builds _noopEncryptionProvider if Patch #7 hasn't already (assembly load order between
+    /// Nav.Ncl and Nav.Types isn't guaranteed), so this patch works no matter which loads first.
+    /// </summary>
+    private static bool EnsureNoOpEncryptionProvider()
+    {
+        if (_noopEncryptionProvider != null) return true;
+        try
+        {
+            Assembly? navTypesAsm = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Types");
+            if (navTypesAsm == null) return false;
+
+            Type? encIfaceType = navTypesAsm.GetType("Microsoft.Dynamics.Nav.Types.ISystemEncryptionProvider");
+            if (encIfaceType == null) return false;
+
+            var createProxy = typeof(DispatchProxy)
+                .GetMethod("Create", 2, Type.EmptyTypes)!
+                .MakeGenericMethod(encIfaceType, typeof(PassthroughEncryptionProxy));
+            _noopEncryptionProvider = createProxy.Invoke(null, null);
+            return _noopEncryptionProvider != null;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #26: EnsureNoOpEncryptionProvider failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Replacement for TenantEncryptionProviderFactory.GetTenantEncryptionProvider(Func&lt;NavSession&gt;).
+    /// Signature: static method, one reference-type param, reference-type return — matches the
+    /// JMP-hook calling convention (both slots are object-sized pointers regardless of the
+    /// original's declared Func&lt;NavSession&gt;/ISystemEncryptionProvider types).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static object? Replacement_GetTenantEncryptionProvider(object? activeSessionProvider)
+    {
+        return _noopEncryptionProvider;
     }
 
     // ========================================================================
