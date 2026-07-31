@@ -65,24 +65,22 @@ jobs:
           echo "Auto-discovering BC versions >= $OLDEST from Microsoft's artifact index..."
           VERSIONS=$(curl -sf --retry 3 --retry-delay 2 \
               "https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net/sandbox/indexes/w1.json" | \
-            OLDEST="$OLDEST" python3 -c "
-          import json, os, sys
-          oldest = tuple(int(x) for x in os.environ['OLDEST'].split('.'))
-          data = json.load(sys.stdin)
-          majors = set()
-          for d in data:
-              v = d.get('Version', '')
-              parts = v.split('.')
-              if len(parts) < 2:
-                  continue
-              try:
-                  key = (int(parts[0]), int(parts[1]))
-              except ValueError:
-                  continue
-              if key >= oldest:
-                  majors.add(key)
-          print(','.join('%d.%d' % m for m in sorted(majors)))
-          ")
+            OLDEST="$OLDEST" python3 -c "import json, os, sys
+        oldest = tuple(int(x) for x in os.environ['OLDEST'].split('.'))
+        data = json.load(sys.stdin)
+        majors = set()
+        for d in data:
+            parts = d.get('Version', '').split('.')
+            if len(parts) < 2:
+                continue
+            try:
+                key = (int(parts[0]), int(parts[1]))
+            except ValueError:
+                continue
+            if key >= oldest:
+                majors.add(key)
+        print(','.join('%d.%d' % m for m in sorted(majors)))
+        ")
           if [ -z "$VERSIONS" ]; then
             echo "ERROR: could not auto-discover BC versions from the artifact index" >&2
             exit 1
