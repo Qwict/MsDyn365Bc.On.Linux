@@ -110,6 +110,11 @@ if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
     mkdir -p "/usr/share/Microsoft/Microsoft Dynamics NAV/$NAV_DIR/Server"
 
     # Patch CustomSettings.config
+    # ManagementServicesEnabled is forced off: with it on, NST crashes at startup
+    # (Microsoft.IdentityModel.S2S.Configuration.ConfigurationException: S2S40011 -
+    # "At least one inbound policy should be provided") because the Admin API's AAD
+    # S2S auth has no configured policy. The dev/OData/SOAP/WebSocket endpoints this
+    # image actually needs don't depend on the Admin API.
     CONFIG="$SERVICE_DIR/CustomSettings.config"
     sed -i \
         -e "s|DatabaseServer\" value=\"[^\"]*\"|DatabaseServer\" value=\"$SQL_SERVER\"|" \
@@ -125,6 +130,7 @@ if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
         -e "s|ODataServicesPort\" value=\"[^\"]*\"|ODataServicesPort\" value=\"7048\"|" \
         -e "s|ManagementServicesPort\" value=\"[^\"]*\"|ManagementServicesPort\" value=\"7045\"|" \
         -e "s|ManagementApiServicesPort\" value=\"[^\"]*\"|ManagementApiServicesPort\" value=\"7086\"|" \
+        -e "s|ManagementServicesEnabled\" value=\"[^\"]*\"|ManagementServicesEnabled\" value=\"false\"|" \
         -e "s|DeveloperServicesPort\" value=\"[^\"]*\"|DeveloperServicesPort\" value=\"7049\"|" \
         -e "s|ServerInstance\" value=\"[^\"]*\"|ServerInstance\" value=\"BC\"|" \
         -e "s|ExtensionAllowedTargetLevel\" value=\"[^\"]*\"|ExtensionAllowedTargetLevel\" value=\"OnPrem\"|" \

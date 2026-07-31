@@ -24,7 +24,7 @@ if [ $# -eq 2 ]; then
     # Derive platform URL: replace country segment with "platform"
     PLATFORM_URL=$(echo "$APP_URL" | sed 's|/[^/]*$|/platform|')
 elif [ $# -eq 4 ]; then
-    BC_TYPE="$1"; BC_VERSION="$2"; BC_COUNTRY="$3"; DEST="$4"
+    BC_TYPE="$1"; BC_VERSION="$2"; BC_COUNTRY="${3,,}"; DEST="$4"
     BASE_URL="https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net"
 
     # Resolve short version (e.g. "27.5") to full version (e.g. "27.5.46862.48612)
