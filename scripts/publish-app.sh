@@ -9,18 +9,30 @@
 #
 # Returns 0 on success — meaning either:
 #   - HTTP 200 (fresh publish completed), or
-#   - HTTP 422 with "already" in the body (same version already installed,
-#     which BC reports as 422 even though it isn't a real error).
+#   - HTTP 422 whose body says the extension is already deployed/installed/
+#     published (BC reports that as a 422 even though it isn't a real
+#     error).
 #
 # Returns 1 (and prints a diagnostic dump) for everything else, including
-# any other 4xx/5xx and 422s whose body does NOT contain "already". The
-# most common 422 failure is "missing dependency" — when the .app declares
-# a dependency on another extension that isn't installed in the BC
-# database. The pre-2026 version of this code treated ALL 422s as
+# any other 4xx/5xx and 422s that don't match one of those specific benign
+# phrases. The most common 422 failure is "missing dependency" — when the
+# .app declares a dependency on another extension that isn't installed in
+# the BC database. The pre-2026 version of this code treated ALL 422s as
 # "already installed" and silently swallowed missing-dep failures, which
 # made for many wasted debugging cycles in downstream consumers like
 # bc-copilot-blueprint. Now those failures are loud and have a clear
 # error body printed.
+#
+# A later version of this code matched any 422 body containing the bare
+# substring "already" — too loose. A genuine install-time AL failure can
+# say e.g. "The record in table Install Seed already exists", which isn't
+# benign at all: BC's error message says "The original extensions have
+# been restored" (i.e. the publish was rolled back), but the bare-substring
+# check treated it as success anyway, so the app was silently never
+# installed and every subsequent test-codeunit lookup failed with
+# "not found". Match only BC's specific "already deployed/installed/
+# published" phrasing, and explicitly exclude bodies that say the publish
+# itself failed.
 
 bc_publish_app() {
     local app="$1"
@@ -49,7 +61,9 @@ bc_publish_app() {
         return 0
     fi
 
-    if [ "$code" = "422" ] && grep -qi "already" "$body"; then
+    if [ "$code" = "422" ] \
+        && grep -qiE "already (deployed|installed|published)" "$body" \
+        && ! grep -qi "publishing failed" "$body"; then
         rm -f "$body"
         return 0
     fi
