@@ -30,9 +30,17 @@
 # been restored" (i.e. the publish was rolled back), but the bare-substring
 # check treated it as success anyway, so the app was silently never
 # installed and every subsequent test-codeunit lookup failed with
-# "not found". Match only BC's specific "already deployed/installed/
-# published" phrasing, and explicitly exclude bodies that say the publish
-# itself failed.
+# "not found".
+#
+# So: match BC's known benign phrasings (already deployed/installed/
+# published/exists, or "duplicate package ID" — the latter is what a
+# republish of an identical already-published package looks like, e.g.
+# run-tests.sh re-publishing a test app the workflow's earlier "Publish AL
+# apps" step already published), but explicitly exclude any body that says
+# the publish itself failed (BC wraps genuine install-trigger errors in
+# "Publishing failed due to 'Could not install the extension ...'" and
+# "The original extensions have been restored") even if that body also
+# happens to contain one of the benign words.
 
 bc_publish_app() {
     local app="$1"
@@ -62,8 +70,8 @@ bc_publish_app() {
     fi
 
     if [ "$code" = "422" ] \
-        && grep -qiE "already (deployed|installed|published)" "$body" \
-        && ! grep -qi "publishing failed" "$body"; then
+        && grep -qiE "already (deployed|installed|published|exists)|duplicate package" "$body" \
+        && ! grep -qiE "publishing failed|could not install the extension|original extensions have been restored" "$body"; then
         rm -f "$body"
         return 0
     fi
