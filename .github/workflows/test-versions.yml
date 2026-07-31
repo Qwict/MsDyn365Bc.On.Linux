@@ -16,14 +16,24 @@ on:
   workflow_dispatch:
     inputs:
       versions:
-        description: 'BC versions to test (comma-separated, e.g. "27.0,28.1")'
+        description: 'BC versions to test (comma-separated, e.g. "27.0,28.1"). Leave empty to auto-discover every version from oldest_version up to the latest Microsoft publishes.'
         required: false
-        default: '27.0,27.1,27.2,27.3,27.4,27.5,28.0,28.1'
+        default: ''
+        type: string
+      oldest_version:
+        description: 'Oldest BC major.minor to include when auto-discovering (used when "versions" is empty)'
+        required: false
+        default: '27.0'
         type: string
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  schedule:
+    # Weekly, Monday 03:00 UTC. Catches new BC sandbox releases (Microsoft
+    # ships minor versions on its own cadence) without anyone remembering
+    # to bump the matrix by hand.
+    - cron: '0 3 * * 1'
 
 permissions:
   contents: read
@@ -40,10 +50,44 @@ jobs:
     - id: set
       run: |
         VERSIONS='${{ inputs.versions }}'
+        OLDEST='${{ inputs.oldest_version }}'
+        if [ -z "$OLDEST" ]; then
+          OLDEST="27.0"
+        fi
         if [ -z "$VERSIONS" ]; then
-          # Default matrix when triggered by push/PR (no workflow_dispatch input).
-          # Keep in sync with the workflow_dispatch input default above.
-          VERSIONS="27.0,27.1,27.2,27.3,27.4,27.5,28.0,28.1"
+          # No explicit override (push/PR/schedule, or workflow_dispatch with
+          # "versions" left empty): auto-discover every major.minor BC
+          # sandbox version Microsoft currently publishes, from $OLDEST up
+          # to whatever is latest. Uses the same per-country index file
+          # scripts/download-artifacts.sh resolves versions from, so the
+          # matrix and the actual artifact download always agree on what
+          # "latest" means.
+          echo "Auto-discovering BC versions >= $OLDEST from Microsoft's artifact index..."
+          VERSIONS=$(curl -sf --retry 3 --retry-delay 2 \
+              "https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net/sandbox/indexes/w1.json" | \
+            OLDEST="$OLDEST" python3 -c "
+          import json, os, sys
+          oldest = tuple(int(x) for x in os.environ['OLDEST'].split('.'))
+          data = json.load(sys.stdin)
+          majors = set()
+          for d in data:
+              v = d.get('Version', '')
+              parts = v.split('.')
+              if len(parts) < 2:
+                  continue
+              try:
+                  key = (int(parts[0]), int(parts[1]))
+              except ValueError:
+                  continue
+              if key >= oldest:
+                  majors.add(key)
+          print(','.join('%d.%d' % m for m in sorted(majors)))
+          ")
+          if [ -z "$VERSIONS" ]; then
+            echo "ERROR: could not auto-discover BC versions from the artifact index" >&2
+            exit 1
+          fi
+          echo "Discovered: $VERSIONS"
         fi
         JSON=$(echo "$VERSIONS" | python3 -c "import sys,json; print(json.dumps({'bc_version': sys.stdin.read().strip().split(',')}))")
         echo "matrix=$JSON" >> $GITHUB_OUTPUT
