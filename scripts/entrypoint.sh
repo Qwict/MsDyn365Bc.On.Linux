@@ -825,7 +825,10 @@ mkfifo /tmp/bc-stdin 2>/dev/null || true
 # - Tiered compilation: DISABLED to prevent JMP hooks from being overwritten by Tier 1 recompilation.
 #   The Watson crash handler patch relies on JMP hooks staying in place.
 export DOTNET_gcServer=1
-export DOTNET_TieredCompilation=0
+# Default 0 (JMP-hook safety), but honor a caller override so the
+# docker-compose passthrough is actually usable for A/B experiments —
+# the unconditional export made that knob silently dead.
+export DOTNET_TieredCompilation="${DOTNET_TieredCompilation:-0}"
 
 # Diagnostic-only: when BC_PROFILE_NST=1, suspend NST at process startup until
 # a diagnostic client (typically dotnet-trace) connects on /tmp/nst-diag.sock.
