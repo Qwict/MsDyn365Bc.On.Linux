@@ -46,6 +46,29 @@ on:
         description: "Space-separated dirs containing app.json for test apps"
         required: true
         type: string
+      extra_symbols_artifact_name:
+        description: >-
+          Opt-in. Name of a workflow-run artifact (uploaded by an earlier job
+          in the same run) containing pre-fetched third-party dependency .app
+          files - i.e. symbols this workflow can't resolve itself, since
+          "Stage symbols from BC artifacts" only indexes the Microsoft BC
+          platform artifact tree. Blank (default): skipped entirely, no
+          behavior change for existing consumers. When set, the artifact is
+          downloaded and its .app files (optionally scoped by
+          extra_symbols_artifact_subdir) are merged into the same symbols/
+          directory the BC-artifact stage populates, before compile.
+        required: false
+        type: string
+        default: ""
+      extra_symbols_artifact_subdir:
+        description: >-
+          Subfolder inside extra_symbols_artifact_name to pull .app files
+          from (e.g. when the artifact bundles dependencies for several
+          projects/callers under per-project subfolders). Blank = use the
+          artifact root. Ignored when extra_symbols_artifact_name is blank.
+        required: false
+        type: string
+        default: ""
       codeunit_range:
         description: |
           Test codeunit IDs to execute. This is the range of your TEST codeunits —
@@ -492,6 +515,34 @@ jobs:
             || true   # warnings about unresolved deps are non-fatal; AL compile gives the precise error if any
           echo "Staged $(ls symbols/*.app 2>/dev/null | wc -l) symbol files"
           bash bc-linux/scripts/workflow-summary.sh end SYMBOLS
+
+      # Opt-in. Third-party dependency symbols (e.g. an AppSource dependency published
+      # in another repo) that "Stage symbols from BC artifacts" above can't resolve,
+      # since it only indexes the Microsoft BC platform artifact tree. The caller
+      # uploads these as a workflow-run artifact in an earlier job; merge them into the
+      # same symbols/ dir so compile_dir's `cp symbols/*.app` picks them up like any
+      # other staged symbol.
+      - name: Download extra dependency symbols
+        if: ${{ inputs.extra_symbols_artifact_name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.extra_symbols_artifact_name }}
+          path: extra-symbols
+
+      - name: Merge extra dependency symbols
+        if: ${{ inputs.extra_symbols_artifact_name != '' }}
+        env:
+          SUBDIR: ${{ inputs.extra_symbols_artifact_subdir }}
+        run: |
+          SRC="extra-symbols"
+          [ -n "$SUBDIR" ] && SRC="extra-symbols/$SUBDIR"
+          if [ ! -d "$SRC" ]; then
+            echo "::warning::extra_symbols_artifact_name was set but '$SRC' does not exist in the downloaded artifact — nothing merged."
+          else
+            COUNT=$(find "$SRC" -maxdepth 1 -name '*.app' | wc -l)
+            cp "$SRC"/*.app symbols/ 2>/dev/null || true
+            echo "Merged $COUNT extra dependency symbol(s) from $SRC into symbols/"
+          fi
 
       # Opt-in only. A consumer's declared runtime is a real compatibility
       # statement (e.g. target "Internal" requires runtime < 11.0) — rewriting
