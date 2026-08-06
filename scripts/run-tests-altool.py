@@ -580,6 +580,106 @@ def _hub_negotiate(hub_http_base: str, auth_header: str, timeout: float = 15.0) 
     return token
 
 
+def _hub_connect(
+    hub_http_base: str, ws_base: str, auth_header: str, company: str | None
+) -> tuple[_WebSocketClient, _SignalRHub]:
+    """Negotiate, connect, SignalR-handshake, wait for HubConnected, then
+    Initialize. Returns (ws, hub) ready for RunTests invocations.
+
+    The HubConnected wait mirrors the required-callback gate documented for
+    DebuggerHub; TestRunnerHub follows the same HubBasedService base class.
+    """
+    token = _hub_negotiate(hub_http_base, auth_header)
+    ws_url = f"{ws_base}?id={urllib.parse.quote(token)}&Authentication={urllib.parse.quote(auth_header)}"
+    ws = _WebSocketClient(ws_url, headers={"Authorization": auth_header})
+    ws.connect()
+    hub = _SignalRHub(ws)
+    try:
+        hub.handshake()
+        connect_deadline = time.monotonic() + 15
+        while True:
+            remaining = connect_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for HubConnected")
+            frame = hub.next_frame(timeout=remaining)
+            target = frame.get("target")
+            if target == "HubConnected":
+                break
+            if target in ("LogServerInfoMessage", "LogServerMessage"):
+                for arg in frame.get("arguments", []):
+                    print(f"    [hub] {arg}")
+
+        hub.invoke("Initialize", [company or "", "", 0], invocation_id="init")
+        # Wait for the type-3 completion ack for "init" (or RuntimeInitialized,
+        # whichever arrives — either confirms the server accepted the call).
+        init_deadline = time.monotonic() + 15
+        while True:
+            remaining = init_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for Initialize to complete")
+            frame = hub.next_frame(timeout=remaining)
+            if frame.get("type") == 3 and frame.get("invocationId") == "init":
+                break
+            if frame.get("target") == "RuntimeInitialized":
+                break
+    except BaseException:
+        ws.close()
+        raise
+    return ws, hub
+
+
+def _run_one_codeunit_on_hub(
+    hub: _SignalRHub, run: CodeunitRun, cuid: int,
+    per_deadline: float, codeunit_timeout_seconds: float,
+) -> None:
+    """Invoke RunTests for one codeunit and collect results into `run`
+    until TestRunCompleted. Raises TimeoutError on the per-codeunit
+    deadline and ConnectionError/OSError when the connection drops."""
+    hub.invoke("RunTests", [cuid, []])
+    last_fail_output = ""
+    while True:
+        remaining = per_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"timed out after {int(codeunit_timeout_seconds)}s")
+        frame = hub.next_frame(timeout=remaining)
+        ftype = frame.get("type")
+        target = frame.get("target")
+        if ftype == 6:
+            continue  # SignalR keepalive ping
+        if target == "IsAlive":
+            hub.invoke("AcknowledgeIsAlive", [])
+            continue
+        if target in ("LogServerInfoMessage", "LogServerMessage"):
+            for arg in frame.get("arguments", []):
+                print(f"    [hub] {arg}")
+            continue
+        if target == "TestStarted":
+            continue
+        if target == "TestCompleted":
+            args = frame.get("arguments", [])
+            if len(args) < 5:
+                continue
+            _cuid, name, status_code, output, duration_ms = args[:5]
+            status = {0: "PASS", 1: "FAIL", 2: "SKIP"}.get(status_code, "FAIL")
+            if not name and status == "PASS":
+                continue  # codeunit-level pseudo-result, see CLI parser docstring
+            print(f"    {status} {name or '(codeunit)'} ({duration_ms}ms)")
+            if status == "FAIL" and output:
+                last_fail_output = output
+                for line in output.strip().splitlines():
+                    print(f"        {line}")
+            if not name:
+                run.results.append((status, "(codeunit)", duration_ms, last_fail_output))
+            else:
+                run.results.append(
+                    (status, name, duration_ms, last_fail_output if status == "FAIL" else "")
+                )
+            continue
+        if target == "TestRunCompleted":
+            return
+        # Unrecognized frame — ignore rather than fail the run.
+
+
 def run_codeunits_via_hub(
     codeunits: list[int],
     server: str,
@@ -591,13 +691,30 @@ def run_codeunits_via_hub(
     deadline: float,
     codeunit_timeout_seconds: float,
 ) -> list[CodeunitRun]:
-    """Run every codeunit over ONE persistent TestRunnerHub connection.
+    """Run every codeunit over a persistent TestRunnerHub connection,
+    RECONNECTING when the server drops it.
 
     Mirrors HubBasedTestRunnerService.SetupAndRunTests from the al dotnet
     tool: Initialize once, then RunTests per codeunit sequentially on the
-    same connection, using the TestRunCompleted event as the per-codeunit
-    completion signal. This is what eliminates the process-start +
-    negotiate + auth overhead the CLI transport pays on every codeunit.
+    same connection, using TestRunCompleted as the per-codeunit completion
+    signal. This eliminates the process-start + negotiate + auth overhead
+    the CLI transport pays on every codeunit.
+
+    Reconnect logic (learned from real Microsoft suites): some tests kill
+    the server session — the same class of failure StartupHook patch #21
+    exists for — which closes the hub connection mid-suite. The CLI
+    transport is naturally immune (fresh connection per codeunit); here we
+    recover by reconnecting and retrying the interrupted codeunit ONCE on
+    the fresh connection (safe: the duplicate-codeunit-id server quirk is
+    per-connection). A codeunit that kills the session twice is recorded
+    as errored and skipped. After a per-codeunit timeout the connection
+    state is unknown (the server may still be streaming), so it is also
+    recycled. Reconnect failures are handled here and never propagate —
+    --transport auto's cli fallback must only ever trigger before the
+    first test has run.
+
+    IMPORTANT for callers: exceptions escaping this function mean NO test
+    has executed (initial connection phase only).
     """
     auth_header = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
     hub_http_base = f"{server}:{port}/{instance}/dev/TestRunnerHub"
@@ -605,123 +722,88 @@ def run_codeunits_via_hub(
     ws_base = re.sub(r"^https?:", ws_scheme + ":", hub_http_base)
 
     runs: list[CodeunitRun] = []
+    # Generous budget: each reconnect costs ~0.5s, and a suite with many
+    # session-killer codeunits legitimately needs many. The budget only
+    # guards against a server in a crash loop.
+    reconnects_left = max(20, len(codeunits) // 4)
 
-    token = _hub_negotiate(hub_http_base, auth_header)
-    ws_url = f"{ws_base}?id={urllib.parse.quote(token)}&Authentication={urllib.parse.quote(auth_header)}"
-    ws = _WebSocketClient(ws_url, headers={"Authorization": auth_header})
-    ws.connect()
-    hub = _SignalRHub(ws)
+    # Initial connection: exceptions propagate (no test has run yet — this
+    # is the window where --transport auto may fall back to cli).
+    ws, hub = _hub_connect(hub_http_base, ws_base, auth_header, company)
+
+    def reconnect() -> bool:
+        """Close the dead connection and open a fresh one. Returns False
+        when the budget is exhausted or the server won't accept us."""
+        nonlocal ws, hub, reconnects_left
+        ws.close()
+        while reconnects_left > 0:
+            reconnects_left -= 1
+            try:
+                time.sleep(1)
+                ws, hub = _hub_connect(hub_http_base, ws_base, auth_header, company)
+                return True
+            except (ConnectionError, OSError, TimeoutError) as ex:
+                print(f"    WARN: hub reconnect failed ({ex}) — "
+                      f"{reconnects_left} attempt(s) left")
+        return False
+
     try:
-        hub.handshake()
-
-        # Wait for HubConnected before doing anything else (mirrors the
-        # required-callback gate documented for DebuggerHub; TestRunnerHub
-        # follows the same HubBasedService base class).
-        connect_deadline = time.monotonic() + 15
-        connected = False
-        while not connected:
-            remaining = connect_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("timed out waiting for HubConnected")
-            frame = hub.next_frame(timeout=remaining)
-            target = frame.get("target")
-            if target == "HubConnected":
-                connected = True
-            elif target in ("LogServerInfoMessage", "LogServerMessage"):
-                for arg in frame.get("arguments", []):
-                    print(f"    [hub] {arg}")
-
-        hub.invoke("Initialize", [company or "", "", 0], invocation_id="init")
-        # Wait for the type-3 completion ack for "init" (or RuntimeInitialized,
-        # whichever arrives — either confirms the server accepted the call).
-        init_deadline = time.monotonic() + 15
-        init_done = False
-        while not init_done:
-            remaining = init_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("timed out waiting for Initialize to complete")
-            frame = hub.next_frame(timeout=remaining)
-            if frame.get("type") == 3 and frame.get("invocationId") == "init":
-                init_done = True
-            elif frame.get("target") == "RuntimeInitialized":
-                init_done = True
-
-        for cuid in codeunits:
+        i = 0
+        while i < len(codeunits):
+            cuid = codeunits[i]
             remaining_overall = deadline - time.monotonic()
-            run = CodeunitRun(cuid)
             if remaining_overall <= 0:
+                run = CodeunitRun(cuid)
                 run.error = "not run: overall timeout reached"
                 runs.append(run)
+                i += 1
                 continue
 
             print(f"=== Codeunit {cuid} (hub) ===")
-            cu_start = time.monotonic()
-            per_deadline = cu_start + min(codeunit_timeout_seconds, remaining_overall)
-            hub.invoke("RunTests", [cuid, []])
-            last_fail_output = ""
-            completed = False
-            try:
-                while not completed:
-                    remaining = per_deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(f"timed out after {int(codeunit_timeout_seconds)}s")
-                    frame = hub.next_frame(timeout=remaining)
-                    ftype = frame.get("type")
-                    target = frame.get("target")
-                    if ftype == 6:
-                        continue  # SignalR keepalive ping
-                    if target == "IsAlive":
-                        hub.invoke("AcknowledgeIsAlive", [])
+            retried = False
+            while True:
+                run = CodeunitRun(cuid)  # fresh on retry — discard partials
+                cu_start = time.monotonic()
+                per_deadline = cu_start + min(codeunit_timeout_seconds, remaining_overall)
+                try:
+                    _run_one_codeunit_on_hub(hub, run, cuid, per_deadline,
+                                             codeunit_timeout_seconds)
+                except TimeoutError as ex:
+                    run.error = str(ex)
+                    run.elapsed_seconds = time.monotonic() - cu_start
+                    # Connection state unknown after a timeout — recycle it.
+                    if not reconnect():
+                        runs.append(run)
+                        return _abandon_remaining(runs, codeunits, i + 1,
+                                                  "not run: hub reconnect budget exhausted")
+                except (ConnectionError, OSError) as ex:
+                    run.elapsed_seconds = time.monotonic() - cu_start
+                    if not retried:
+                        print(f"    WARN: hub connection lost ({ex}) — "
+                              f"reconnecting and retrying codeunit {cuid} once")
+                        if not reconnect():
+                            run.error = f"hub connection lost: {ex}"
+                            runs.append(run)
+                            return _abandon_remaining(runs, codeunits, i + 1,
+                                                      "not run: hub reconnect budget exhausted")
+                        retried = True
                         continue
-                    if target in ("LogServerInfoMessage", "LogServerMessage"):
-                        for arg in frame.get("arguments", []):
-                            print(f"    [hub] {arg}")
-                        continue
-                    if target == "TestStarted":
-                        continue
-                    if target == "TestCompleted":
-                        args = frame.get("arguments", [])
-                        if len(args) < 5:
-                            continue
-                        _cuid, name, status_code, output, duration_ms = args[:5]
-                        status = {0: "PASS", 1: "FAIL", 2: "SKIP"}.get(status_code, "FAIL")
-                        if not name and status == "PASS":
-                            continue  # codeunit-level pseudo-result, see CLI parser docstring
-                        print(f"    {status} {name or '(codeunit)'} ({duration_ms}ms)")
-                        if status == "FAIL" and output:
-                            last_fail_output = output
-                            for line in output.strip().splitlines():
-                                print(f"        {line}")
-                        if not name:
-                            run.results.append((status, "(codeunit)", duration_ms, last_fail_output))
-                        else:
-                            run.results.append(
-                                (status, name, duration_ms, last_fail_output if status == "FAIL" else "")
-                            )
-                        continue
-                    if target == "TestRunCompleted":
-                        completed = True
-                        continue
-                    # Unrecognized frame — ignore rather than fail the run.
-            except TimeoutError as ex:
-                run.error = str(ex)
-            except (ConnectionError, OSError) as ex:
-                run.elapsed_seconds = time.monotonic() - cu_start
-                run.error = f"hub connection lost: {ex}"
-                runs.append(run)
-                # Connection is dead — mark every remaining codeunit as not run.
-                for remaining_cuid in codeunits[codeunits.index(cuid) + 1:]:
-                    err_run = CodeunitRun(remaining_cuid)
-                    err_run.error = "not run: hub connection lost"
-                    runs.append(err_run)
-                return runs
+                    # Second kill on the same codeunit: record and move on.
+                    run.error = f"session killed twice by this codeunit: {ex}"
+                    if not reconnect():
+                        runs.append(run)
+                        return _abandon_remaining(runs, codeunits, i + 1,
+                                                  "not run: hub reconnect budget exhausted")
+                else:
+                    run.elapsed_seconds = time.monotonic() - cu_start
+                    if not run.results and not run.error:
+                        run.error = "no test results returned for a Subtype=Test codeunit"
+                break
 
-            run.elapsed_seconds = time.monotonic() - cu_start
-            if not run.results and not run.error:
-                run.error = "no test results returned for a Subtype=Test codeunit"
             if run.error:
                 print(f"    ERROR: {run.error}")
             runs.append(run)
+            i += 1
 
         try:
             hub.invoke("StopTestExecution", [])
@@ -730,6 +812,16 @@ def run_codeunits_via_hub(
     finally:
         ws.close()
 
+    return runs
+
+
+def _abandon_remaining(
+    runs: list[CodeunitRun], codeunits: list[int], start_idx: int, reason: str
+) -> list[CodeunitRun]:
+    for cuid in codeunits[start_idx:]:
+        err_run = CodeunitRun(cuid)
+        err_run.error = reason
+        runs.append(err_run)
     return runs
 
 
