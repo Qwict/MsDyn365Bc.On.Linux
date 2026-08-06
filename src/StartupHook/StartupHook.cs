@@ -129,6 +129,9 @@ internal class StartupHook
     private static Assembly? _navNclAssembly;
     private static IntPtr _kernel32StubHandle;
     private static object? _noopEncryptionProvider;
+    // Patch #26 state — deliberately separate from _noopEncryptionProvider, see
+    // TenantFakeEncryptionProxy's class comment.
+    private static object? _noopTenantEncryptionProvider;
     // Patch #24 state
     private static Type? _navTimeZoneExceptionType;
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, TimeZoneInfo> _safeTimeZoneCache =
@@ -2007,10 +2010,6 @@ internal class StartupHook
                 "Encrypt" or "Decrypt" => args?[0], // pass-through
                 "get_IsKeyPresent" or "get_IsKeyCreated" => true,
                 "get_PublicKey" => "<RSAKeyValue><Modulus>xbzyD+SGxykyAv82XOEFtDzWEIok0MM5SAc+CS6Mq0W5LwiyXeakWyblq1XgYi3CDu700986ZVRi4KJjruZlzBeZ7IWXD4lEEpTCRuqoxasRTnwVpyVqGuHclJAnUpjeBS6HvaS/iesYWwxZcmlsmzJHvF3hXdDmLj+8GSKgo4IhschPCIpnoH8+FREX++VpwfZH1ejMk5Izds/ZI70Xc/OWfRfaYy3rtCFeZQ1R5T1AhlNJDgpn0a1oP86F8yDGYawB2GJKIewdcWE8usu4QesrFnlS1g/IJcFXe71/TiJjryqRJPk8ze3Jh9+atx57OnI4R3QvuM/lQ7YoN1RVjw==</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>",
-                // Patch #26: CreateKey/DeleteKey/ImportKey/ExportKey/Dispose are all void —
-                // IsKeyPresent/IsKeyCreated already report true, so callers never actually
-                // need these to do anything real.
-                "CreateKey" or "DeleteKey" or "ImportKey" or "ExportKey" or "Dispose" => null,
                 _ => null,
             };
             if (targetMethod?.Name == "Decrypt" || targetMethod?.Name == "Encrypt")
@@ -2018,11 +2017,77 @@ internal class StartupHook
                 _encryptionBypassed = true;
                 Console.WriteLine($"[StartupHook] Encryption.{targetMethod.Name}() called — bypass working");
             }
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Patch #26's own proxy, deliberately SEPARATE from PassthroughEncryptionProxy/
+    /// _noopEncryptionProvider (Patch #7's SQL connection-string password fake). Sharing one
+    /// instance across both was tried and broke NST boot: whatever writes the SQL system-tenant
+    /// password expects Decrypt(x) == x (Patch #7's identity passthrough), so giving Encrypt/
+    /// Decrypt a real transform there corrupted that password and NST couldn't connect to SQL
+    /// at all ("Cannot establish a connection to the SQL Server/Database" during
+    /// NavTenantCollection.ConfigureTenants). Keeping this proxy AL-encryption-only avoids that
+    /// blast radius entirely.
+    /// </summary>
+    public class TenantFakeEncryptionProxy : DispatchProxy
+    {
+        // Fixed XOR key: this only needs to be self-consistent within one running
+        // container, not secret or stable across restarts.
+        private const byte FakeEncryptionXorKey = 0x5A;
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            var result = targetMethod?.Name switch
+            {
+                // Reversible-but-obviously-fake transform (byte XOR + Base64), not a
+                // straight pass-through: some AL tests assert Encrypt(x) != x in addition
+                // to Decrypt(Encrypt(x)) == x. A no-op passthrough satisfies the second
+                // assertion but not the first; XOR is its own inverse so both hold.
+                "Encrypt" => (object)FakeEncrypt(args?[0] as string),
+                "Decrypt" => (object)FakeDecrypt(args?[0] as string),
+                "get_IsKeyPresent" or "get_IsKeyCreated" => true,
+                "get_PublicKey" => "<RSAKeyValue><Modulus>xbzyD+SGxykyAv82XOEFtDzWEIok0MM5SAc+CS6Mq0W5LwiyXeakWyblq1XgYi3CDu700986ZVRi4KJjruZlzBeZ7IWXD4lEEpTCRuqoxasRTnwVpyVqGuHclJAnUpjeBS6HvaS/iesYWwxZcmlsmzJHvF3hXdDmLj+8GSKgo4IhschPCIpnoH8+FREX++VpwfZH1ejMk5Izds/ZI70Xc/OWfRfaYy3rtCFeZQ1R5T1AhlNJDgpn0a1oP86F8yDGYawB2GJKIewdcWE8usu4QesrFnlS1g/IJcFXe71/TiJjryqRJPk8ze3Jh9+atx57OnI4R3QvuM/lQ7YoN1RVjw==</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>",
+                // CreateKey/DeleteKey/ImportKey/ExportKey/Dispose are all void — IsKeyPresent/
+                // IsKeyCreated already report true, so callers never actually need these to do
+                // anything real.
+                "CreateKey" or "DeleteKey" or "ImportKey" or "ExportKey" or "Dispose" => null,
+                _ => null,
+            };
+            if (targetMethod?.Name == "Decrypt" || targetMethod?.Name == "Encrypt")
+            {
+                Console.WriteLine($"[StartupHook] Patch #26: Tenant Encryption.{targetMethod.Name}() called — fake transform applied");
+            }
             else if (targetMethod?.Name == "CreateKey")
             {
                 Console.WriteLine("[StartupHook] Patch #26: Encryption.CreateKey() called — no-op (already \"has a key\")");
             }
             return result;
+        }
+
+        private static string FakeEncrypt(string? plaintext)
+        {
+            if (string.IsNullOrEmpty(plaintext)) return plaintext ?? "";
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(plaintext);
+            for (int i = 0; i < bytes.Length; i++) bytes[i] ^= FakeEncryptionXorKey;
+            return Convert.ToBase64String(bytes);
+        }
+
+        private static string FakeDecrypt(string? ciphertext)
+        {
+            if (string.IsNullOrEmpty(ciphertext)) return ciphertext ?? "";
+            try
+            {
+                byte[] bytes = Convert.FromBase64String(ciphertext);
+                for (int i = 0; i < bytes.Length; i++) bytes[i] ^= FakeEncryptionXorKey;
+                return System.Text.Encoding.UTF8.GetString(bytes);
+            }
+            catch (FormatException)
+            {
+                // Not something FakeEncrypt produced (e.g. stored before this patch existed) — leave as-is.
+                return ciphertext;
+            }
         }
     }
 
@@ -2556,9 +2621,9 @@ internal class StartupHook
                 return;
             }
 
-            if (!EnsureNoOpEncryptionProvider())
+            if (!EnsureTenantFakeEncryptionProvider())
             {
-                Console.WriteLine("[StartupHook] Patch #26: could not build pass-through encryption proxy — skipping");
+                Console.WriteLine("[StartupHook] Patch #26: could not build tenant fake-encryption proxy — skipping");
                 return;
             }
 
@@ -2575,12 +2640,12 @@ internal class StartupHook
     }
 
     /// <summary>
-    /// Builds _noopEncryptionProvider if Patch #7 hasn't already (assembly load order between
-    /// Nav.Ncl and Nav.Types isn't guaranteed), so this patch works no matter which loads first.
+    /// Builds _noopTenantEncryptionProvider (a TenantFakeEncryptionProxy — see its class comment
+    /// for why this is NOT shared with Patch #7's _noopEncryptionProvider).
     /// </summary>
-    private static bool EnsureNoOpEncryptionProvider()
+    private static bool EnsureTenantFakeEncryptionProvider()
     {
-        if (_noopEncryptionProvider != null) return true;
+        if (_noopTenantEncryptionProvider != null) return true;
         try
         {
             Assembly? navTypesAsm = AppDomain.CurrentDomain.GetAssemblies()
@@ -2592,13 +2657,13 @@ internal class StartupHook
 
             var createProxy = typeof(DispatchProxy)
                 .GetMethod("Create", 2, Type.EmptyTypes)!
-                .MakeGenericMethod(encIfaceType, typeof(PassthroughEncryptionProxy));
-            _noopEncryptionProvider = createProxy.Invoke(null, null);
-            return _noopEncryptionProvider != null;
+                .MakeGenericMethod(encIfaceType, typeof(TenantFakeEncryptionProxy));
+            _noopTenantEncryptionProvider = createProxy.Invoke(null, null);
+            return _noopTenantEncryptionProvider != null;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[StartupHook] Patch #26: EnsureNoOpEncryptionProvider failed: {ex.Message}");
+            Console.WriteLine($"[StartupHook] Patch #26: EnsureTenantFakeEncryptionProvider failed: {ex.Message}");
             return false;
         }
     }
@@ -2612,7 +2677,7 @@ internal class StartupHook
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static object? Replacement_GetTenantEncryptionProvider(object? activeSessionProvider)
     {
-        return _noopEncryptionProvider;
+        return _noopTenantEncryptionProvider;
     }
 
     // ========================================================================
