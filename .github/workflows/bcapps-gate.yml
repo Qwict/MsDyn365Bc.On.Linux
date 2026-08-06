@@ -14,11 +14,15 @@ name: bcapps-gate
 #
 # The test apps come out of the BC platform artifact itself
 # (platform/Applications/BaseApp/Test/*.app) — nothing is stored in the repo.
-# The recipe mirrors PipelinePerformanceComparison/scripts/benchmark-bucket4.sh:
-# BC_CLEAR_ALL_APPS=false, publish the three test-library deps, then let
-# run-tests.sh publish the suite app and drive it over the websocket runner
-# (these suites need real test-runner isolation — deliberately NOT the
-# altool/hub runner).
+# Recipe: BC_CLEAR_ALL_APPS=false, publish the three test-library deps plus
+# the suite app, then run via run-tests-altool.py --transport hub (the
+# persistent TestRunnerHub connection). Tests therefore run WITHOUT an AL
+# test-runner codeunit (no RequiredTestIsolation) — absolute failure counts
+# will differ from the classic websocket runner, but both TC legs use the
+# same runner in the same codeunit order, so the TC0-vs-TC1 comparison is
+# still apples-to-apples. The hub path also avoids the client-services
+# (7085) session auth, which rejected BCRUNNER on full-stack boots when
+# this gate first ran over the websocket runner.
 #
 # Verdict logic: absolute pass rates are NOT the gate — these suites have
 # known environment-dependent failures on Linux (see KNOWN-LIMITATIONS.md).
@@ -121,24 +125,21 @@ jobs:
         run: |
           APP="$BC_ARTIFACTS_DIR/platform/Applications/BaseApp/Test/Microsoft_${SUITE}.app"
           [ -f "$APP" ] || { echo "suite app not found: $APP"; exit 1; }
-          # Discover the suite's Subtype=Test codeunit ids from its symbols
-          # (reuses run-tests-altool.py's parser; range spans = everything).
-          IDS=$(python3 - "$APP" <<'PYEOF'
-          import sys, importlib.util
-          spec = importlib.util.spec_from_file_location("rta", "scripts/run-tests-altool.py")
-          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-          ids = m.discover_test_codeunits(sys.argv[1], [(1, 2**31 - 1)])
-          print(",".join(str(i) for i in ids))
-          PYEOF
-          )
-          [ -n "$IDS" ] || { echo "no test codeunits discovered in $APP"; exit 1; }
-          echo "Discovered $(echo "$IDS" | tr ',' '\n' | wc -l) test codeunits"
+          # run-tests-altool.py doesn't publish — do it here (deps went in the
+          # previous step). 422-already is benign per the shared helper.
+          source ./scripts/publish-app.sh
+          bc_publish_app "$APP" || exit 1
           set +e
-          ./scripts/run-tests.sh \
+          # --transport hub (hard, no cli fallback): the gate should fail loud
+          # if the hub connection breaks rather than silently change runners
+          # between legs. Wide range = run every Subtype=Test codeunit the
+          # script discovers in the app.
+          python3 scripts/run-tests-altool.py \
             --app "$APP" \
-            --codeunit-range "$IDS" \
+            --codeunit-range "1..2147483647" \
+            --transport hub \
             --junit-output "junit-${SUITE}-tc${{ matrix.tc }}.xml" \
-            --timeout 300 2>&1 | tee run.log
+            --timeout 300 --codeunit-timeout 10 2>&1 | tee run.log
           RC=${PIPESTATUS[0]}
           set -e
           LINE=$(grep -oE '[0-9]+ total, [0-9]+ passed, [0-9]+ failed' run.log | tail -1 || true)
