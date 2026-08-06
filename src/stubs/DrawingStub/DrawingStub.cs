@@ -104,8 +104,16 @@ namespace System.Drawing
 
         public Bitmap(Stream stream)
         {
+            // Restore the stream position after reading. BC probes unknown media with
+            // Image.FromStream and, when that throws, hands the SAME stream to a binary
+            // fallback that copies from the CURRENT position without rewinding
+            // (NavMediaDocument..ctor does mediaSourceStream.CopyTo with no Seek).
+            // Consuming the stream without restoring made that fallback capture zero
+            // bytes — the actual mechanism behind issue #18's "empty Custom layout".
+            long pos = -1;
             try
             {
+                if (stream.CanSeek) pos = stream.Position;
                 using var ms = new MemoryStream();
                 stream.CopyTo(ms);
                 SourceBytes = ms.ToArray();
@@ -119,6 +127,11 @@ namespace System.Drawing
                 LooksLikeImage = false;
                 StubWidth = 1;
                 StubHeight = 1;
+            }
+            finally
+            {
+                if (pos >= 0)
+                    try { stream.Position = pos; } catch { }
             }
         }
 
