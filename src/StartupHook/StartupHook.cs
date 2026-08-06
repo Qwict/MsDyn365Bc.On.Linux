@@ -95,6 +95,31 @@ using System.Threading.Tasks;
 ///   too), so "encryption" always reports enabled/present and Encrypt/Decrypt round-trip as
 ///   plain text. Good enough for tests to stop erroring; not real cryptography.
 ///
+/// Patch #27: NavClientHandle.Dispose (Nav.Ncl.dll)
+///   Disposing a form/page that held a .NET client handle throws NullReferenceException on
+///   headless Linux sessions: Dispose dereferences the NavAutomationHandle field and the
+///   thread-local session state, both of which can be null when there is no real client UI
+///   (the teardown often runs on a cleanup thread with sessionId -1). The NRE propagates out
+///   of NavForm.Dispose and fails the test AFTER its logic already completed — the single
+///   biggest failure bucket in Microsoft's Tests-Misc/Tests-Workflow suites (189 failures in
+///   the 2026-08-06 gate run). This is the disposal-side sibling of the documented
+///   NSClientCallback.CreateDotNetHandle hole (KNOWN-LIMITATIONS.md).
+///   Fix: replace Dispose(bool) with a null-guarded equivalent — same logic, but a missing
+///   handle/session/callback means "nothing to notify" instead of a crash.
+///
+/// Patch #28: NavFile.ExpandFileName (Nav.Ncl.dll)
+///   AL code (Microsoft's own test libraries included) builds file paths with Windows '\'
+///   separators — e.g. "Library - Utility" produces "<ServerDir>\..\..\App\Test\Files\x.jpg".
+///   On Linux, backslash is not a separator: Path.GetFullPath leaves the string literal, the
+///   user-folder confinement check then rejects it ("Files outside of the current users
+///   folder cannot be accessed. Access is denied to file '/bc/service\..\..\...'"), and even
+///   without the lockdown the literal path could never resolve to a real file.
+///   Fix: replace ExpandFileName with a Linux-aware equivalent — normalize '\' to '/' first,
+///   then combine/canonicalize exactly like the original. The user-folder lockdown is NOT
+///   re-enforced (single-user dev/test container; the SaaS confinement has no meaning here),
+///   so out-of-folder paths proceed to the actual file operation and produce an honest
+///   file-not-found instead of a bogus access-denied.
+///
 /// JMP hooks work ONLY on BC methods (JIT-compiled). BCL methods are ReadyToRun pre-compiled
 /// and cannot be patched this way.
 /// </summary>
@@ -411,6 +436,21 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
             PatchDebugRuntimeNullSession(args.LoadedAssembly);
+        }
+
+        // Patch #27: NavClientHandle.Dispose NREs on headless sessions when the automation
+        // handle or thread-local session state is null — fails tests during form teardown
+        // after their logic already passed. Replace with a null-guarded equivalent.
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            PatchNavClientHandleDispose(args.LoadedAssembly);
+        }
+
+        // Patch #28: NavFile.ExpandFileName — normalize Windows '\' path separators so
+        // AL-built paths resolve on Linux instead of tripping the user-folder lockdown.
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            PatchNavFileExpandFileName(args.LoadedAssembly);
         }
 
         // Patch #16 is now only 16b (NavUser.TryAuthenticate bypass in Nav.Ncl).
@@ -2848,6 +2888,246 @@ internal class StartupHook
             // introduce a new failure path — the worst case reverts to original risk.
             return false;
         }
+    }
+
+    // ========================================================================
+    // Patch #27: NavClientHandle.Dispose null-guard
+    // ========================================================================
+
+    // Reflection members cached at patch time — Dispose runs for every form/DotNet
+    // teardown, so per-call GetField/GetProperty lookups are avoided where possible.
+    private static FieldInfo? _nchHandleField;              // NavClientHandle.handle (NavAutomationHandle)
+    private static PropertyInfo? _nahHandleProp;            // NavAutomationHandle.Handle (int)
+    private static PropertyInfo? _nchSuppressDisposeProp;   // NavInteropHandleReferenceCount.SuppressDispose
+    private static PropertyInfo? _navCurrentThreadSessionProp; // NavCurrentThread.Session (static)
+    private static PropertyInfo? _sessionCallbackAllowedProp;  // NavSession.CallbackAllowed
+    private static PropertyInfo? _sessionClientCallbackOrNullProp; // NavSession.ClientCallbackOrNull
+    private static MethodInfo? _cbDisposeAutomationObject;  // IClientCallback.DisposeAutomationObject(int, bool)
+
+    private static void PatchNavClientHandleDispose(Assembly navNcl)
+    {
+        if (IsPatchDisabled("27")) return;
+        try
+        {
+            var handleType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavClientHandle");
+            if (handleType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #27: NavClientHandle type not found — skipping");
+                return;
+            }
+
+            var dispose = handleType.GetMethod("Dispose",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+                binder: null, types: new[] { typeof(bool) }, modifiers: null);
+            if (dispose == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #27: NavClientHandle.Dispose(bool) not found — skipping");
+                return;
+            }
+
+            _nchHandleField = handleType.GetField("handle",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            _nahHandleProp = _nchHandleField?.FieldType.GetProperty("Handle");
+            _nchSuppressDisposeProp = handleType.BaseType?.GetProperty("SuppressDispose",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var currentThreadType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavCurrentThread");
+            _navCurrentThreadSessionProp = currentThreadType?.GetProperty("Session",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            var sessionType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavSession");
+            _sessionCallbackAllowedProp = sessionType?.GetProperty("CallbackAllowed",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _sessionClientCallbackOrNullProp = sessionType?.GetProperty("ClientCallbackOrNull",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _cbDisposeAutomationObject = navNcl
+                .GetType("Microsoft.Dynamics.Nav.Runtime.IClientCallback")
+                ?.GetMethod("DisposeAutomationObject", new[] { typeof(int), typeof(bool) });
+            if (_nchHandleField == null || _nahHandleProp == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #27: NavClientHandle.handle field shape changed — skipping");
+                return;
+            }
+
+            var replacement = typeof(StartupHook).GetMethod(
+                nameof(Replacement_NavClientHandleDispose),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(dispose, replacement, "NavClientHandle.Dispose (Patch #27)");
+            Console.WriteLine("[StartupHook] Patch #27: NavClientHandle.Dispose null-guarded");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #27 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Null-guarded replacement for NavClientHandle.Dispose(bool disposing). Instance
+    /// method → the receiver arrives as the first explicit argument. Original logic:
+    ///   if (disposing) {
+    ///     if (handle.Handle != -1 && Session != null && Session.CallbackAllowed)
+    ///       Session.ClientCallback.DisposeAutomationObject(handle.Handle, SuppressDispose);
+    ///     handle.Handle = -1;
+    ///   }
+    /// On headless sessions `handle` can be null (the client handle was never really
+    /// created — the CreateDotNetHandle hole) and NavCurrentThread's TLS may be missing
+    /// on the cleanup thread, so every dereference here is guarded. When there is a real
+    /// client (web client PoC), the callback still fires exactly as the original did.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Replacement_NavClientHandleDispose(object self, bool disposing)
+    {
+        if (!disposing) return;
+        try
+        {
+            var handle = _nchHandleField?.GetValue(self);
+            if (handle == null) return; // no automation handle → nothing to release
+
+            int h = _nahHandleProp!.GetValue(handle) is int v ? v : -1;
+            if (h != -1)
+            {
+                try
+                {
+                    // NavCurrentThread.Session's getter itself dereferences thread-local
+                    // state that may be absent on cleanup threads — hence its own guard.
+                    var session = _navCurrentThreadSessionProp?.GetValue(null);
+                    if (session != null
+                        && _sessionCallbackAllowedProp?.GetValue(session) is bool allowed && allowed)
+                    {
+                        var cb = _sessionClientCallbackOrNullProp?.GetValue(session);
+                        if (cb != null)
+                        {
+                            bool suppress = _nchSuppressDisposeProp?.GetValue(self) is bool s && s;
+                            _cbDisposeAutomationObject?.Invoke(cb, new object[] { h, suppress });
+                        }
+                    }
+                }
+                catch
+                {
+                    // No client to notify (or it went away mid-dispose) — dropping the
+                    // notification is fine; the server-side handle is cleared below.
+                }
+                _nahHandleProp.SetValue(handle, -1);
+            }
+        }
+        catch
+        {
+            // Dispose must never throw — an NRE here failed tests whose logic had
+            // already completed (the 189-failure bucket this patch exists for).
+        }
+    }
+
+    // ========================================================================
+    // Patch #28: NavFile.ExpandFileName backslash normalization
+    // ========================================================================
+
+    private static PropertyInfo? _sessionUserFolderProp;   // NavSession.UserFolder
+    private static bool _expandFileNameLockdownLogged;
+
+    private static void PatchNavFileExpandFileName(Assembly navNcl)
+    {
+        if (IsPatchDisabled("28")) return;
+        try
+        {
+            var navFileType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavFile");
+            if (navFileType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #28: NavFile type not found — skipping");
+                return;
+            }
+
+            MethodInfo? expand = null;
+            foreach (var m in navFileType.GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
+            {
+                var p = m.GetParameters();
+                if (m.Name == "ExpandFileName" && p.Length == 3
+                    && p[0].ParameterType.IsEnum
+                    && p[1].ParameterType == typeof(string)
+                    && p[2].ParameterType == typeof(bool))
+                {
+                    expand = m;
+                    break;
+                }
+            }
+            if (expand == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #28: ExpandFileName(DataError,string,bool) not found — skipping");
+                return;
+            }
+
+            var sessionType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavSession");
+            _sessionUserFolderProp = sessionType?.GetProperty("UserFolder",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            // NavCurrentThread.Session accessor is shared with Patch #27; resolve if #27 didn't.
+            _navCurrentThreadSessionProp ??= navNcl
+                .GetType("Microsoft.Dynamics.Nav.Runtime.NavCurrentThread")
+                ?.GetProperty("Session", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+            var replacement = typeof(StartupHook).GetMethod(
+                nameof(Replacement_NavFileExpandFileName),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(expand, replacement, "NavFile.ExpandFileName (Patch #28)");
+            Console.WriteLine("[StartupHook] Patch #28: NavFile.ExpandFileName backslash normalization active");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #28 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Replacement for static NavFile.ExpandFileName(DataError errorLevel, string fileName,
+    /// bool enforceUserPath). DataError is an int-backed enum → declared as int (identical
+    /// x64 ABI). Behaviour vs the original: '\' → '/' normalization first, same
+    /// relative-path-under-user-folder combining and canonicalization, but the user-folder
+    /// lockdown throw is replaced by a one-time log (see the Patch #28 header comment).
+    /// Any failure degrades to returning the normalized input so the actual file operation
+    /// reports its own (honest) error.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static string Replacement_NavFileExpandFileName(int errorLevel, string fileName, bool enforceUserPath)
+    {
+        if (string.IsNullOrEmpty(fileName)) return fileName;
+        fileName = fileName.Replace('\\', '/');
+        try
+        {
+            string? userFolder = null;
+            try
+            {
+                var session = _navCurrentThreadSessionProp?.GetValue(null);
+                userFolder = session != null ? _sessionUserFolderProp?.GetValue(session) as string : null;
+                userFolder = string.IsNullOrEmpty(userFolder)
+                    ? null
+                    : System.IO.Path.GetFullPath(userFolder.Replace('\\', '/'));
+            }
+            catch { }
+
+            if (!System.IO.Path.IsPathRooted(fileName) && userFolder != null)
+                fileName = System.IO.Path.Combine(userFolder, fileName);
+            fileName = System.IO.Path.GetFullPath(fileName);
+
+            // BC builds user-folder subpaths with '\' too (GetUserTempFolder combines
+            // "TEMP\\"), so pre-#28 the "directories" were literal backslash-named files
+            // and nothing ever created them as real directories. For normalized paths
+            // under the user folder, materialize the parent so temp-file creation works.
+            if (userFolder != null
+                && fileName.StartsWith(userFolder, StringComparison.OrdinalIgnoreCase))
+            {
+                var dir = System.IO.Path.GetDirectoryName(fileName);
+                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+                    System.IO.Directory.CreateDirectory(dir);
+            }
+
+            if (!_expandFileNameLockdownLogged && enforceUserPath)
+            {
+                _expandFileNameLockdownLogged = true;
+                Console.WriteLine($"[StartupHook] Patch #28: user-folder lockdown not enforced (first path: {fileName})");
+            }
+        }
+        catch
+        {
+            // Invalid path characters etc. — hand the normalized string to the caller and
+            // let the real file operation surface the error with its usual mapping.
+        }
+        return fileName;
     }
 
     // ========================================================================

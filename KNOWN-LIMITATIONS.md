@@ -1,5 +1,31 @@
 # Known Test Limitations on BC Linux
 
+## Failure triage: bcapps-gate run 2026-08-06 (BC 28.1, hub runner, TC=0 legs)
+
+Full classification of the 787 Tests-Misc + 165 Tests-Workflow failures from
+gate run 31090966927 (per-method JUnit in the run's `result-*-tc0` artifacts).
+Every failure fell into one of the buckets below. "Hub runner" caveat applies
+throughout: `run-tests-altool.py --transport hub` runs WITHOUT an AL test-runner
+codeunit, so isolation-dependent buckets are inflated versus `run-tests.sh`.
+
+| Bucket | Count | Class |
+|---|---|---|
+| ~~`NavClientHandle.Dispose` NullRef~~ (form/handle teardown without client UI) | 189 | **FIXED — Patch #27** (null-guarded Dispose; disposal-side sibling of the CreateDotNetHandle hole). Validation rerun: signature fully eliminated |
+| TestPage metadata: "field/action/part with ID not found", "TestPage is not open" | ~165 | needs comparison vs websocket runner before judging — may be hub-runner artifact, may be TestPageClient patch gap |
+| ~~Report rendering pipeline~~: "Value too large/small for Int32" in `Report Selections.SaveReportAsHTML/PDFInTempBlob` (70), uninstantiated `XmlDocument.Load` (43), empty PDF attachments | ~143 | **MOSTLY FIXED — report rendering now actually works on Linux.** The renderer text-shapes via native P/Invoke `harfbuzz` and rasterizes via SkiaSharp; the artifact only ships Windows natives. The image now bundles Linux `libSkiaSharp.so` (2.88.9 + 3.119.0) and the entrypoint links a version-matched pair (system harfbuzz + Skia) into the service dir — BOTH or NEITHER (Skia-missing-but-harfbuzz-present kills the NST via SkiaSharp's SKObject finalizer). Validated on 28.1: Report Selections Tests 54→14 failures, Document Attachment Tests 91→38, zero NST crashes |
+| Missing-isolation cascades: "General Posting Setup does not exist" (39), "Commit with AutoRollback" (25), empty-table/filter asserts | ~90 | hub-runner artifact (no test-runner codeunit → no RequiredTestIsolation); expected to shrink under run-tests.sh |
+| ~~Empty generated images~~: "selected file 'x.jpeg' has no content" | ~17 | **FIXED — DrawingStub** now emits real image bytes (source-byte passthrough on round-trips, valid synthesized PNG/JPEG otherwise). CU 134776: 91 → 45 failures; the rest are empty *PDF* attachments (reporting-stub bucket above) |
+| License limit ("new users do not meet the terms", SUPER assignment) | ~14 | Cronus demo license constraint — use `BC_LICENSE_FILE` (ISV license) to clear |
+| User cannot be deleted (BCRUNNER logged on) | 9 | documented below |
+| Word merger `TransformContentElement` NullRef (TC=0 residual, non-fatal) | 6 | Patch #23 neighborhood; benign leftovers |
+| ~~Backslash paths~~: "Access is denied to file '/bc/service\\..\\..\\App\\Test\\Files\\...'" | 5 | **FIXED — Patch #28** (ExpandFileName normalizes `\`→`/`, materializes user-folder parents). Access-denied signature eliminated; the ImageAnalysis tests still fail honestly because the artifact doesn't ship `App/Test/Files` |
+| `MemoryMappedFile.CreateOrOpen`: "Named maps are not supported" | 3 | genuine .NET-on-Linux platform limitation |
+| Long tail (assert diffs, localized-collation artifacts, item tracking data) | rest | mostly data/cascade noise; re-triage after the isolation bucket is sized |
+
+Remaining next steps: (1) rerun one suite under `run-tests.sh` to size the
+isolation + TestPage buckets honestly; (2) `NSClientCallback.CreateDotNetHandle`
+("A call to IsAvailable failed": the creation-side hole, still open, see below).
+
 ## "User cannot be deleted because logged on" (~142 failures in SINGLESERVER)
 
 **Root cause**: Microsoft's test cleanup code does broad `User.DeleteAll()` or
