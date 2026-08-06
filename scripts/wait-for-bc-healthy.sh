@@ -6,7 +6,7 @@
 # Usage (run from a directory containing docker-compose.yml):
 #   ./scripts/wait-for-bc-healthy.sh [timeout-minutes]
 #
-# Defaults to 30 minutes. Polls every 5 seconds and prints a progress
+# Defaults to 30 minutes. Polls every 2 seconds and prints a progress
 # line from the most recent [entrypoint] log message every 60 seconds
 # so you can see what BC is doing without staring at silence.
 #
@@ -28,7 +28,7 @@
 set -uo pipefail
 
 TIMEOUT_MIN="${1:-30}"
-MAX_ITER=$(( TIMEOUT_MIN * 12 ))   # 5 sec poll interval
+MAX_ITER=$(( TIMEOUT_MIN * 30 ))   # 2 sec poll interval
 
 START_TIME=$(date +%s)
 LAST_PROGRESS=0
@@ -40,7 +40,7 @@ for i in $(seq 1 "$MAX_ITER"); do
     CID=$(docker compose ps -q bc 2>/dev/null | head -1)
     if [ -z "$CID" ]; then
         # Container hasn't been created yet — give it a moment.
-        sleep 5
+        sleep 2
         continue
     fi
 
@@ -76,7 +76,7 @@ for i in $(seq 1 "$MAX_ITER"); do
         LAST_PROGRESS=$NOW
     fi
 
-    sleep 5
+    sleep 2
 done
 
 echo "ERROR: BC did not become healthy within ${TIMEOUT_MIN} minutes (final status: ${STATUS})"

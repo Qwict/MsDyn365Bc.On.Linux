@@ -18,8 +18,10 @@ services:
       - ${BC_LICENSE_HOST_PATH:-/dev/null}:/bc/custom-license.bclicense:ro
     healthcheck:
       test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '${SA_PASSWORD:-Passw0rd123!}' -C -No -Q "SELECT 1" || exit 1
-      interval: 10s
-      retries: 10
+      # 5s interval: depends_on gates bc container creation on this check, so
+      # its interval is dead time on every boot. SELECT 1 is negligible load.
+      interval: 5s
+      retries: 20
       start_period: 20s
 
   bc:
@@ -98,12 +100,12 @@ services:
       - ${BC_LICENSE_HOST_PATH:-/dev/null}:/bc/custom-license.bclicense:ro
     healthcheck:
       test: test -f /tmp/bc-ready && curl -sf -o /dev/null -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company || exit 1
-      # 5s interval (was 15s) so wait-for-bc-healthy.sh sees the transition within ~5s
-      # of the entrypoint touching /tmp/bc-ready. Saves ~10-15s of slack on every cold
-      # boot. The OData /Company probe is cheap; running it every 5s instead of every
-      # 15s during the start_period grace window adds negligible NST load.
-      interval: 5s
-      retries: 360            # 5s × 360 = 30 min after start_period (was 15s × 120)
+      # 2s interval (was 15s, then 5s) so the healthy transition is seen within
+      # ~2s of the entrypoint touching /tmp/bc-ready. With cold boots down to
+      # ~30-80s (R2R Merkle seeding + fast downloads), a 5s interval was
+      # 7-15% of the whole wait. The OData /Company probe is cheap.
+      interval: 2s
+      retries: 900            # 2s × 900 = 30 min after start_period
       start_period: 60s
       timeout: 5s             # was 10s; the probe is cheap, fail fast
 
