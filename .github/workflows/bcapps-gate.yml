@@ -106,6 +106,19 @@ jobs:
           docker compose up -d 2>&1 | tail -3
           ./scripts/wait-for-bc-healthy.sh 30
 
+      # Surface the boot-phase facts the wait loop's 60s sampling misses:
+      # did the R2R pre-seed run, did any Base App chunk recompile (it must
+      # NOT — that would mean the Merkle seeding regressed), where did the
+      # boot seconds go.
+      - name: Boot diagnostics
+        run: |
+          docker compose logs bc 2>&1 | grep -E \
+            "R2R DLL cache seeded|Pre-seeding|Compiling the application object assembly|NST startup|Total startup|Step [0-9b]+ \(" \
+            | sed 's/^bc-1  | //' || true
+          if docker compose logs bc 2>&1 | grep -q "Compiling the application object assembly for the app: .*Base Application"; then
+            echo "::warning::Base Application chunks were RECOMPILED — R2R Merkle pre-seed did not take effect on this boot"
+          fi
+
       - name: Publish test-library dependencies
         run: |
           source ./scripts/publish-app.sh
