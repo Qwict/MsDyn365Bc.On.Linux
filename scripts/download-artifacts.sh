@@ -7,6 +7,20 @@
 #     (host tmpfs / runner /tmp) rather than directly to the destination
 #     volume.  This avoids writing the raw zip into the (slower) Docker
 #     named volume and cuts the effective I/O to the volume by ~50%.
+#   - Each zip is fetched with MULTIPLE PARALLEL BYTE-RANGE STREAMS
+#     (BC_DL_STREAMS per file, default 8). Azure Front Door serves a
+#     POP-cache MISS at only ~4-8 MB/s PER CONNECTION (origin fetch),
+#     while the same POP serves cache hits at 200+ MB/s — that's the
+#     source of the notorious 30s-vs-6min variance. AFD uses chunked
+#     object caching, so N concurrent range requests pull origin chunks
+#     in parallel and multiply cold-miss throughput by ~N. The direct
+#     blob endpoint (bcartifacts.blob.core.windows.net) is no longer an
+#     option: Microsoft put it behind a network security perimeter
+#     (403), so AFD is the only door.
+#   - Every range stream aborts and retries when it crawls below
+#     1 MB/s for 30s (--speed-limit/--speed-time) — a reconnect usually
+#     lands a healthier origin connection, and by then AFD has cached
+#     the chunks already pulled.
 #   - Timing is logged for each phase so you can see exactly where time
 #     goes: version resolution, download, and extraction.
 #
@@ -16,6 +30,80 @@
 set -e
 
 _ms() { date +%s%3N; }
+
+# Parallel range streams per file (two files download concurrently, so the
+# total connection count is 2x this). 8 is a good default: ~8x cold-miss
+# throughput without hammering AFD; override with BC_DL_STREAMS.
+STREAMS="${BC_DL_STREAMS:-8}"
+
+# Fetch one byte range to a part file, with slow-transfer abort + retries.
+# A stream stuck below 1 MB/s for 30s is killed and reconnected — AFD
+# origin connections occasionally degenerate, and a fresh connection
+# (plus the chunks AFD cached meanwhile) is almost always faster.
+_fetch_range() {
+    local url="$1" out="$2" start="$3" end="$4"
+    local want=$((end - start + 1)) attempt got
+    for attempt in 1 2 3; do
+        if curl -sf --http1.1 --retry 2 --retry-all-errors \
+                --speed-limit 1000000 --speed-time 30 \
+                -r "$start-$end" "$url" -o "$out"; then
+            got=$(stat -c%s "$out" 2>/dev/null || echo 0)
+            if [ "$got" -eq "$want" ]; then
+                return 0
+            fi
+            echo "[artifacts] WARN: range $start-$end returned $got of $want bytes (attempt $attempt)" >&2
+        else
+            echo "[artifacts] WARN: range $start-$end failed or stalled <1MB/s (attempt $attempt)" >&2
+        fi
+        sleep 2
+    done
+    echo "[artifacts] ERROR: range $start-$end failed after 3 attempts" >&2
+    return 1
+}
+
+# Download a URL using $STREAMS parallel byte-range streams, then stitch
+# the parts together. Falls back to a plain single-stream curl when the
+# server doesn't advertise range support or a usable Content-Length.
+_ranged_download() {
+    local url="$1" out="$2"
+    local head size
+    head=$(curl -sfI --http1.1 --retry 3 --retry-all-errors "$url" | tr -d '\r') || head=""
+    size=$(echo "$head" | awk 'tolower($1)=="content-length:"{print $2}' | tail -1)
+    if ! echo "$head" | grep -qi '^accept-ranges: *bytes' || \
+       ! echo "$size" | grep -qE '^[0-9]+$' || [ "$size" -lt $((16 * 1024 * 1024)) ]; then
+        curl -sSL --retry 3 --retry-all-errors --http1.1 \
+             --speed-limit 1000000 --speed-time 60 "$url" -o "$out"
+        return
+    fi
+
+    local chunk=$(( (size + STREAMS - 1) / STREAMS ))
+    local i start end pids=() rc=0
+    for ((i = 0; i < STREAMS; i++)); do
+        start=$((i * chunk))
+        end=$((start + chunk - 1))
+        if [ "$end" -ge "$size" ]; then end=$((size - 1)); fi
+        if [ "$start" -gt "$end" ]; then break; fi
+        _fetch_range "$url" "$out.part$i" "$start" "$end" &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        if ! wait "$pid"; then rc=1; fi
+    done
+    if [ "$rc" -ne 0 ]; then return 1; fi
+
+    # Explicit index loop — a glob would order part10 before part2.
+    : > "$out"
+    for ((i = 0; i < ${#pids[@]}; i++)); do
+        cat "$out.part$i" >> "$out"
+        rm -f "$out.part$i"
+    done
+    local total
+    total=$(stat -c%s "$out")
+    if [ "$total" -ne "$size" ]; then
+        echo "[artifacts] ERROR: stitched $total bytes, expected $size ($url)" >&2
+        return 1
+    fi
+}
 
 # Parse arguments: either (url, dest) or (type, version, country, dest)
 if [ $# -eq 2 ]; then
@@ -107,11 +195,11 @@ trap 'rm -rf "$TMPDIR_DL"' EXIT
 mkdir -p "$DEST/app" "$DEST/platform"
 
 # ── Parallel download ──────────────────────────────────────────────────────
-echo "[artifacts] Downloading app + platform in parallel..."
+echo "[artifacts] Downloading app + platform in parallel ($STREAMS range streams each)..."
 T0=$(_ms)
-curl -sSL --retry 3 --retry-all-errors --http1.1 "$APP_URL"      -o "$TMPDIR_DL/app.zip"      &
+_ranged_download "$APP_URL"      "$TMPDIR_DL/app.zip"      &
 APP_PID=$!
-curl -sSL --retry 3 --retry-all-errors --http1.1 "$PLATFORM_URL" -o "$TMPDIR_DL/platform.zip" &
+_ranged_download "$PLATFORM_URL" "$TMPDIR_DL/platform.zip" &
 PLATFORM_PID=$!
 
 wait $APP_PID      || { echo "[artifacts] ERROR: app artifact download failed";      exit 1; }
