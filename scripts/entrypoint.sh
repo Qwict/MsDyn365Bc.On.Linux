@@ -274,6 +274,31 @@ if [ ! -f "$ADDINS_DIR/System.Runtime.dll" ] && [ -d /bc/refasm ]; then
         log_step "Applied DrawingStub to Add-Ins (compile-time)"
     fi
 
+    # Report rendering natives: BC's renderer text-shapes via P/Invoke "harfbuzz"
+    # (Aspose.Words) and rasterizes via SkiaSharp. The artifact only ships the
+    # Windows natives (harfbuzz.dll / libSkiaSharp.dll). Link the system harfbuzz
+    # and a version-matched Linux libSkiaSharp.so into the service dir (the
+    # P/Invoke probe path) — BOTH or NEITHER: with harfbuzz resolvable but Skia
+    # missing, the first render kills the whole NST via SkiaSharp's SKObject
+    # finalizer, which is strictly worse than the graceful per-test shaper error.
+    SKIA_VER=$(python3 - "$SERVICE_DIR/SkiaSharp.dll" <<'PYEOF' 2>/dev/null || true
+import re, sys
+try:
+    data = open(sys.argv[1], 'rb').read()
+    m = re.search(rb'i(\d+\.\d+\.\d+)\+', data)
+    print(m.group(1).decode() if m else '')
+except Exception:
+    print('')
+PYEOF
+)
+    if [ -n "$SKIA_VER" ] && [ -f "/bc/natives/skia/$SKIA_VER/libSkiaSharp.so" ]; then
+        cp "/bc/natives/skia/$SKIA_VER/libSkiaSharp.so" "$SERVICE_DIR/libSkiaSharp.so"
+        ln -sf /usr/lib/x86_64-linux-gnu/libharfbuzz.so.0 "$SERVICE_DIR/libharfbuzz.so"
+        log_step "Report rendering natives linked (SkiaSharp $SKIA_VER + system harfbuzz)"
+    else
+        log_step "WARN: no bundled libSkiaSharp.so for SkiaSharp '$SKIA_VER' — report rendering stays disabled (harfbuzz not linked either)"
+    fi
+
     # Layer 5: MockTest.dll for test framework (required by Test Library)
     # Try from image overlay first, fall back to artifacts
     if [ -f /bc/addins-overlay/MockTest.dll ]; then
