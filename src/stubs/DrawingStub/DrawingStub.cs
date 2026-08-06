@@ -18,8 +18,20 @@ namespace System.Drawing
 {
     public abstract class Image : IDisposable
     {
-        public virtual int Width => 0;
-        public virtual int Height => 0;
+        // Real content where we have it: images constructed from a stream keep the source
+        // bytes so Save() round-trips them; images constructed from dimensions synthesize
+        // a valid PNG/JPEG. A no-op Save produced zero-byte files, which BC's attachment
+        // import rejects with "The selected file '<x>' has no content."
+        internal byte[]? SourceBytes;
+        internal int StubWidth;
+        internal int StubHeight;
+        // True when the content carries a known image signature (or the object was
+        // synthesized from dimensions). Image.FromStream throws when this is false,
+        // matching Windows GDI+ — see FromStream.
+        internal bool LooksLikeImage = true;
+
+        public virtual int Width => StubWidth;
+        public virtual int Height => StubHeight;
         public float HorizontalResolution => 96f;
         public float VerticalResolution => 96f;
         public Guid[] FrameDimensionsList => Array.Empty<Guid>();
@@ -29,16 +41,30 @@ namespace System.Drawing
         public int GetFrameCount(Drawing.Imaging.FrameDimension dimension) => 0;
         public void SelectActiveFrame(Drawing.Imaging.FrameDimension dimension, int frameIndex) { }
 
-        public void Save(Stream stream, Drawing.Imaging.ImageFormat format) { }
+        public void Save(Stream stream, Drawing.Imaging.ImageFormat format)
+            => StubImageWriter.Write(stream, this, format?.Guid ?? default);
         public void Save(Stream stream, Drawing.Imaging.ImageCodecInfo encoder,
-            Drawing.Imaging.EncoderParameters? encoderParams) { }
+            Drawing.Imaging.EncoderParameters? encoderParams)
+            => StubImageWriter.Write(stream, this, encoder?.FormatID ?? default);
         public void SaveAdd(Drawing.Imaging.EncoderParameters encoderParams) { }
 
         public Drawing.Imaging.PropertyItem? GetPropertyItem(int propid) => null;
         public void SetPropertyItem(Drawing.Imaging.PropertyItem propitem) { }
 
-        public static Image FromStream(Stream stream) => new Bitmap(stream);
-        public static Image FromStream(Stream stream, bool useEmbeddedColorManagement) => new Bitmap(stream);
+        // Faithful to Windows GDI+: FromStream THROWS ArgumentException for content that
+        // isn't a recognized image. BC relies on that contract for content sniffing —
+        // NavMediaFactory.ProcessMediaObject probes unknown media with Image.FromStream
+        // and falls back to application/octet-stream when it throws. A never-throwing
+        // stub made BC treat arbitrary text/binary media as images and re-encode them
+        // into garbage (issue #18: tenant report layout import produced an empty layout).
+        public static Image FromStream(Stream stream) => FromStream(stream, false);
+        public static Image FromStream(Stream stream, bool useEmbeddedColorManagement)
+        {
+            var bmp = new Bitmap(stream);
+            if (!bmp.LooksLikeImage)
+                throw new ArgumentException("Parameter is not valid.");
+            return bmp;
+        }
 
         public void RotateFlip(RotateFlipType rotateFlipType) { }
 
@@ -70,15 +96,218 @@ namespace System.Drawing
 
     public sealed class Bitmap : Image
     {
-        public Bitmap(int width, int height) { }
-        public Bitmap(Stream stream) { }
-        public Bitmap(Image original) { }
-        public Bitmap(Image original, int width, int height) { }
+        public Bitmap(int width, int height)
+        {
+            StubWidth = width > 0 ? width : 1;
+            StubHeight = height > 0 ? height : 1;
+        }
+
+        public Bitmap(Stream stream)
+        {
+            try
+            {
+                using var ms = new MemoryStream();
+                stream.CopyTo(ms);
+                SourceBytes = ms.ToArray();
+                LooksLikeImage = StubImageWriter.HasImageSignature(SourceBytes);
+                var (w, h) = StubImageWriter.SniffDimensions(SourceBytes);
+                StubWidth = w;
+                StubHeight = h;
+            }
+            catch
+            {
+                LooksLikeImage = false;
+                StubWidth = 1;
+                StubHeight = 1;
+            }
+        }
+
+        public Bitmap(Image original)
+        {
+            SourceBytes = original?.SourceBytes;
+            StubWidth = original?.StubWidth ?? 1;
+            StubHeight = original?.StubHeight ?? 1;
+        }
+
+        public Bitmap(Image original, int width, int height)
+        {
+            // A resize drops the source bytes — Save() synthesizes at the new dimensions.
+            StubWidth = width > 0 ? width : 1;
+            StubHeight = height > 0 ? height : 1;
+        }
         public void SetResolution(float xDpi, float yDpi) { }
         public void MakeTransparent() { }
         public void MakeTransparent(Color transparentColor) { }
         public Color GetPixel(int x, int y) => Color.Empty;
         public void SetPixel(int x, int y, Color color) { }
+    }
+
+    // Emits real, decodable image bytes for the stubbed Save() paths. Source bytes are
+    // passed through verbatim when the Image came from a stream; otherwise a valid image
+    // is synthesized at the Image's dimensions (opaque white). Not gated to specific BC
+    // call sites — anything that saves an Image gets non-empty, well-formed output.
+    internal static class StubImageWriter
+    {
+        private static readonly Guid JpegGuid = new Guid("b96b3cae-0728-11d3-9d7b-0000f81ef32e");
+        private static readonly Guid ExifGuid = new Guid("b96b3cb2-0728-11d3-9d7b-0000f81ef32e");
+
+        // Smallest well-formed baseline JPEG (1×1 white). Synthesizing JPEG at arbitrary
+        // dimensions isn't worth a DCT encoder — consumers that care about dimensions get
+        // them from Image.Width/Height, not by re-decoding.
+        private static readonly byte[] MinimalJpeg = Convert.FromBase64String(
+            "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwc" +
+            "KDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAA" +
+            "AAAAAAAAAAD/2gAIAQEAAD8AVN//2Q==");
+
+        internal static void Write(Stream stream, Image image, Guid formatGuid)
+        {
+            var src = image?.SourceBytes;
+            if (src != null && src.Length > 0)
+            {
+                stream.Write(src, 0, src.Length);
+                return;
+            }
+            if (formatGuid == JpegGuid || formatGuid == ExifGuid)
+            {
+                stream.Write(MinimalJpeg, 0, MinimalJpeg.Length);
+                return;
+            }
+            var png = BuildPng(image?.StubWidth ?? 1, image?.StubHeight ?? 1);
+            stream.Write(png, 0, png.Length);
+        }
+
+        // Same signature set Windows GDI+ accepts (BMP/GIF/JPEG/PNG/TIFF/ICO/EMF/WMF).
+        // Content matching none of these must make Image.FromStream throw, like GDI+.
+        internal static bool HasImageSignature(byte[] d)
+        {
+            if (d == null || d.Length < 8) return false;
+            if (d[0] == 0x89 && d[1] == 0x50 && d[2] == 0x4E && d[3] == 0x47) return true;      // PNG
+            if (d[0] == 0xFF && d[1] == 0xD8) return true;                                       // JPEG
+            if (d[0] == 'G' && d[1] == 'I' && d[2] == 'F' && d[3] == '8') return true;           // GIF
+            if (d[0] == 'B' && d[1] == 'M') return true;                                         // BMP
+            if ((d[0] == 'I' && d[1] == 'I' && d[2] == 42 && d[3] == 0)
+             || (d[0] == 'M' && d[1] == 'M' && d[2] == 0 && d[3] == 42)) return true;            // TIFF
+            if (d[0] == 0 && d[1] == 0 && d[2] == 1 && d[3] == 0) return true;                   // ICO
+            if (d[0] == 0x01 && d[1] == 0x00 && d[2] == 0x00 && d[3] == 0x00
+             && d.Length > 43 && d[40] == 0x20 && d[41] == 0x45 && d[42] == 0x4D && d[43] == 0x46) return true; // EMF
+            if (d[0] == 0xD7 && d[1] == 0xCD && d[2] == 0xC6 && d[3] == 0x9A) return true;       // WMF (placeable)
+            return false;
+        }
+
+        internal static (int, int) SniffDimensions(byte[] d)
+        {
+            try
+            {
+                // PNG: 8-byte signature, IHDR width/height big-endian at 16/20
+                if (d.Length >= 24 && d[0] == 0x89 && d[1] == 0x50 && d[2] == 0x4E && d[3] == 0x47)
+                    return (BE32(d, 16), BE32(d, 20));
+                // GIF: little-endian u16 at 6/8
+                if (d.Length >= 10 && d[0] == 'G' && d[1] == 'I' && d[2] == 'F')
+                    return (d[6] | (d[7] << 8), d[8] | (d[9] << 8));
+                // BMP: little-endian i32 at 18/22
+                if (d.Length >= 26 && d[0] == 'B' && d[1] == 'M')
+                    return (d[18] | (d[19] << 8) | (d[20] << 16) | (d[21] << 24),
+                            Math.Abs(d[22] | (d[23] << 8) | (d[24] << 16) | (d[25] << 24)));
+                // JPEG: scan for SOFn marker (C0–CF except C4/C8/CC), height/width big-endian
+                if (d.Length >= 4 && d[0] == 0xFF && d[1] == 0xD8)
+                {
+                    int i = 2;
+                    while (i + 9 < d.Length && d[i] == 0xFF)
+                    {
+                        byte marker = d[i + 1];
+                        int len = (d[i + 2] << 8) | d[i + 3];
+                        if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC)
+                            return ((d[i + 7] << 8) | d[i + 8], (d[i + 5] << 8) | d[i + 6]);
+                        i += 2 + len;
+                    }
+                }
+            }
+            catch { }
+            return (1, 1);
+        }
+
+        private static int BE32(byte[] d, int i) => (d[i] << 24) | (d[i + 1] << 16) | (d[i + 2] << 8) | d[i + 3];
+
+        // Minimal but fully valid PNG: 8-bit RGB, opaque white, correct CRC32 + zlib/Adler32.
+        private static byte[] BuildPng(int width, int height)
+        {
+            if (width <= 0) width = 1;
+            if (height <= 0) height = 1;
+            // Cap synthesis so a pathological Bitmap(100000,100000) can't allocate GBs.
+            if ((long)width * height > 16_000_000) { width = Math.Min(width, 4000); height = Math.Min(height, 4000); }
+
+            var raw = new byte[height * (1 + 3 * width)];
+            for (int y = 0; y < height; y++)
+            {
+                int row = y * (1 + 3 * width);
+                // raw[row] = 0 (filter: None)
+                for (int x = 1; x <= 3 * width; x++) raw[row + x] = 0xFF; // white
+            }
+
+            byte[] compressed;
+            using (var ms = new MemoryStream())
+            {
+                using (var deflate = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionLevel.Fastest, leaveOpen: true))
+                    deflate.Write(raw, 0, raw.Length);
+                compressed = ms.ToArray();
+            }
+            var idat = new byte[2 + compressed.Length + 4];
+            idat[0] = 0x78; idat[1] = 0x9C; // zlib header
+            Buffer.BlockCopy(compressed, 0, idat, 2, compressed.Length);
+            uint adler = Adler32(raw);
+            idat[^4] = (byte)(adler >> 24); idat[^3] = (byte)(adler >> 16);
+            idat[^2] = (byte)(adler >> 8); idat[^1] = (byte)adler;
+
+            var ihdr = new byte[13];
+            ihdr[0] = (byte)(width >> 24); ihdr[1] = (byte)(width >> 16); ihdr[2] = (byte)(width >> 8); ihdr[3] = (byte)width;
+            ihdr[4] = (byte)(height >> 24); ihdr[5] = (byte)(height >> 16); ihdr[6] = (byte)(height >> 8); ihdr[7] = (byte)height;
+            ihdr[8] = 8;  // bit depth
+            ihdr[9] = 2;  // color type: truecolor RGB
+            // 10..12: compression/filter/interlace = 0
+
+            using var png = new MemoryStream();
+            png.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
+            WriteChunk(png, "IHDR", ihdr);
+            WriteChunk(png, "IDAT", idat);
+            WriteChunk(png, "IEND", Array.Empty<byte>());
+            return png.ToArray();
+        }
+
+        private static void WriteChunk(Stream s, string type, byte[] data)
+        {
+            var t = new byte[] { (byte)type[0], (byte)type[1], (byte)type[2], (byte)type[3] };
+            s.Write(new byte[] { (byte)(data.Length >> 24), (byte)(data.Length >> 16), (byte)(data.Length >> 8), (byte)data.Length }, 0, 4);
+            s.Write(t, 0, 4);
+            s.Write(data, 0, data.Length);
+            uint crc = Crc32(t, data);
+            s.Write(new byte[] { (byte)(crc >> 24), (byte)(crc >> 16), (byte)(crc >> 8), (byte)crc }, 0, 4);
+        }
+
+        private static uint Adler32(byte[] data)
+        {
+            uint a = 1, b = 0;
+            foreach (byte t in data) { a = (a + t) % 65521; b = (b + a) % 65521; }
+            return (b << 16) | a;
+        }
+
+        private static uint[]? _crcTable;
+        private static uint Crc32(byte[] type, byte[] data)
+        {
+            if (_crcTable == null)
+            {
+                _crcTable = new uint[256];
+                for (uint n = 0; n < 256; n++)
+                {
+                    uint c = n;
+                    for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1;
+                    _crcTable[n] = c;
+                }
+            }
+            uint crc = 0xFFFFFFFF;
+            foreach (byte t in type) crc = _crcTable[(crc ^ t) & 0xFF] ^ (crc >> 8);
+            foreach (byte t in data) crc = _crcTable[(crc ^ t) & 0xFF] ^ (crc >> 8);
+            return crc ^ 0xFFFFFFFF;
+        }
     }
 
     public static class ColorTranslator
