@@ -773,11 +773,16 @@ jobs:
               # /dev/TestRunnerHub. The script prints the same
               # "N total, P passed, F failed" and "Test codeunits:" lines
               # as run-tests.sh, so the parsing below works for both.
+              # --transport auto: one persistent TestRunnerHub connection for
+              # all codeunits (~0.4s saved per codeunit vs spawning `al
+              # runtests` each time), falling back to the per-codeunit CLI
+              # path if the hub connection can't be established.
               python3 scripts/run-tests-altool.py \
                 --app "$app" \
                 --codeunit-range "${{ inputs.codeunit_range }}" \
                 --junit-output "$junit_file" \
                 --altool-cmd "$HOME/.dotnet/tools/al" \
+                --transport auto \
                 --timeout 30 2>&1 | tee "$tmplog"
             else
               ./scripts/run-tests.sh \

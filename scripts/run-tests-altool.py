@@ -39,8 +39,10 @@ Authentication: the AL tool reads BC_SERVER_USERNAME / BC_SERVER_PASSWORD
 from the environment for --authentication UserPassword. This script sets
 them from --auth (default BCRUNNER:Admin123!, same as run-tests.sh).
 
---transport {cli,hub}: 'cli' (default) shells out to `al runtests <id>` once
-per codeunit — this is the path validated above. 'hub' (EXPERIMENTAL) opens
+--transport {cli,hub,auto}: 'cli' (default) shells out to `al runtests <id>`
+once per codeunit — this is the path validated above. 'auto' tries hub and
+falls back to cli when the hub connection can't be established (the fallback
+can only trigger before any test has run). 'hub' opens
 ONE persistent SignalR connection to /dev/TestRunnerHub and runs every
 codeunit over it (protocol reverse-engineered from the al dotnet tool's own
 HubBasedTestRunnerService — no `al` CLI needed at test-run time, stdlib-only
@@ -819,13 +821,16 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=30, help="overall timeout, minutes (default 30)")
     ap.add_argument("--codeunit-timeout", type=int, default=10, help="per-codeunit timeout, minutes (default 10)")
     ap.add_argument("--altool-cmd", default="al", help="AL dotnet tool command or path (default 'al')")
-    ap.add_argument("--transport", choices=["cli", "hub"], default="cli",
+    ap.add_argument("--transport", choices=["cli", "hub", "auto"], default="cli",
                      help="'cli' (default) shells out to `al runtests` once per codeunit — "
                           "battle-tested but pays a fresh process start + SignalR negotiate + "
-                          "auth per codeunit. 'hub' (EXPERIMENTAL) opens one persistent "
-                          "TestRunnerHub connection and runs every codeunit over it — "
-                          "meaningfully faster on suites with many codeunits, no `al` CLI "
-                          "dependency at test-run time. Same stdout/JUnit contract either way.")
+                          "auth per codeunit. 'hub' opens one persistent TestRunnerHub "
+                          "connection and runs every codeunit over it — meaningfully faster "
+                          "on suites with many codeunits, no `al` CLI dependency at test-run "
+                          "time. 'auto' tries hub and falls back to cli when the hub "
+                          "connection can't be established (fallback can only trigger before "
+                          "any test has run, so no double execution). Same stdout/JUnit "
+                          "contract in all modes.")
     args = ap.parse_args()
 
     user, _, password = args.auth.partition(":")
@@ -889,26 +894,17 @@ def main() -> int:
     deadline = time.monotonic() + args.timeout * 60
     runs: list[CodeunitRun] = []
     overall_start = time.monotonic()
-    if args.transport == "hub":
-        print(f"Transport: hub (persistent TestRunnerHub connection, {len(codeunits)} codeunit(s))")
-        try:
-            runs = run_codeunits_via_hub(
-                codeunits, args.server, args.server_instance, args.port, company,
-                user, password, deadline, args.codeunit_timeout * 60,
-            )
-        except (ConnectionError, OSError, TimeoutError) as ex:
-            print(f"ERROR: hub transport failed: {ex}")
-            print("       Falling back is not automatic — rerun with --transport cli.")
-            return 1
-    else:
+
+    def run_via_cli() -> list[CodeunitRun]:
+        cli_runs: list[CodeunitRun] = []
         for cuid in codeunits:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 print(f"ERROR: overall timeout ({args.timeout} min) reached — "
-                      f"{len(codeunits) - len(runs)} codeunit(s) not run")
+                      f"{len(codeunits) - len(cli_runs)} codeunit(s) not run")
                 timed_out = CodeunitRun(cuid)
                 timed_out.error = "not run: overall timeout reached"
-                runs.append(timed_out)
+                cli_runs.append(timed_out)
                 break
             print(f"=== Codeunit {cuid} ===")
             run = run_codeunit(
@@ -917,7 +913,30 @@ def main() -> int:
             )
             if run.error:
                 print(f"    ERROR: {run.error}")
-            runs.append(run)
+            cli_runs.append(run)
+        return cli_runs
+
+    if args.transport in ("hub", "auto"):
+        print(f"Transport: hub (persistent TestRunnerHub connection, {len(codeunits)} codeunit(s))")
+        try:
+            runs = run_codeunits_via_hub(
+                codeunits, args.server, args.server_instance, args.port, company,
+                user, password, deadline, args.codeunit_timeout * 60,
+            )
+        except (ConnectionError, OSError, TimeoutError) as ex:
+            # These can only escape from the connection/handshake/Initialize
+            # phase — run_codeunits_via_hub handles mid-run failures itself —
+            # so at this point no test has executed and a cli fallback cannot
+            # double-run anything.
+            if args.transport == "auto":
+                print(f"WARN: hub transport unavailable ({ex}) — falling back to cli transport")
+                runs = run_via_cli()
+            else:
+                print(f"ERROR: hub transport failed: {ex}")
+                print("       Falling back is not automatic — rerun with --transport cli or auto.")
+                return 1
+    else:
+        runs = run_via_cli()
     total_elapsed = time.monotonic() - overall_start
 
     total = sum(len(r.results) for r in runs)
