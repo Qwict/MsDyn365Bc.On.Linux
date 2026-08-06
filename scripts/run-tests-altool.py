@@ -38,19 +38,42 @@ Usage:
 Authentication: the AL tool reads BC_SERVER_USERNAME / BC_SERVER_PASSWORD
 from the environment for --authentication UserPassword. This script sets
 them from --auth (default BCRUNNER:Admin123!, same as run-tests.sh).
+
+--transport {cli,hub}: 'cli' (default) shells out to `al runtests <id>` once
+per codeunit — this is the path validated above. 'hub' (EXPERIMENTAL) opens
+ONE persistent SignalR connection to /dev/TestRunnerHub and runs every
+codeunit over it (protocol reverse-engineered from the al dotnet tool's own
+HubBasedTestRunnerService — no `al` CLI needed at test-run time, stdlib-only
+WebSocket client). Measured against a live BC 28.3 server: 43 codeunits took
+18.6s over --transport cli (~433ms/codeunit — process start + SignalR
+negotiate + auth, paid per invocation) vs 0.47s over --transport hub
+(~11ms/codeunit after one shared connection setup) — identical JUnit output
+and pass/fail counts in both cases. Known hub-protocol quirk: the server
+closes the connection if the SAME codeunit id is invoked twice on one
+connection (doesn't matter in practice — a test app's codeunit ids are
+always unique, and this script never re-invokes one). See CodeunitRun /
+run_codeunits_via_hub for the full protocol writeup.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
+import queue
+import random
 import re
+import socket
+import ssl
+import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -302,6 +325,412 @@ def run_codeunit(
     return run
 
 
+
+# --------------------------------------------------------------------------
+# --transport hub: direct TestRunnerHub SignalR client.
+#
+# Reverse-engineered from the al dotnet tool's own implementation
+# (Microsoft.Dynamics.Nav.LanguageModelTools.dll, HubBasedTestRunnerService /
+# TestRunService — decompiled with ilspycmd) and confirmed against a live
+# BC 28.3 server by capturing real traffic. Protocol summary (see the final
+# report for the full writeup):
+#
+#   Hub URL:   <server>:<port>/<instance>/dev/TestRunnerHub
+#   Negotiate: POST <hub-url>/negotiate?negotiateVersion=1
+#              -> {"connectionToken": "...", ...}
+#   Connect:   GET  ws://<hub-url>?id=<connectionToken>&Authentication=<auth>
+#              (Authorization header set too, redundant with the query param
+#              — same pattern as DebuggerHub)
+#   Handshake: client sends {"protocol":"json","version":1}<RS>, server
+#              replies {}<RS> (RS = 0x1e, the SignalR JSON-protocol record
+#              separator)
+#   Server->client callbacks (type 1, "target" = method name):
+#     HubConnected, LogServerInfoMessage, LogServerMessage, RuntimeInitialized,
+#     IsAlive (client must reply with a "AcknowledgeIsAlive" invocation or the
+#     hub disconnects it), TestStarted(codeunitId, methodName),
+#     TestCompleted(codeunitId, methodName, status, output, durationMs),
+#     TestRunCompleted(codeCoverageInfo-or-null)
+#   Client->server invocations (type 1, with optional invocationId to get a
+#   type-3 completion ack back):
+#     Initialize(companyName, debuggingContext, coverageMode) — coverageMode
+#       0 = None (the only mode this client uses)
+#     RunTests(codeunitId, testMethodNames[])  — testMethodNames=[] runs all
+#     StopTestExecution()
+#   TestResultStatus enum (transmitted as a plain int, no StringEnumConverter
+#   on the wire): Passed=0, Failed=1, Skipped=2.
+#   SignalR keepalive pings arrive as {"type":6} — no ack needed for a
+#   short-lived client; ignore.
+#
+# One connection can run an arbitrary sequence of codeunits: after a
+# TestRunCompleted event for codeunit N, invoking RunTests(N+1, []) on the
+# SAME connection reuses the already-authenticated session — this is what
+# eliminates the ~0.4s per-codeunit process-start + negotiate + auth
+# overhead that --transport cli pays on every `al runtests` invocation.
+#
+# Implemented with the stdlib only (raw socket + hand-rolled RFC6455 framing)
+# so --transport hub has no extra pip dependency in CI images.
+
+_RS = "\x1e"  # SignalR JSON-Hub-Protocol record separator
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class _WebSocketClient:
+    """Minimal RFC6455 client: text frames only, stdlib socket + ssl."""
+
+    def __init__(self, url: str, headers: dict[str, str], connect_timeout: float = 15.0):
+        parsed = urllib.parse.urlparse(url)
+        self.host = parsed.hostname
+        self.port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        self.path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        self.use_ssl = parsed.scheme == "wss"
+        self.headers = headers
+        self.connect_timeout = connect_timeout
+        self.sock: socket.socket | None = None
+        self._recv_buf = b""
+        self._msg_queue: queue.Queue = queue.Queue()
+        self._send_lock = threading.Lock()
+        self._reader_thread: threading.Thread | None = None
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
+        raw.settimeout(None)
+        if self.use_ssl:
+            ctx = ssl.create_default_context()
+            raw = ctx.wrap_socket(raw, server_hostname=self.host)
+        self.sock = raw
+        key = base64.b64encode(bytes(random.getrandbits(8) for _ in range(16))).decode()
+        lines = [
+            f"GET {self.path} HTTP/1.1",
+            f"Host: {self.host}:{self.port}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        for k, v in self.headers.items():
+            lines.append(f"{k}: {v}")
+        self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        head = self._recv_http_headers()
+        status_line = head.split(b"\r\n", 1)[0]
+        if b" 101 " not in status_line:
+            raise ConnectionError(f"WebSocket handshake failed: {status_line!r} — {head[:500]!r}")
+        expected = base64.b64encode(
+            hashlib.sha1((key + _WS_GUID).encode()).digest()
+        ).decode().encode()
+        if expected not in head:
+            raise ConnectionError("WebSocket handshake Sec-WebSocket-Accept mismatch")
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _recv_http_headers(self) -> bytes:
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("connection closed during WebSocket handshake")
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        self._recv_buf = rest
+        return head
+
+    def _recv_exact(self, n: int) -> bytes:
+        while len(self._recv_buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("WebSocket connection closed")
+            self._recv_buf += chunk
+        data = self._recv_buf[:n]
+        self._recv_buf = self._recv_buf[n:]
+        return data
+
+    def _read_message(self) -> bytes | None:
+        payload = b""
+        while True:
+            hdr = self._recv_exact(2)
+            b0, b1 = hdr[0], hdr[1]
+            fin = b0 & 0x80
+            opcode = b0 & 0x0F
+            masked = b1 & 0x80
+            length = b1 & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._recv_exact(8))[0]
+            mask_key = self._recv_exact(4) if masked else None
+            data = self._recv_exact(length)
+            if masked:
+                data = bytes(b ^ mask_key[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:  # close
+                return None
+            if opcode == 0x9:  # ping -> pong
+                self._send_frame(0xA, data)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+            payload += data
+            if fin:
+                return payload
+
+    def _reader_loop(self) -> None:
+        try:
+            while True:
+                msg = self._read_message()
+                if msg is None:
+                    break
+                self._msg_queue.put(("message", msg))
+        except Exception as ex:  # noqa: BLE001 - surfaced to the consumer thread
+            self._msg_queue.put(("error", ex))
+            return
+        self._msg_queue.put(("closed", None))
+
+    def _send_frame(self, opcode: int, data: bytes) -> None:
+        with self._send_lock:
+            b0 = 0x80 | opcode
+            length = len(data)
+            mask_key = bytes(random.getrandbits(8) for _ in range(4))
+            if length < 126:
+                header = bytes([b0, 0x80 | length])
+            elif length < 65536:
+                header = bytes([b0, 0x80 | 126]) + struct.pack(">H", length)
+            else:
+                header = bytes([b0, 0x80 | 127]) + struct.pack(">Q", length)
+            masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(data))
+            self.sock.sendall(header + mask_key + masked)
+
+    def send_text(self, text: str) -> None:
+        self._send_frame(0x1, text.encode("utf-8"))
+
+    def recv(self, timeout: float | None = None) -> bytes | None:
+        try:
+            kind, val = self._msg_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError("timed out waiting for WebSocket message") from None
+        if kind == "error":
+            raise val
+        if kind == "closed":
+            return None
+        return val
+
+    def close(self) -> None:
+        try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+
+
+class _SignalRHub:
+    """JSON Hub Protocol framing (record-separated JSON) over a WebSocket."""
+
+    def __init__(self, ws: _WebSocketClient):
+        self.ws = ws
+        self._buf = ""
+
+    def handshake(self, timeout: float = 15.0) -> None:
+        self.ws.send_text(json.dumps({"protocol": "json", "version": 1}) + _RS)
+        frame = self.next_frame(timeout=timeout)
+        if frame.get("error"):
+            raise ConnectionError(f"SignalR handshake rejected: {frame['error']}")
+
+    def next_frame(self, timeout: float | None = None) -> dict:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while _RS not in self._buf:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if deadline is not None and remaining <= 0:
+                raise TimeoutError("timed out waiting for hub message")
+            raw = self.ws.recv(timeout=remaining)
+            if raw is None:
+                raise ConnectionError("hub connection closed")
+            self._buf += raw.decode("utf-8", errors="replace")
+        idx = self._buf.index(_RS)
+        frame_str = self._buf[:idx]
+        self._buf = self._buf[idx + 1:]
+        if not frame_str:
+            return {}
+        return json.loads(frame_str)
+
+    def send(self, obj: dict) -> None:
+        self.ws.send_text(json.dumps(obj) + _RS)
+
+    def invoke(self, target: str, args: list, invocation_id: str | None = None) -> None:
+        msg = {"type": 1, "target": target, "arguments": args}
+        if invocation_id is not None:
+            msg["invocationId"] = invocation_id
+        self.send(msg)
+
+
+def _hub_negotiate(hub_http_base: str, auth_header: str, timeout: float = 15.0) -> str:
+    """POST .../negotiate?negotiateVersion=1, return the connectionToken."""
+    req = urllib.request.Request(
+        hub_http_base + "/negotiate?negotiateVersion=1",
+        method="POST",
+        headers={"Authorization": auth_header},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    token = data.get("connectionToken") or data.get("connectionId")
+    if not token:
+        raise ConnectionError(f"negotiate response had no connectionToken: {data}")
+    return token
+
+
+def run_codeunits_via_hub(
+    codeunits: list[int],
+    server: str,
+    instance: str,
+    port: int,
+    company: str | None,
+    user: str,
+    password: str,
+    deadline: float,
+    codeunit_timeout_seconds: float,
+) -> list[CodeunitRun]:
+    """Run every codeunit over ONE persistent TestRunnerHub connection.
+
+    Mirrors HubBasedTestRunnerService.SetupAndRunTests from the al dotnet
+    tool: Initialize once, then RunTests per codeunit sequentially on the
+    same connection, using the TestRunCompleted event as the per-codeunit
+    completion signal. This is what eliminates the process-start +
+    negotiate + auth overhead the CLI transport pays on every codeunit.
+    """
+    auth_header = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+    hub_http_base = f"{server}:{port}/{instance}/dev/TestRunnerHub"
+    ws_scheme = "wss" if hub_http_base.startswith("https:") else "ws"
+    ws_base = re.sub(r"^https?:", ws_scheme + ":", hub_http_base)
+
+    runs: list[CodeunitRun] = []
+
+    token = _hub_negotiate(hub_http_base, auth_header)
+    ws_url = f"{ws_base}?id={urllib.parse.quote(token)}&Authentication={urllib.parse.quote(auth_header)}"
+    ws = _WebSocketClient(ws_url, headers={"Authorization": auth_header})
+    ws.connect()
+    hub = _SignalRHub(ws)
+    try:
+        hub.handshake()
+
+        # Wait for HubConnected before doing anything else (mirrors the
+        # required-callback gate documented for DebuggerHub; TestRunnerHub
+        # follows the same HubBasedService base class).
+        connect_deadline = time.monotonic() + 15
+        connected = False
+        while not connected:
+            remaining = connect_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for HubConnected")
+            frame = hub.next_frame(timeout=remaining)
+            target = frame.get("target")
+            if target == "HubConnected":
+                connected = True
+            elif target in ("LogServerInfoMessage", "LogServerMessage"):
+                for arg in frame.get("arguments", []):
+                    print(f"    [hub] {arg}")
+
+        hub.invoke("Initialize", [company or "", "", 0], invocation_id="init")
+        # Wait for the type-3 completion ack for "init" (or RuntimeInitialized,
+        # whichever arrives — either confirms the server accepted the call).
+        init_deadline = time.monotonic() + 15
+        init_done = False
+        while not init_done:
+            remaining = init_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for Initialize to complete")
+            frame = hub.next_frame(timeout=remaining)
+            if frame.get("type") == 3 and frame.get("invocationId") == "init":
+                init_done = True
+            elif frame.get("target") == "RuntimeInitialized":
+                init_done = True
+
+        for cuid in codeunits:
+            remaining_overall = deadline - time.monotonic()
+            run = CodeunitRun(cuid)
+            if remaining_overall <= 0:
+                run.error = "not run: overall timeout reached"
+                runs.append(run)
+                continue
+
+            print(f"=== Codeunit {cuid} (hub) ===")
+            cu_start = time.monotonic()
+            per_deadline = cu_start + min(codeunit_timeout_seconds, remaining_overall)
+            hub.invoke("RunTests", [cuid, []])
+            last_fail_output = ""
+            completed = False
+            try:
+                while not completed:
+                    remaining = per_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"timed out after {int(codeunit_timeout_seconds)}s")
+                    frame = hub.next_frame(timeout=remaining)
+                    ftype = frame.get("type")
+                    target = frame.get("target")
+                    if ftype == 6:
+                        continue  # SignalR keepalive ping
+                    if target == "IsAlive":
+                        hub.invoke("AcknowledgeIsAlive", [])
+                        continue
+                    if target in ("LogServerInfoMessage", "LogServerMessage"):
+                        for arg in frame.get("arguments", []):
+                            print(f"    [hub] {arg}")
+                        continue
+                    if target == "TestStarted":
+                        continue
+                    if target == "TestCompleted":
+                        args = frame.get("arguments", [])
+                        if len(args) < 5:
+                            continue
+                        _cuid, name, status_code, output, duration_ms = args[:5]
+                        status = {0: "PASS", 1: "FAIL", 2: "SKIP"}.get(status_code, "FAIL")
+                        if not name and status == "PASS":
+                            continue  # codeunit-level pseudo-result, see CLI parser docstring
+                        print(f"    {status} {name or '(codeunit)'} ({duration_ms}ms)")
+                        if status == "FAIL" and output:
+                            last_fail_output = output
+                            for line in output.strip().splitlines():
+                                print(f"        {line}")
+                        if not name:
+                            run.results.append((status, "(codeunit)", duration_ms, last_fail_output))
+                        else:
+                            run.results.append(
+                                (status, name, duration_ms, last_fail_output if status == "FAIL" else "")
+                            )
+                        continue
+                    if target == "TestRunCompleted":
+                        completed = True
+                        continue
+                    # Unrecognized frame — ignore rather than fail the run.
+            except TimeoutError as ex:
+                run.error = str(ex)
+            except (ConnectionError, OSError) as ex:
+                run.elapsed_seconds = time.monotonic() - cu_start
+                run.error = f"hub connection lost: {ex}"
+                runs.append(run)
+                # Connection is dead — mark every remaining codeunit as not run.
+                for remaining_cuid in codeunits[codeunits.index(cuid) + 1:]:
+                    err_run = CodeunitRun(remaining_cuid)
+                    err_run.error = "not run: hub connection lost"
+                    runs.append(err_run)
+                return runs
+
+            run.elapsed_seconds = time.monotonic() - cu_start
+            if not run.results and not run.error:
+                run.error = "no test results returned for a Subtype=Test codeunit"
+            if run.error:
+                print(f"    ERROR: {run.error}")
+            runs.append(run)
+
+        try:
+            hub.invoke("StopTestExecution", [])
+        except Exception:
+            pass
+    finally:
+        ws.close()
+
+    return runs
+
+
 def write_junit(path: str, runs: list[CodeunitRun], total_elapsed: float) -> None:
     """Same schema as tools/TestRunner's JUnitWriter: one <testsuite> per
     codeunit, classname "Codeunit <id>", <failure> bodies carry the error
@@ -390,6 +819,13 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=30, help="overall timeout, minutes (default 30)")
     ap.add_argument("--codeunit-timeout", type=int, default=10, help="per-codeunit timeout, minutes (default 10)")
     ap.add_argument("--altool-cmd", default="al", help="AL dotnet tool command or path (default 'al')")
+    ap.add_argument("--transport", choices=["cli", "hub"], default="cli",
+                     help="'cli' (default) shells out to `al runtests` once per codeunit — "
+                          "battle-tested but pays a fresh process start + SignalR negotiate + "
+                          "auth per codeunit. 'hub' (EXPERIMENTAL) opens one persistent "
+                          "TestRunnerHub connection and runs every codeunit over it — "
+                          "meaningfully faster on suites with many codeunits, no `al` CLI "
+                          "dependency at test-run time. Same stdout/JUnit contract either way.")
     args = ap.parse_args()
 
     user, _, password = args.auth.partition(":")
@@ -453,23 +889,35 @@ def main() -> int:
     deadline = time.monotonic() + args.timeout * 60
     runs: list[CodeunitRun] = []
     overall_start = time.monotonic()
-    for cuid in codeunits:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            print(f"ERROR: overall timeout ({args.timeout} min) reached — "
-                  f"{len(codeunits) - len(runs)} codeunit(s) not run")
-            timed_out = CodeunitRun(cuid)
-            timed_out.error = "not run: overall timeout reached"
-            runs.append(timed_out)
-            break
-        print(f"=== Codeunit {cuid} ===")
-        run = run_codeunit(
-            args.altool_cmd, cuid, args.server, args.server_instance, args.port,
-            company, env, min(args.codeunit_timeout * 60, remaining),
-        )
-        if run.error:
-            print(f"    ERROR: {run.error}")
-        runs.append(run)
+    if args.transport == "hub":
+        print(f"Transport: hub (persistent TestRunnerHub connection, {len(codeunits)} codeunit(s))")
+        try:
+            runs = run_codeunits_via_hub(
+                codeunits, args.server, args.server_instance, args.port, company,
+                user, password, deadline, args.codeunit_timeout * 60,
+            )
+        except (ConnectionError, OSError, TimeoutError) as ex:
+            print(f"ERROR: hub transport failed: {ex}")
+            print("       Falling back is not automatic — rerun with --transport cli.")
+            return 1
+    else:
+        for cuid in codeunits:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(f"ERROR: overall timeout ({args.timeout} min) reached — "
+                      f"{len(codeunits) - len(runs)} codeunit(s) not run")
+                timed_out = CodeunitRun(cuid)
+                timed_out.error = "not run: overall timeout reached"
+                runs.append(timed_out)
+                break
+            print(f"=== Codeunit {cuid} ===")
+            run = run_codeunit(
+                args.altool_cmd, cuid, args.server, args.server_instance, args.port,
+                company, env, min(args.codeunit_timeout * 60, remaining),
+            )
+            if run.error:
+                print(f"    ERROR: {run.error}")
+            runs.append(run)
     total_elapsed = time.monotonic() - overall_start
 
     total = sum(len(r.results) for r in runs)
