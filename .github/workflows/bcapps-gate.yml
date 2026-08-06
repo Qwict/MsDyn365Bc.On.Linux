@@ -1,0 +1,223 @@
+name: bcapps-gate
+
+# TieredCompilation gate: run real Microsoft BCApps test suites against the
+# Linux BC container with DOTNET_TieredCompilation 0 and 1 side by side, and
+# fail if the TC=1 leg's results diverge from its TC=0 sibling.
+#
+# Why this exists: the smoke-test matrix (test-versions.yml) proved TC=1 is
+# safe for the STARTUP-path JMP hooks, but the session-lifetime hooks
+# (StartupHook patches #21 task-page no-op, #23 Word-merger recursion fix,
+# #25 debugger-session check) only fire deep inside real Microsoft suites —
+# exactly where Tier-1 recompilation has had time and call-counts to promote
+# a hooked method and potentially clobber the hook. This workflow runs those
+# workloads. See the tc1-validation branch / 2026-08-06 session for history.
+#
+# The test apps come out of the BC platform artifact itself
+# (platform/Applications/BaseApp/Test/*.app) — nothing is stored in the repo.
+# The recipe mirrors PipelinePerformanceComparison/scripts/benchmark-bucket4.sh:
+# BC_CLEAR_ALL_APPS=false, publish the three test-library deps, then let
+# run-tests.sh publish the suite app and drive it over the websocket runner
+# (these suites need real test-runner isolation — deliberately NOT the
+# altool/hub runner).
+#
+# Verdict logic: absolute pass rates are NOT the gate — these suites have
+# known environment-dependent failures on Linux (see KNOWN-LIMITATIONS.md).
+# The gate is per-suite equality: TC=1 must produce the same total/passed/
+# failed counts as TC=0, and the container must survive.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: >-
+          "fast" = Tests-Misc + Tests-Workflow (the suites that exercise the
+          at-risk session-lifetime hooks; ~1-2h). "full" = all six Bucket 4
+          suites (adds ERM, SCM, SCM-Service, SINGLESERVER; long).
+        required: false
+        default: fast
+        type: choice
+        options: [fast, full]
+      bc_version:
+        description: "BC version (short form resolves to latest build)"
+        required: false
+        default: "28.1"
+        type: string
+      runner_image:
+        description: "bc-runner image to test"
+        required: false
+        default: "ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest"
+        type: string
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        run: |
+          FAST='"Tests-Misc","Tests-Workflow"'
+          FULL='"Tests-Misc","Tests-Workflow","Tests-ERM","Tests-SCM","Tests-SCM-Service","Tests-SINGLESERVER"'
+          if [ "${{ inputs.scope }}" = "full" ]; then SUITES="$FULL"; else SUITES="$FAST"; fi
+          echo "matrix={\"suite\":[$SUITES],\"tc\":[\"0\",\"1\"]}" >> "$GITHUB_OUTPUT"
+
+  run-suite:
+    needs: prepare
+    name: ${{ matrix.suite }} / TC=${{ matrix.tc }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download BC artifacts + pull images (parallel)
+        env:
+          BC_VERSION: ${{ inputs.bc_version }}
+          BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
+        run: |
+          ./scripts/download-artifacts.sh sandbox "$BC_VERSION" w1 "artifact-cache/$BC_VERSION" &
+          DL_PID=$!
+          docker compose pull -q 2>&1 | tail -2 &
+          PULL_PID=$!
+          wait $DL_PID || { echo "artifact download failed"; exit 1; }
+          wait $PULL_PID || true
+          echo "BC_ARTIFACTS_DIR=$GITHUB_WORKSPACE/artifact-cache/$BC_VERSION" >> "$GITHUB_ENV"
+
+      - name: Start BC (TieredCompilation=${{ matrix.tc }})
+        env:
+          BC_VERSION: ${{ inputs.bc_version }}
+          BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
+          BC_CLEAR_ALL_APPS: "false"
+          DOTNET_TieredCompilation: ${{ matrix.tc }}
+        run: |
+          docker compose up -d 2>&1 | tail -3
+          ./scripts/wait-for-bc-healthy.sh 30
+
+      - name: Publish test-library dependencies
+        run: |
+          source ./scripts/publish-app.sh
+          APPS_DIR="$BC_ARTIFACTS_DIR/platform/Applications"
+          for dep in \
+            "System Application/Test/Microsoft_System Application Test Library.app" \
+            "BusinessFoundation/Test/Microsoft_Business Foundation Test Libraries.app" \
+            "BaseApp/Test/Microsoft_Tests-TestLibraries.app"; do
+            echo "--- publishing dep: $dep"
+            bc_publish_app "$APPS_DIR/$dep" || exit 1
+          done
+
+      - name: Run ${{ matrix.suite }}
+        id: run
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          APP="$BC_ARTIFACTS_DIR/platform/Applications/BaseApp/Test/Microsoft_${SUITE}.app"
+          [ -f "$APP" ] || { echo "suite app not found: $APP"; exit 1; }
+          # Discover the suite's Subtype=Test codeunit ids from its symbols
+          # (reuses run-tests-altool.py's parser; range spans = everything).
+          IDS=$(python3 - "$APP" <<'PYEOF'
+          import sys, importlib.util
+          spec = importlib.util.spec_from_file_location("rta", "scripts/run-tests-altool.py")
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          ids = m.discover_test_codeunits(sys.argv[1], [(1, 2**31 - 1)])
+          print(",".join(str(i) for i in ids))
+          PYEOF
+          )
+          [ -n "$IDS" ] || { echo "no test codeunits discovered in $APP"; exit 1; }
+          echo "Discovered $(echo "$IDS" | tr ',' '\n' | wc -l) test codeunits"
+          set +e
+          ./scripts/run-tests.sh \
+            --app "$APP" \
+            --codeunit-range "$IDS" \
+            --junit-output "junit-${SUITE}-tc${{ matrix.tc }}.xml" \
+            --timeout 300 2>&1 | tee run.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          LINE=$(grep -oE '[0-9]+ total, [0-9]+ passed, [0-9]+ failed' run.log | tail -1 || true)
+          ALIVE=$(docker inspect --format '{{.State.Running}}' "$(docker compose ps -q bc)" 2>/dev/null || echo false)
+          mkdir -p results
+          python3 - "$SUITE" "${{ matrix.tc }}" "$RC" "$LINE" "$ALIVE" <<'PYEOF'
+          import json, re, sys
+          suite, tc, rc, line, alive = sys.argv[1:6]
+          m = re.match(r"(\d+) total, (\d+) passed, (\d+) failed", line or "")
+          out = {
+              "suite": suite, "tc": tc, "rc": int(rc),
+              "container_alive": alive == "true",
+              "total": int(m.group(1)) if m else 0,
+              "passed": int(m.group(2)) if m else 0,
+              "failed": int(m.group(3)) if m else 0,
+          }
+          path = f"results/{suite}-tc{tc}.json"
+          json.dump(out, open(path, "w"), indent=1)
+          print(json.dumps(out))
+          PYEOF
+          # The leg itself only fails on infrastructure death — result
+          # divergence is judged by the verdict job across the TC pair.
+          if [ "$ALIVE" != "true" ]; then
+            echo "ERROR: BC container died during the suite run"
+            docker compose logs bc 2>&1 | tail -150
+            exit 1
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.suite }}-tc${{ matrix.tc }}
+          path: |
+            results/
+            junit-*.xml
+          if-no-files-found: warn
+
+  verdict:
+    needs: run-suite
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          merge-multiple: true
+
+      - name: Compare TC=1 against TC=0 per suite
+        run: |
+          python3 - <<'PYEOF'
+          import glob, json, os, sys
+          results = {}
+          for p in glob.glob("all/**/*.json", recursive=True):
+              r = json.load(open(p))
+              results[(r["suite"], r["tc"])] = r
+          suites = sorted({s for s, _ in results})
+          lines = ["| Suite | TC | total | passed | failed | container | verdict |",
+                   "|---|---|---|---|---|---|---|"]
+          bad = []
+          for s in suites:
+              a, b = results.get((s, "0")), results.get((s, "1"))
+              for r in (a, b):
+                  if r:
+                      lines.append(f"| {s} | {r['tc']} | {r['total']} | {r['passed']} "
+                                   f"| {r['failed']} | {'alive' if r['container_alive'] else 'DIED'} | |")
+              if not a or not b:
+                  bad.append(f"{s}: missing a TC leg (0={bool(a)}, 1={bool(b)})")
+                  continue
+              if not b["container_alive"]:
+                  bad.append(f"{s}: container died under TC=1")
+              if (a["total"], a["passed"], a["failed"]) != (b["total"], b["passed"], b["failed"]):
+                  bad.append(f"{s}: result divergence TC0={a['total']}/{a['passed']}/{a['failed']} "
+                             f"TC1={b['total']}/{b['passed']}/{b['failed']}")
+              if b["total"] == 0:
+                  bad.append(f"{s}: TC=1 leg ran 0 tests")
+          summary = "\n".join(lines) + "\n\n" + ("### ❌ Gate FAILED\n" + "\n".join(f"- {x}" for x in bad) if bad else "### ✅ Gate passed — TC=1 matches TC=0 on every suite")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary + "\n")
+          print(summary)
+          sys.exit(1 if bad else 0)
+          PYEOF
