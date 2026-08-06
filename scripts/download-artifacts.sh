@@ -18,9 +18,13 @@
 #     option: Microsoft put it behind a network security perimeter
 #     (403), so AFD is the only door.
 #   - Every range stream aborts and retries when it crawls below
-#     1 MB/s for 30s (--speed-limit/--speed-time) — a reconnect usually
+#     100 KB/s for 60s (--speed-limit/--speed-time) — a reconnect usually
 #     lands a healthier origin connection, and by then AFD has cached
-#     the chunks already pulled.
+#     the chunks already pulled. The threshold must stay low enough that
+#     many parallel streams sharing a narrow home pipe don't trip it.
+#   - Extraction is MULTI-THREADED (python zipfile + thread pool; plain
+#     unzip is single-threaded and took as long as the download), and the
+#     app zip is extracted WHILE the platform zip is still downloading.
 #   - Timing is logged for each phase so you can see exactly where time
 #     goes: version resolution, download, and extraction.
 #
@@ -32,32 +36,36 @@ set -e
 _ms() { date +%s%3N; }
 
 # Parallel range streams per file (two files download concurrently, so the
-# total connection count is 2x this). 8 is a good default: ~8x cold-miss
-# throughput without hammering AFD; override with BC_DL_STREAMS.
-STREAMS="${BC_DL_STREAMS:-8}"
+# total connection count is 2x this). 16 gives ~16x cold-miss throughput;
+# override with BC_DL_STREAMS.
+STREAMS="${BC_DL_STREAMS:-16}"
 
 # Fetch one byte range to a part file, with slow-transfer abort + retries.
-# A stream stuck below 1 MB/s for 30s is killed and reconnected — AFD
+# A stream stuck below 100 KB/s for 60s is killed and reconnected — AFD
 # origin connections occasionally degenerate, and a fresh connection
-# (plus the chunks AFD cached meanwhile) is almost always faster.
+# (plus the chunks AFD cached meanwhile) is almost always faster. The
+# threshold is deliberately low: on a narrow pipe (e.g. 100 Mbit home
+# connection) 32 parallel streams legitimately run at ~300 KB/s each, and
+# an aggressive watchdog would kill healthy streams. The final attempt
+# runs with no watchdog at all — better slow than failed.
 _fetch_range() {
     local url="$1" out="$2" start="$3" end="$4"
-    local want=$((end - start + 1)) attempt got
-    for attempt in 1 2 3; do
-        if curl -sf --http1.1 --retry 2 --retry-all-errors \
-                --speed-limit 1000000 --speed-time 30 \
-                -r "$start-$end" "$url" -o "$out"; then
-            got=$(stat -c%s "$out" 2>/dev/null || echo 0)
-            if [ "$got" -eq "$want" ]; then
-                return 0
-            fi
-            echo "[artifacts] WARN: range $start-$end returned $got of $want bytes (attempt $attempt)" >&2
-        else
-            echo "[artifacts] WARN: range $start-$end failed or stalled <1MB/s (attempt $attempt)" >&2
+    local want=$((end - start + 1)) attempt code got
+    for attempt in 1 2 3 4; do
+        local speed_args=(--speed-limit 102400 --speed-time 60)
+        if [ "$attempt" -eq 4 ]; then speed_args=(); fi
+        code=$(curl -s --http1.1 --retry 2 --retry-all-errors \
+                    "${speed_args[@]}" \
+                    -r "$start-$end" "$url" -o "$out" \
+                    -w '%{http_code}' 2>/dev/null) || code="exit$?"
+        got=$(stat -c%s "$out" 2>/dev/null || echo 0)
+        if [ "$code" = "206" ] && [ "$got" -eq "$want" ]; then
+            return 0
         fi
-        sleep 2
+        echo "[artifacts] WARN: range $start-$end attempt $attempt: http=$code got=$got of $want bytes" >&2
+        sleep $((attempt * 2))
     done
-    echo "[artifacts] ERROR: range $start-$end failed after 3 attempts" >&2
+    echo "[artifacts] ERROR: range $start-$end failed after 4 attempts" >&2
     return 1
 }
 
@@ -72,7 +80,7 @@ _ranged_download() {
     if ! echo "$head" | grep -qi '^accept-ranges: *bytes' || \
        ! echo "$size" | grep -qE '^[0-9]+$' || [ "$size" -lt $((16 * 1024 * 1024)) ]; then
         curl -sSL --retry 3 --retry-all-errors --http1.1 \
-             --speed-limit 1000000 --speed-time 60 "$url" -o "$out"
+             --speed-limit 102400 --speed-time 60 "$url" -o "$out"
         return
     fi
 
@@ -103,6 +111,54 @@ _ranged_download() {
         echo "[artifacts] ERROR: stitched $total bytes, expected $size ($url)" >&2
         return 1
     fi
+}
+
+# Multi-threaded zip extraction (plain `unzip` is single-threaded and was
+# taking as long as the 16-stream download it follows). zlib decompression
+# and file writes release the GIL, so a Python thread pool scales across
+# cores. Extracts EVERYTHING deliberately: the old selective
+# `unzip 'ServiceTier/*' 'applications/*' ... || unzip <all>` never
+# actually selected — the zip's dir is `Applications/` (capital A), the
+# unmatched lowercase pattern made unzip exit 11, and the fallback
+# extracted the full zip on every run. Selection would save ~10 MB of
+# ~2 GB today and risks silently dropping dirs consumers need
+# (Applications/ holds the test-framework .apps that stage-symbols.py
+# and the entrypoint's install-for-tenant loop walk). BC artifact zips
+# are built on Windows (no unix modes/symlinks), so zipfile loses
+# nothing vs unzip.
+_extract_zip() {
+    local zip="$1" dest="$2"
+    python3 - "$zip" "$dest" <<'PYEOF'
+import os, sys, zipfile
+from concurrent.futures import ThreadPoolExecutor
+
+zip_path, dest = sys.argv[1], sys.argv[2]
+
+with zipfile.ZipFile(zip_path) as zf:
+    infos = zf.infolist()
+files = [i for i in infos if not i.is_dir()]
+
+# Pre-create every directory up front: zipfile's internal makedirs is not
+# race-safe, and the workers below extract concurrently.
+for d in {os.path.dirname(i.filename) for i in files}:
+    if d:
+        os.makedirs(os.path.join(dest, d), exist_ok=True)
+
+# Largest-first round-robin keeps the per-worker byte counts balanced.
+files.sort(key=lambda i: i.file_size, reverse=True)
+workers = min(8, os.cpu_count() or 4)
+chunks = [files[i::workers] for i in range(workers)]
+
+def extract(chunk):
+    # One ZipFile handle per worker — a shared handle serializes reads.
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in chunk:
+            zf.extract(info, dest)
+
+with ThreadPoolExecutor(workers) as ex:
+    for _ in ex.map(extract, chunks):
+        pass
+PYEOF
 }
 
 # Parse arguments: either (url, dest) or (type, version, country, dest)
@@ -203,6 +259,13 @@ _ranged_download "$PLATFORM_URL" "$TMPDIR_DL/platform.zip" &
 PLATFORM_PID=$!
 
 wait $APP_PID      || { echo "[artifacts] ERROR: app artifact download failed";      exit 1; }
+
+# The app zip is smaller and finishes first — extract it while the platform
+# zip is still downloading, so app extraction is (mostly) free wall-clock.
+echo "[artifacts] App downloaded ($(du -h "$TMPDIR_DL/app.zip" | cut -f1)) — extracting while platform downloads..."
+_extract_zip "$TMPDIR_DL/app.zip" "$DEST/app" &
+APP_EXTRACT_PID=$!
+
 wait $PLATFORM_PID || { echo "[artifacts] ERROR: platform artifact download failed"; exit 1; }
 
 T_DOWNLOADED=$(_ms)
@@ -215,22 +278,17 @@ SPEED_MBS=$(( DOWNLOAD_MS > 0 ? TOTAL_MB * 1000 / DOWNLOAD_MS : 0 ))
 echo "[artifacts] Downloaded: app=$(du -h "$TMPDIR_DL/app.zip" | cut -f1) platform=$(du -h "$TMPDIR_DL/platform.zip" | cut -f1) in ${DOWNLOAD_MS}ms (~${SPEED_MBS} MB/s)"
 
 # ── Extract ────────────────────────────────────────────────────────────────
-echo "[artifacts] Extracting app..."
+echo "[artifacts] Extracting platform..."
 T_EXTRACT=$(_ms)
-unzip -qo "$TMPDIR_DL/app.zip" -d "$DEST/app"
+_extract_zip "$TMPDIR_DL/platform.zip" "$DEST/platform"
 
+wait $APP_EXTRACT_PID || { echo "[artifacts] ERROR: app artifact extraction failed"; exit 1; }
 PLATFORM_VERSION=$(python3 -c "import json; print(json.load(open('$DEST/app/manifest.json'))['platform'])" 2>/dev/null)
 echo "[artifacts] Platform version: $PLATFORM_VERSION"
-
-echo "[artifacts] Extracting platform (ServiceTier, ModernDev, WebClient, applications, Test Assemblies)..."
-# Selective extraction keeps only what the service tier needs (~50% of the zip)
-# WebClient is needed for TestPage client DLLs (page testability in tests)
-unzip -qo "$TMPDIR_DL/platform.zip" 'ServiceTier/*' 'ModernDev/*' 'WebClient/*' 'applications/*' 'Test Assemblies/*' -d "$DEST/platform" 2>/dev/null || \
-    unzip -qo "$TMPDIR_DL/platform.zip" -d "$DEST/platform"
 
 T_DONE=$(_ms)
 EXTRACT_MS=$(( T_DONE - T_EXTRACT ))
 TOTAL_MS=$(( T_DONE - T0 ))
-echo "[artifacts] Extracted in ${EXTRACT_MS}ms | Total: ${TOTAL_MS}ms | Disk: $(du -sh "$DEST" | cut -f1)"
+echo "[artifacts] Extracted in ${EXTRACT_MS}ms (app overlapped with download) | Total: ${TOTAL_MS}ms | Disk: $(du -sh "$DEST" | cut -f1)"
 
 echo "[artifacts] Done. Artifacts at $DEST"
