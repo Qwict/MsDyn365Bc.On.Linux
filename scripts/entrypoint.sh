@@ -712,11 +712,27 @@ if [ -n "$PLATFORM_VER" ]; then
     # mkdir all targets up front so the Python helper doesn't need to.
     IFS='|' read -ra _CACHE_LIST <<< "$ASSEMBLY_CACHES"
     for c in "${_CACHE_LIST[@]}"; do mkdir -p "$c"; done
+    # Merkle chunk-map remapping: NST finds a seeded {hash}.dll on its own for
+    # single-chunk apps, but a multi-chunk app (Base Application = 5 chunks)
+    # needs the app's Merkle json to know the chunk layout — and NST looks it
+    # up as {RuntimePackageId}_<N>_Merkle.json, where Runtime Package ID comes
+    # from the restored DB's [Published Application] row. The json shipped in
+    # the .app is named after Microsoft's build-time package id, which never
+    # matches a restored .bak, so NST recompiled all 5 Base App chunks from AL
+    # source on every first boot (~2 min wall each, in parallel) despite
+    # byte-identical DLLs sitting in the cache. Verified empirically on BC
+    # 28.3: cache Merkle names match [Runtime Package ID], Base App's shipped
+    # name matches neither Package ID nor Runtime Package ID. So: dump the
+    # appid → runtime-package-id map from the DB (restore finished just
+    # above) and have the seeder ALSO write each Merkle json under the
+    # runtime-package-id name.
+    R2R_PKGMAP="/tmp/r2r-pkgmap.csv"
+    $SQLCMD -d CRONUS -h -1 -W -Q "SET NOCOUNT ON; SELECT LOWER(CONVERT(varchar(36),[ID])) + ',' + UPPER(REPLACE(CONVERT(varchar(36),[Runtime Package ID]),'-','')) FROM [Published Application]" > "$R2R_PKGMAP" 2>/dev/null || : > "$R2R_PKGMAP"
     R2R_SEEDED=0
     R2R_FILTERED=0
     R2R_FAILED=0
     while IFS= read -r -d '' appfile; do
-        python3 - "$appfile" "$ASSEMBLY_CACHES" "${BC_KEEP_APP_IDS_FOR_R2R:-}" << 'PYEOF' && R2R_SEEDED=$((R2R_SEEDED + 1)) || { [ $? -eq 2 ] && R2R_FILTERED=$((R2R_FILTERED + 1)) || R2R_FAILED=$((R2R_FAILED + 1)); }
+        python3 - "$appfile" "$ASSEMBLY_CACHES" "${BC_KEEP_APP_IDS_FOR_R2R:-}" "$R2R_PKGMAP" << 'PYEOF' && R2R_SEEDED=$((R2R_SEEDED + 1)) || { [ $? -eq 2 ] && R2R_FILTERED=$((R2R_FILTERED + 1)) || R2R_FAILED=$((R2R_FAILED + 1)); }
 import sys, zipfile, os, json, re
 
 app_path = sys.argv[1]
@@ -725,23 +741,38 @@ app_path = sys.argv[1]
 dests = [d for d in sys.argv[2].split('|') if d]
 keep_ids = set(sys.argv[3].split(',')) if len(sys.argv) > 3 and sys.argv[3] else set()
 
+# appid (lower) → runtime package id (upper, no dashes) from the DB
+pkg_map = {}
+if len(sys.argv) > 4 and sys.argv[4]:
+    try:
+        with open(sys.argv[4]) as f:
+            for line in f:
+                line = line.strip()
+                if ',' in line:
+                    aid, rtid = line.split(',', 1)
+                    pkg_map[aid.strip().lower()] = rtid.strip()
+    except Exception:
+        pass
+
 try:
     z = zipfile.ZipFile(app_path)
     names = z.namelist()
 
+    app_id = None
+    if 'readytorunappmanifest.json' in names:
+        m = json.loads(z.read('readytorunappmanifest.json'))
+        app_id = m.get('EmbeddedAppId', '').lower().strip('{}')
+    elif 'NavxManifest.xml' in names:
+        xml = z.read('NavxManifest.xml').decode('utf-8', errors='replace')
+        match = re.search(r'(?:App)?Id\s*=\s*"([^"]+)"', xml, re.IGNORECASE)
+        if match:
+            app_id = match.group(1).lower().strip('{}')
+
     # If selective filtering is active, check this app's ID against the keep list
-    if keep_ids:
-        app_id = None
-        if 'readytorunappmanifest.json' in names:
-            m = json.loads(z.read('readytorunappmanifest.json'))
-            app_id = m.get('EmbeddedAppId', '').lower().strip('{}')
-        elif 'NavxManifest.xml' in names:
-            xml = z.read('NavxManifest.xml').decode('utf-8', errors='replace')
-            match = re.search(r'(?:App)?Id\s*=\s*"([^"]+)"', xml, re.IGNORECASE)
-            if match:
-                app_id = match.group(1).lower().strip('{}')
-        if app_id and app_id not in keep_ids:
-            sys.exit(2)  # filtered out — not an error
+    if keep_ids and app_id and app_id not in keep_ids:
+        sys.exit(2)  # filtered out — not an error
+
+    runtime_pkg_id = pkg_map.get(app_id) if app_id else None
 
     extracted = 0
     for name in names:
@@ -750,18 +781,26 @@ try:
         basename = os.path.basename(name)
         if not basename:
             continue
+        # Write the entry under its shipped name, and Merkle jsons additionally
+        # under the DB runtime-package-id name NST actually looks up (see the
+        # comment above the pkg map dump). Shipped name pattern:
+        # {32-hex-build-pkgid}_{N}_Merkle.json → {RuntimePkgId}_{N}_Merkle.json
+        target_names = [basename]
+        if runtime_pkg_id and basename.endswith('_Merkle.json') and '_' in basename:
+            target_names.append(runtime_pkg_id + '_' + basename.split('_', 1)[1])
         # Read the entry once, then write to every destination that doesn't
         # already have it. Reading is the expensive part (zip decompress);
         # extra writes to a same-fs target are nearly free.
         payload = None
         for dest in dests:
-            dest_path = os.path.join(dest, basename)
-            if os.path.exists(dest_path):
-                continue
-            if payload is None:
-                payload = z.read(name)
-            with open(dest_path, 'wb') as f:
-                f.write(payload)
+            for tname in target_names:
+                dest_path = os.path.join(dest, tname)
+                if os.path.exists(dest_path):
+                    continue
+                if payload is None:
+                    payload = z.read(name)
+                with open(dest_path, 'wb') as f:
+                    f.write(payload)
         extracted += 1
     sys.exit(0 if extracted > 0 else 1)
 except Exception:
