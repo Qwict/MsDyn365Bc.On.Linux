@@ -825,6 +825,16 @@ def _abandon_remaining(
     return runs
 
 
+# Control characters are invalid in XML 1.0 even when entity-escaped — BC test output
+# can contain them (observed in Tests-Misc failure bodies), and emitting them raw makes
+# the whole JUnit file unparseable for downstream consumers.
+_XML_INVALID_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]|[\ud800-\udfff]")
+
+
+def _xml_text(s: str) -> str:
+    return _XML_INVALID_RE.sub("", s or "")
+
+
 def write_junit(path: str, runs: list[CodeunitRun], total_elapsed: float) -> None:
     """Same schema as tools/TestRunner's JUnitWriter: one <testsuite> per
     codeunit, classname "Codeunit <id>", <failure> bodies carry the error
@@ -858,6 +868,8 @@ def write_junit(path: str, runs: list[CodeunitRun], total_elapsed: float) -> Non
             f"timestamp=\"{suite_stamp}\">"
         )
         for status, name, ms, detail in run.results:
+            name = _xml_text(name)
+            detail = _xml_text(detail)
             case = (
                 f"    <testcase classname={quoteattr(cls)} "
                 f"name={quoteattr(name)} time=\"{ms / 1000.0:.3f}\""
@@ -877,13 +889,14 @@ def write_junit(path: str, runs: list[CodeunitRun], total_elapsed: float) -> Non
             else:
                 lines.append(case + "/>")
         if run.error:
+            err = _xml_text(run.error)
             lines.append(
                 f"    <testcase classname={quoteattr(cls)} "
                 f"name=\"(codeunit run)\" time=\"{run.elapsed_seconds:.3f}\">"
             )
             lines.append(
-                f"      <error message={quoteattr(run.error[:500])} "
-                f'type="RunError">{escape(run.error)}</error>'
+                f"      <error message={quoteattr(err[:500])} "
+                f'type="RunError">{escape(err)}</error>'
             )
             lines.append("    </testcase>")
         lines.append("  </testsuite>")
