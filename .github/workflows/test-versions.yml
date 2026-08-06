@@ -159,6 +159,11 @@ jobs:
       bc_country: w1
       bc_type: sandbox
       test_app_dirs: extensions/smoke-test
+      # The smoke-test fixture ships a placeholder runtime ("14.0") so one
+      # committed app.json spans the whole version matrix; "auto" opts into
+      # the per-leg rewrite (27 → 16.0, 28 → 17.0). Consumer repos should
+      # NOT set this — the workflow respects their declared runtime.
+      runtime_version: auto
       # Pipe form deliberately exercises the multi-range parser end-to-end on
       # the hosted runner so a regression in run-tests.sh's normalization shows
       # up here. Equivalent to the legacy "70000..70001" but covers the new

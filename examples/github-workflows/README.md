@@ -51,7 +51,7 @@ reproducible CI runs swap it for a release tag once one exists
 | `codeunit_range` | **yes** | — | IDs of your **test** codeunits to execute. Production app codeunits are published but not run. Accepts `"50000..99999"` (single AL range), `"50000..50100\|130450..130459"` (multiple ranges, pipe-separated), `"50000,50001,50002"` (explicit ids), or any mix. |
 | `al_tool_version` | no | *(auto-derived from bc_version)* | Linux AL compiler NuGet version. Auto-derived: BC 27 → `16.2.28.57946`, BC 28 → `17.0.34.45391`. Set explicitly to pin. |
 | `preprocessor_symbols` | no | `""` | Comma-separated preprocessor symbols for `/preprocessorsymbols` (e.g. `"BC27PLUS,BC28PLUS"`). |
-| `runtime_version` | no | *(auto-derived from bc_version)* | Override `app.json` `runtime` before compile. Auto-derived when blank: BC 27 → `16.0`, BC 28 → `17.0`. |
+| `runtime_version` | no | `""` (no rewrite) | Opt-in rewrite of `app.json` `runtime` before compile. Blank (default): your declared runtime is respected as-is. `auto`: derive from bc_version (BC 27 → `16.0`, BC 28 → `17.0`). Explicit value: patch to exactly that. |
 | `runner_image` | no | public ghcr.io tag | Override the bc-runner image |
 | `bc_linux_ref` | no | `master` | Git ref of `MsDyn365Bc.On.Linux` to check out for scripts |
 | `timeout_minutes` | no | `45` | Job timeout |

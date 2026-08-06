@@ -77,17 +77,21 @@ without using the VS Code AL extension's F5 build:
   echo 'export PATH="$HOME/.dotnet/tools:$PATH"' >> ~/.bashrc
   ```
 
-  The reusable workflow (`bc-test-from-source.yml`) auto-derives both values
-  from `bc_version` — you only need to set `al_tool_version` explicitly to
-  pin a specific build. If you use VS Code with the AL Language extension,
-  F5 / Ctrl+F5 publishes via the dev endpoint without the CLI compiler —
-  skip this section.
+  The reusable workflow (`bc-test-from-source.yml`) auto-derives
+  `al_tool_version` from `bc_version` — set it explicitly only to pin a
+  specific build. Your app.json `runtime` is respected as-is; the optional
+  `runtime_version` input ("auto" or an explicit value) rewrites it before
+  compile, but that's opt-in and off by default. If you use VS Code with
+  the AL Language extension, F5 / Ctrl+F5 publishes via the dev endpoint
+  without the CLI compiler — skip this section.
 
   **Why does the smoke test use `runtime: "14.0"`?**
   `extensions/smoke-test/app.json` uses a deliberately low runtime value so
-  the same committed file compiles cleanly against any supported BC version
-  without patching. Consumer apps should use the runtime matching their
-  minimum supported BC version (auto-derived by the workflow).
+  the same committed file compiles cleanly against any supported BC version.
+  bc-linux's own `test-versions.yml` passes `runtime_version: auto` to
+  rewrite it per matrix leg; consumer apps should declare the runtime
+  matching their minimum supported BC version and leave `runtime_version`
+  unset.
 
 ---
 

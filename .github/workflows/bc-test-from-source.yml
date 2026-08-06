@@ -65,9 +65,12 @@ on:
         default: ""
       runtime_version:
         description: >-
-          Override app.json "runtime" before compile (e.g. "16.0" for BC 27,
-          "17.0" for BC 28). Auto-derived from bc_version when blank.
-          Set explicitly to suppress auto-derive for edge cases.
+          Opt-in rewrite of app.json "runtime" before compile. Blank
+          (default): app.json is left untouched and the project's declared
+          runtime is respected. "auto": derive from bc_version (BC 27 →
+          "16.0", BC 28 → "17.0") and patch every app — used by bc-linux's
+          own version matrix, whose smoke-test fixture ships a placeholder
+          runtime. An explicit value (e.g. "17.0") patches to exactly that.
         required: false
         type: string
         default: ""
@@ -490,7 +493,12 @@ jobs:
           echo "Staged $(ls symbols/*.app 2>/dev/null | wc -l) symbol files"
           bash bc-linux/scripts/workflow-summary.sh end SYMBOLS
 
+      # Opt-in only. A consumer's declared runtime is a real compatibility
+      # statement (e.g. target "Internal" requires runtime < 11.0) — rewriting
+      # it silently breaks such projects, so blank means hands off and any
+      # runtime/BC mismatch surfaces as the AL compiler's own error.
       - name: Patch app.json runtime
+        if: ${{ inputs.runtime_version != '' }}
         env:
           APP_DIRS: ${{ inputs.app_dirs }}
           TEST_APP_DIRS: ${{ inputs.test_app_dirs }}
@@ -498,7 +506,7 @@ jobs:
         run: |
           EFFECTIVE_RUNTIME="$RUNTIME_VERSION"
           BC_MAJOR=$(echo "${{ inputs.bc_version }}" | cut -d. -f1)
-          if [ -z "$EFFECTIVE_RUNTIME" ]; then
+          if [ "$EFFECTIVE_RUNTIME" = "auto" ]; then
             case "$BC_MAJOR" in
               27) EFFECTIVE_RUNTIME="16.0" ;;
               28) EFFECTIVE_RUNTIME="17.0" ;;
