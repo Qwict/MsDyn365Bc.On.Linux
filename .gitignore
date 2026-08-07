@@ -36,3 +36,10 @@ extensions/minimal-test/*.app
 docker-compose.override.yml
 .local-ca/
 src/Dockerfile.local-ca
+
+# Python bytecode from running scripts/ modules directly
+__pycache__/
+*.pyc
+
+# Serena agent workspace
+.serena/

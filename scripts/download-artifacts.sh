@@ -41,22 +41,26 @@ _ms() { date +%s%3N; }
 STREAMS="${BC_DL_STREAMS:-16}"
 
 # Share of the total stream budget handed to the LARGER of the two zips,
-# as a percentage. The point is extraction overlap, not download speed:
-# the link is the bottleneck (measured 34 MB/s aggregate across 32 streams
-# on a GitHub runner, i.e. ~2 MB/s per stream — nowhere near AFD's ~4-8
-# MB/s per-connection ceiling), so total download time is fixed no matter
-# how the streams are split. What the split DOES control is which zip
-# lands first, and therefore how much of its extraction runs for free
-# while the other zip is still downloading.
+# as a percentage. 50 = even split, which is the default and what you
+# want in almost every case.
 #
-# With an even split the bigger zip finishes last and its extraction —
-# the longer of the two — is pure serial tail. Measured on Pageworks #27:
-# 65s download, then 30s of extraction nobody could overlap. Biasing the
-# streams so the bigger zip lands ~15s early moves most of that tail
-# under the remaining download.
+# This started at 70 on the theory that biasing streams would land the
+# bigger zip early and let its extraction overlap the other download.
+# Measured across two environments, it doesn't:
 #
-# 50 restores the previous even split.
-BIG_SHARE="${BC_DL_BIG_SHARE:-70}"
+#   Pageworks re-run, 122 MB/s: platform (22 streams) finished at
+#   17943ms, app (10 streams) at 17945ms. Two milliseconds apart.
+#
+# Bandwidth doesn't reallocate proportionally to stream count the way
+# that model assumed, so no overlap window opens and the bias buys
+# nothing. Worse, it made the app zip the extraction tail, and the app
+# zip is dominated by one ~900 MB BusinessCentral-*.bak — a single zip
+# entry, so single-threaded no matter how many workers the pool has,
+# where the platform zip's 6600 files parallelize fine.
+#
+# The knob stays for genuinely slow links where the two downloads DO
+# separate in time; the default no longer guesses.
+BIG_SHARE="${BC_DL_BIG_SHARE:-50}"
 
 # Fetch one byte range to a part file, with slow-transfer abort + retries.
 # A stream stuck below 100 KB/s for 60s is killed and reconnected — AFD
@@ -277,68 +281,76 @@ trap 'rm -rf "$TMPDIR_DL"' EXIT
 mkdir -p "$DEST/app" "$DEST/platform"
 
 # ── Plan the stream split ──────────────────────────────────────────────────
-# Ask both endpoints for Content-Length first so the bigger zip can be
-# given the larger share of streams and land first. Costs two HEAD
-# requests (~20ms). If either HEAD fails we fall back to an even split;
-# _ranged_download re-checks the headers itself and degrades to a plain
-# single-stream curl when the server won't do ranges, so a missing size
-# here is never fatal.
+# Only does anything when BC_DL_BIG_SHARE is moved off its default of 50.
+# The two HEAD requests (~20ms) are skipped entirely at 50, since an even
+# split needs no size information. When a size lookup fails we fall back
+# to an even split; _ranged_download re-checks the headers itself and
+# degrades to a plain single-stream curl when the server won't do ranges,
+# so a missing size here is never fatal.
 TOTAL_STREAMS=$(( STREAMS * 2 ))
-APP_SIZE=$(_head_size "$APP_URL")
-PLAT_SIZE=$(_head_size "$PLATFORM_URL")
 APP_STREAMS=$STREAMS
 PLAT_STREAMS=$STREAMS
-BIGGER="platform"
-if echo "$APP_SIZE" | grep -qE '^[0-9]+$' && echo "$PLAT_SIZE" | grep -qE '^[0-9]+$'; then
-    BIG_STREAMS=$(( TOTAL_STREAMS * BIG_SHARE / 100 ))
-    # Never starve the smaller file: it still has to finish, and one
-    # stream would make it the new tail.
-    [ "$BIG_STREAMS" -gt $(( TOTAL_STREAMS - 2 )) ] && BIG_STREAMS=$(( TOTAL_STREAMS - 2 ))
-    [ "$BIG_STREAMS" -lt 2 ] && BIG_STREAMS=2
-    if [ "$APP_SIZE" -ge "$PLAT_SIZE" ]; then
-        BIGGER="app"
-        APP_STREAMS=$BIG_STREAMS
-        PLAT_STREAMS=$(( TOTAL_STREAMS - BIG_STREAMS ))
-    else
-        PLAT_STREAMS=$BIG_STREAMS
-        APP_STREAMS=$(( TOTAL_STREAMS - BIG_STREAMS ))
+if [ "$BIG_SHARE" != "50" ]; then
+    APP_SIZE=$(_head_size "$APP_URL")
+    PLAT_SIZE=$(_head_size "$PLATFORM_URL")
+    if echo "$APP_SIZE" | grep -qE '^[0-9]+$' && echo "$PLAT_SIZE" | grep -qE '^[0-9]+$'; then
+        BIG_STREAMS=$(( TOTAL_STREAMS * BIG_SHARE / 100 ))
+        # Never starve the smaller file: it still has to finish, and one
+        # stream would make it the new tail.
+        [ "$BIG_STREAMS" -gt $(( TOTAL_STREAMS - 2 )) ] && BIG_STREAMS=$(( TOTAL_STREAMS - 2 ))
+        [ "$BIG_STREAMS" -lt 2 ] && BIG_STREAMS=2
+        if [ "$APP_SIZE" -ge "$PLAT_SIZE" ]; then
+            APP_STREAMS=$BIG_STREAMS
+            PLAT_STREAMS=$(( TOTAL_STREAMS - BIG_STREAMS ))
+        else
+            PLAT_STREAMS=$BIG_STREAMS
+            APP_STREAMS=$(( TOTAL_STREAMS - BIG_STREAMS ))
+        fi
     fi
 fi
 
-# ── Parallel download ──────────────────────────────────────────────────────
-echo "[artifacts] Downloading app + platform in parallel (app=$APP_STREAMS platform=$PLAT_STREAMS range streams; '$BIGGER' prioritized so its extraction overlaps)..."
-T0=$(_ms)
-_ranged_download "$APP_URL"      "$TMPDIR_DL/app.zip"      "$APP_STREAMS"  &
-APP_PID=$!
-_ranged_download "$PLATFORM_URL" "$TMPDIR_DL/platform.zip" "$PLAT_STREAMS" &
-PLATFORM_PID=$!
-
-# Extract each zip the moment it lands rather than waiting for both. The
-# stream split above aims the bigger zip — the one with the longer
-# extraction — at finishing first, so the bulk of extraction runs while
-# the other download is still using the link.
+# ── Parallel download, extract whichever lands first ───────────────────────
+# No prediction about which zip finishes first — each download drops a
+# sentinel file when it's done and we start that zip's extraction the
+# moment its sentinel appears. When the two land together (the common
+# case on a fast link) this degrades to "extract both at the end", which
+# is what the script did before; when they separate, the early one's
+# extraction is free.
 #
-# Both `wait` calls have to happen in THIS shell: bash can only wait on
-# its own children, so moving them into a backgrounded helper would fail
-# with "not a child of this shell".
-if [ "$BIGGER" = "app" ]; then
-    FIRST_PID=$APP_PID;      FIRST_LABEL="app"
-    FIRST_ZIP="$TMPDIR_DL/app.zip";      FIRST_DEST="$DEST/app"
-    SECOND_PID=$PLATFORM_PID; SECOND_LABEL="platform"
-    SECOND_ZIP="$TMPDIR_DL/platform.zip"; SECOND_DEST="$DEST/platform"
-else
-    FIRST_PID=$PLATFORM_PID; FIRST_LABEL="platform"
-    FIRST_ZIP="$TMPDIR_DL/platform.zip"; FIRST_DEST="$DEST/platform"
-    SECOND_PID=$APP_PID;     SECOND_LABEL="app"
-    SECOND_ZIP="$TMPDIR_DL/app.zip";     SECOND_DEST="$DEST/app"
-fi
+# Sentinels rather than `wait -n`: that's bash 5.1+ for `-p`, and this
+# script also runs under the macOS overlay job.
+echo "[artifacts] Downloading app + platform in parallel (app=$APP_STREAMS platform=$PLAT_STREAMS range streams)..."
+T0=$(_ms)
+( _ranged_download "$APP_URL"      "$TMPDIR_DL/app.zip"      "$APP_STREAMS"  \
+    && : > "$TMPDIR_DL/app.ok" || : > "$TMPDIR_DL/app.fail" ) &
+( _ranged_download "$PLATFORM_URL" "$TMPDIR_DL/platform.zip" "$PLAT_STREAMS" \
+    && : > "$TMPDIR_DL/platform.ok" || : > "$TMPDIR_DL/platform.fail" ) &
 
-wait $FIRST_PID || { echo "[artifacts] ERROR: $FIRST_LABEL artifact download failed"; exit 1; }
-echo "[artifacts] ${FIRST_LABEL^} downloaded ($(du -h "$FIRST_ZIP" | cut -f1)) at $(( $(_ms) - T0 ))ms — extracting while $SECOND_LABEL downloads..."
-_extract_zip "$FIRST_ZIP" "$FIRST_DEST" &
-FIRST_EXTRACT_PID=$!
+_zip_path()  { [ "$1" = app ] && echo "$TMPDIR_DL/app.zip"  || echo "$TMPDIR_DL/platform.zip"; }
+_zip_dest()  { [ "$1" = app ] && echo "$DEST/app"           || echo "$DEST/platform"; }
 
-wait $SECOND_PID || { echo "[artifacts] ERROR: $SECOND_LABEL artifact download failed"; exit 1; }
+EXTRACT_PIDS=""
+PENDING="app platform"
+while [ -n "$PENDING" ]; do
+    STILL_PENDING=""
+    STARTED=""
+    for name in $PENDING; do
+        if [ -e "$TMPDIR_DL/$name.fail" ]; then
+            echo "[artifacts] ERROR: $name artifact download failed"
+            exit 1
+        fi
+        if [ -e "$TMPDIR_DL/$name.ok" ]; then
+            echo "[artifacts] ${name} downloaded ($(du -h "$(_zip_path "$name")" | cut -f1)) at $(( $(_ms) - T0 ))ms — extracting"
+            _extract_zip "$(_zip_path "$name")" "$(_zip_dest "$name")" &
+            EXTRACT_PIDS="$EXTRACT_PIDS $!"
+            STARTED="$STARTED $name"
+        else
+            STILL_PENDING="$STILL_PENDING $name"
+        fi
+    done
+    PENDING=$(echo "$STILL_PENDING" | tr -s ' ' | sed 's/^ //;s/ $//')
+    [ -n "$PENDING" ] && [ -z "$STARTED" ] && sleep 0.5
+done
 
 T_DOWNLOADED=$(_ms)
 APP_BYTES=$(stat -c%s "$TMPDIR_DL/app.zip")
@@ -349,22 +361,20 @@ DOWNLOAD_MS=$(( T_DOWNLOADED - T0 ))
 SPEED_MBS=$(( DOWNLOAD_MS > 0 ? TOTAL_MB * 1000 / DOWNLOAD_MS : 0 ))
 echo "[artifacts] Downloaded: app=$(du -h "$TMPDIR_DL/app.zip" | cut -f1) platform=$(du -h "$TMPDIR_DL/platform.zip" | cut -f1) in ${DOWNLOAD_MS}ms (~${SPEED_MBS} MB/s)"
 
-# ── Extract ────────────────────────────────────────────────────────────────
-# Only the second zip's extraction is on the critical path now; the first
-# one has been running since it landed. The two extractions share the
-# CPU while they overlap, which is fine — inflate is the bottleneck and
-# each pool already sizes itself to the core count.
-echo "[artifacts] Extracting $SECOND_LABEL (${FIRST_LABEL} extraction already in flight)..."
+# ── Wait out the extractions ───────────────────────────────────────────────
+# Whatever is left here started when its zip landed. On a fast link both
+# start at roughly the same moment and this is the whole extraction cost;
+# on a slow one the early zip is already most of the way through.
 T_EXTRACT=$(_ms)
-_extract_zip "$SECOND_ZIP" "$SECOND_DEST"
-
-wait $FIRST_EXTRACT_PID || { echo "[artifacts] ERROR: $FIRST_LABEL artifact extraction failed"; exit 1; }
+for pid in $EXTRACT_PIDS; do
+    wait "$pid" || { echo "[artifacts] ERROR: artifact extraction failed"; exit 1; }
+done
 PLATFORM_VERSION=$(python3 -c "import json; print(json.load(open('$DEST/app/manifest.json'))['platform'])" 2>/dev/null)
 echo "[artifacts] Platform version: $PLATFORM_VERSION"
 
 T_DONE=$(_ms)
 EXTRACT_MS=$(( T_DONE - T_EXTRACT ))
 TOTAL_MS=$(( T_DONE - T0 ))
-echo "[artifacts] Extract tail ${EXTRACT_MS}ms ($FIRST_LABEL overlapped with download) | Total: ${TOTAL_MS}ms | Disk: $(du -sh "$DEST" | cut -f1)"
+echo "[artifacts] Extract tail ${EXTRACT_MS}ms | Total: ${TOTAL_MS}ms | Disk: $(du -sh "$DEST" | cut -f1)"
 
 echo "[artifacts] Done. Artifacts at $DEST"
