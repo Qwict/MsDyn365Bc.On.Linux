@@ -238,13 +238,27 @@ steps:
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" begin AL_INSTALL "Install AL compiler"
       TOOL="$(AL_TOOL_VERSION)"
       BC_MAJOR=$(echo "$(BC_VERSION)" | cut -d. -f1)
+      # A policy keyword ("matching" default, "latest", "prerelease")
+      # resolves through the shared script; anything else is an exact
+      # version and is used as-is. "latest" is the answer when an app
+      # declares a runtime its own major's compiler rejects — e.g.
+      # runtime 16.1 is refused by AL 16.2 but accepted by AL 17.
+      case "$TOOL" in
+        ""|matching|latest|prerelease)
+          AL_POLICY="${TOOL:-matching}"
+          TOOL=""
+          ;;
+        *)
+          AL_POLICY=""
+          ;;
+      esac
       if [ -z "$TOOL" ]; then
         # Resolved from nuget.org: AL major is BC major - 11, newest stable of
         # that major, falling back to the newest prerelease when no stable
         # exists (a BC version still in preview has no stable compiler).
         # Calling the shared script rather than keeping a table here means a
         # new BC release needs no edit to this file.
-        if ! TOOL=$(python3 "$(Agent.BuildDirectory)/bc-linux/scripts/resolve-al-tool-version.py" "$(BC_VERSION)"); then
+        if ! TOOL=$(python3 "$(Agent.BuildDirectory)/bc-linux/scripts/resolve-al-tool-version.py" "$(BC_VERSION)" --policy "$AL_POLICY"); then
           echo "##vso[task.logissue type=error]Could not resolve an AL compiler version for BC $(BC_VERSION)"
           exit 1
         fi

@@ -103,15 +103,21 @@ on:
         default: ""
       al_tool_version:
         description: >-
-          Linux AL compiler tool version
+          Which Linux AL compiler to use
           (Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux on
-          nuget.org). Blank (default) resolves it from nuget.org via
-          scripts/resolve-al-tool-version.py: AL major is BC major - 11, and
-          it takes the newest stable of that major, falling back to the newest
-          prerelease when no stable exists. A BC version still in preview has
-          no stable compiler — BC 29 needs AL 18.x, which as of 2026-08 is
-          prerelease only — so that fallback is required to build against it.
-          Set this to pin an exact version.
+          nuget.org). Accepts a policy keyword or an exact version.
+          "matching" (default, same as blank): newest stable of the AL major
+          that matches bc_version (AL major = BC major - 11), falling back to
+          that major's newest prerelease when no stable exists — required for
+          a BC version still in preview, since BC 29 needs AL 18.x and there
+          is no stable 18.x.
+          "latest": newest stable across all majors, regardless of bc_version.
+          Use this when an app declares a runtime its own major's compiler
+          rejects — runtime 16.1 is refused by AL 16.2.28.57946 (which accepts
+          16.0 only) but accepted by AL 17.0.34.45391. Newer compilers accept
+          older runtimes, so this is safe and is what some AL-Go setups do.
+          "prerelease": newest across all majors including prereleases.
+          Anything else is treated as an exact version to pin.
         required: false
         type: string
         default: ""
@@ -452,6 +458,17 @@ jobs:
           bash bc-linux/scripts/workflow-summary.sh begin AL_INSTALL "Install AL compiler"
           AL_TOOL="${{ inputs.al_tool_version }}"
           BC_MAJOR=$(echo "${{ inputs.bc_version }}" | cut -d. -f1)
+          # A policy keyword resolves through the shared script; anything
+          # else is an exact version and is used as-is.
+          case "$AL_TOOL" in
+            ""|matching|latest|prerelease)
+              AL_POLICY="${AL_TOOL:-matching}"
+              AL_TOOL=""
+              ;;
+            *)
+              AL_POLICY=""
+              ;;
+          esac
           if [ -z "$AL_TOOL" ]; then
             # Resolved from nuget.org rather than a hardcoded table. AL major
             # is BC major - 11, and the resolver prefers the newest stable of
@@ -466,7 +483,7 @@ jobs:
             # errors point somewhere unrelated. The resolver returns the same
             # versions the table did for 27 and 28, so this is a
             # generalization of the previous behavior, not a new guess.
-            if ! AL_TOOL=$(python3 bc-linux/scripts/resolve-al-tool-version.py "${{ inputs.bc_version }}"); then
+            if ! AL_TOOL=$(python3 bc-linux/scripts/resolve-al-tool-version.py "${{ inputs.bc_version }}" --policy "$AL_POLICY"); then
               echo "::error::could not resolve an AL compiler version for BC ${{ inputs.bc_version }}"
               exit 1
             fi

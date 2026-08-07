@@ -26,10 +26,27 @@ is unbuildable without that fallback.
 
 The AL runtime version follows the same offset: BC 29 -> runtime "18.0".
 
+Policies
+--------
+Which compiler to pick is a choice, not a fact, so it is selectable:
+
+    matching    (default) newest stable of the AL major that matches the BC
+                version, falling back to that major's newest prerelease when
+                no stable exists. This is what Microsoft ships for that BC
+                version.
+    latest      newest stable across ALL majors, regardless of BC version.
+                A newer compiler accepts older runtimes, so this is a valid
+                choice and is what some AL-Go setups do. It is the answer when
+                an app declares a runtime its own major's compiler rejects —
+                e.g. runtime 16.1 is refused by AL 16.2.28.57946 (which accepts
+                16.0 only) but accepted by AL 17.0.34.45391.
+    prerelease  newest version across all majors including prereleases.
+
 Usage:
-    resolve-al-tool-version.py 29.0            # -> 18.0.39.10160-beta
-    resolve-al-tool-version.py 29.0 --runtime  # -> 18.0
-    resolve-al-tool-version.py 28.3 --stable-only
+    resolve-al-tool-version.py 29.0                       # -> 18.0.39.10160-beta
+    resolve-al-tool-version.py 27.5 --policy latest       # -> 17.0.34.45391
+    resolve-al-tool-version.py 27.5 --policy prerelease
+    resolve-al-tool-version.py 29.0 --runtime             # -> 18.0
 """
 import argparse
 import json
@@ -68,6 +85,9 @@ def main():
     ap.add_argument("bc_version", help="BC version, e.g. 29.0 or 28.3.52162.53447")
     ap.add_argument("--runtime", action="store_true",
                     help="print the AL runtime version (e.g. 18.0) instead of the tool version")
+    ap.add_argument("--policy", choices=("matching", "latest", "prerelease"),
+                    default="matching",
+                    help="which compiler to select; see the module docstring")
     ap.add_argument("--stable-only", action="store_true",
                     help="fail instead of falling back to a prerelease")
     ap.add_argument("--timeout", type=float, default=30)
@@ -95,6 +115,17 @@ def main():
     except (urllib.error.URLError, OSError, ValueError) as e:
         print(f"ERROR: could not read {INDEX}: {e}", file=sys.stderr)
         return 1
+
+    if args.policy in ("latest", "prerelease"):
+        # Not scoped to a major: a newer compiler accepts older runtimes, and
+        # the caller has asked for the newest one rather than the one matched
+        # to their BC version.
+        pool = versions if args.policy == "prerelease" else [v for v in versions if "-" not in v]
+        if not pool:
+            print(f"ERROR: no versions available under policy '{args.policy}'", file=sys.stderr)
+            return 1
+        print(sorted(pool, key=version_key)[-1])
+        return 0
 
     same_major = [v for v in versions if v.split(".")[0] == str(al_major)]
     if not same_major:
