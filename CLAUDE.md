@@ -277,6 +277,77 @@ Measured on run 31155693451; don't re-derive it from a local benchmark.
 (~3m of a 7m job), then tests, then app publish. The fetch phase is the
 dominant cost only for bc-linux's own thin smoke-test matrix.
 
+### The TestRunnerExtension app.json seed is load-bearing
+
+`resolve-keep-app-ids.py` must be seeded with
+`bc-linux/extensions/TestRunnerExtension/app.json` in addition to the
+consumer's own app.json files. That extension declares a dependency on
+Microsoft's **Test Runner**, and most consumer test apps do not — they
+declare Library Assert and Tests-TestLibraries. Without the seed, Test
+Runner falls outside the closure, the selective filter deletes it in SQL,
+and the entrypoint's own TestRunnerExtension publish then fails `AL1024`.
+
+Reproduced with a test app declaring only Library Assert +
+Tests-TestLibraries: 11 apps without the seed (Test Runner absent), 12
+with it. All four inlined example pipelines were missing it while the two
+reusable workflows had it — fixed 2026-08-07.
+
+Seed via `--app-json`, **not** `--extra-ids` with a hardcoded GUID list.
+The app.json route stays correct when TestRunnerExtension's dependencies
+change, and it keeps the "no hand-curated app lists" property the whole
+keep-set design rests on.
+
+### Why the post-NST publish costs what it does
+
+Per-app timings from a local boot, and the reason each app is in the list:
+
+| app | ships R2R DLL | publish |
+|---|---|---|
+| Tests-TestLibraries | **no** | **16.9s** |
+| System Application Test Library | **no** | 5.0s |
+| Business Foundation Test Libraries | **no** | 0.3s |
+| Test Runner | yes | 6.1s |
+| Permissions Mock / Library Assert / Library Variable Storage / Any / Performance Toolkit | yes | 0.2-0.8s each |
+
+The three apps that dominate ship **no precompiled DLL at all**, so BC
+compiles them from AL source. That ~22s is irreducible; no amount of
+R2R or install-vs-republish work touches it. Don't go looking for it again.
+
+The R2R group is the one the stuck-publish wipe deletes and republishes
+(~8s), which also **orphans their R2R cache seeds**: the pre-seed keys the
+cache on `Runtime Package ID` from `[Published Application]`, the wipe
+deleted those rows, and the re-POST assigns fresh ids. Measured on a live
+container: 12 seeded entries, only 3 still valid, 11 of 14 published apps
+with no usable entry. So the pre-seed currently pays off for the baseline
+apps only.
+
+### Installing a published app without republishing IS possible
+
+The design assumption that "without the management endpoint there's no way
+to install a pre-published app" is **obsolete** on BC 27/28. The automation
+API on the API port exposes it:
+
+```
+/api/microsoft/automation/v2.0/extensions(<appId>)/Microsoft.NAV.install
+Actions: install, uninstall, unpublish, upload   (bound to Microsoft.NAV.extension)
+```
+
+Two prerequisites, both discovered the hard way:
+
+- `_Exclude_APIV2_` must be published **and tenant-installed** — it's stuck
+  in the same state as everything else, so it needs one bootstrap publish
+  (~3s) before its own API can install anything.
+- `ServicesDefaultCompany` must be set in `CustomSettings.config`, or the
+  action returns `Internal_CompanyNotFound`. A `?company=` query parameter
+  does not work — it breaks route resolution entirely. Pre-NST the value is
+  available from `SELECT Name FROM [Company] WHERE [Evaluation Company]=1`,
+  which is localization-safe.
+
+Not implemented: the round-trip was never proven green, and the ceiling is
+~8s minus the ~3s bootstrap. Recorded because the obsolete constraint is
+what shaped the wipe-and-republish design, not because the time is worth
+chasing.
+
 ### Known, not yet acted on: the post-NST extension publish
 
 Local boot splits as 8s prep/restore/R2R-seed → 25s NST startup → **31s

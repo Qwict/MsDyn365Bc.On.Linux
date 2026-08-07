@@ -118,7 +118,15 @@ jobs:
           # Walk consumer .app files, keep the 5-app baseline + any
           # non-test-framework transitive deps. Test framework is
           # handled by the entrypoint's republish step.
-          ARGS=""
+          # Seed the closure with bc-linux's own TestRunnerExtension app.json.
+          # It declares a dependency on Microsoft's Test Runner, which most
+          # consumer test apps do NOT declare — they depend on Library Assert
+          # and Tests-TestLibraries instead. Without this seed Test Runner
+          # falls outside the closure, the selective filter wipes it in SQL,
+          # and the entrypoint's TestRunnerExtension publish then fails with
+          # AL1024. Seeding via app.json rather than a hardcoded GUID list
+          # keeps the closure self-maintaining.
+          ARGS="--app-json bc-linux/extensions/TestRunnerExtension/app.json"
           for f in $APP_FILES $TEST_APP_FILES; do
             [ -z "$f" ] && continue
             [ -f "project/$f" ] && ARGS="$ARGS --app-file project/$f"

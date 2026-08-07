@@ -152,7 +152,15 @@ steps:
   - bash: |
       set -e
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" begin RESOLVE "Resolve apps to keep"
-      ARGS=""
+      # Seed the closure with bc-linux's own TestRunnerExtension app.json.
+      # It declares a dependency on Microsoft's Test Runner, which most
+      # consumer test apps do NOT declare — they depend on Library Assert
+      # and Tests-TestLibraries instead. Without this seed Test Runner falls
+      # outside the closure, the selective filter wipes it in SQL, and the
+      # entrypoint's TestRunnerExtension publish then fails with AL1024.
+      # Seeding via app.json rather than a hardcoded GUID list keeps the
+      # closure self-maintaining.
+      ARGS="--app-json $(Agent.BuildDirectory)/bc-linux/extensions/TestRunnerExtension/app.json"
       cd "$(Pipeline.Workspace)/project"
       for d in $(APP_DIRS) $(TEST_APP_DIRS); do
         [ -z "$d" ] && continue
