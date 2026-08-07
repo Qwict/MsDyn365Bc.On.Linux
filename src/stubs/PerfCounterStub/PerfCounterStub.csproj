@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- Multi-targeted: BC 27/28 run on .NET 8, BC 29+ on .NET 10. -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <AssemblyName>System.Diagnostics.PerformanceCounter</AssemblyName>
     <Nullable>enable</Nullable>
   </PropertyGroup>

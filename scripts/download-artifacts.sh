@@ -221,6 +221,12 @@ elif [ $# -eq 4 ]; then
         echo "[artifacts] Resolving version $BC_VERSION via Microsoft's index file..."
         T_RESOLVE=$(_ms)
         REQUESTED_PREFIX="$BC_VERSION"
+        # Released versions live on bcartifacts; versions Microsoft hasn't
+        # shipped yet (BC 29 as of 2026-08) live only on the insider storage
+        # account, which serves the same index layout and — unlike the old
+        # bcinsider blob endpoint — needs no SAS token. Try released first and
+        # fall back, so this stays a no-op for every version that IS released.
+        INDEX_BASES="$BASE_URL https://bcinsider-fvh2ekdjecfjd6gk.b02.azurefd.net"
         INDEX_URL="$BASE_URL/${BC_TYPE}/indexes/${BC_COUNTRY}.json"
         RESOLVED=""
         # Three attempts in case of transient network errors. The index
@@ -228,6 +234,8 @@ elif [ $# -eq 4 ]; then
         # list-blobs API's stale-cache problem; one retry is usually
         # plenty.
         for attempt in 1 2 3; do
+          for INDEX_BASE in $INDEX_BASES; do
+            INDEX_URL="$INDEX_BASE/${BC_TYPE}/indexes/${BC_COUNTRY}.json"
             RESOLVED=$(curl -sf --retry 2 --retry-delay 2 "$INDEX_URL" 2>/dev/null | \
                 BC_PREFIX="$REQUESTED_PREFIX" python3 -c "
 import json, os, sys
@@ -245,11 +253,14 @@ versions.sort(key=vkey)
 print(versions[-1])
 " 2>/dev/null || true)
             if [ -n "$RESOLVED" ] && echo "$RESOLVED" | grep -q "^${REQUESTED_PREFIX}\."; then
+                RESOLVED_BASE="$INDEX_BASE"
                 break
             fi
             RESOLVED=""
-            echo "[artifacts] WARN: attempt $attempt — index file unreachable or no '$REQUESTED_PREFIX.x' versions found; retrying..."
-            sleep 3
+          done
+          [ -n "$RESOLVED" ] && break
+          echo "[artifacts] WARN: attempt $attempt — index file unreachable or no '$REQUESTED_PREFIX.x' versions found; retrying..."
+          sleep 3
         done
         if [ -z "$RESOLVED" ]; then
             echo "[artifacts] ERROR: Could not resolve version $REQUESTED_PREFIX from $INDEX_URL"
@@ -257,8 +268,10 @@ print(versions[-1])
             echo "[artifacts]   BC_VERSION=27.5.46862.48612 docker compose up -d --wait"
             exit 1
         fi
-        echo "[artifacts] Resolved: $REQUESTED_PREFIX → $RESOLVED ($(( $(_ms) - T_RESOLVE ))ms)"
+        echo "[artifacts] Resolved: $REQUESTED_PREFIX → $RESOLVED via $RESOLVED_BASE ($(( $(_ms) - T_RESOLVE ))ms)"
         BC_VERSION="$RESOLVED"
+        # Download from whichever account actually had the version.
+        BASE_URL="$RESOLVED_BASE"
     fi
 
     APP_URL="$BASE_URL/$BC_TYPE/$BC_VERSION/$BC_COUNTRY"

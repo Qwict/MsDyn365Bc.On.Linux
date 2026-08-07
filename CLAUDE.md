@@ -564,6 +564,122 @@ normalizes `[User Personalization].[Time Zone]` to `UTC` before NST starts.
 If you touch one `ZoneForOffset`, update the other — they're duplicated
 across the two hook assemblies on purpose (no shared assembly).
 
+## Two .NET runtimes in one image (BC 27/28 = net8.0, BC 29 = net10.0)
+
+BC 29 is a `net10.0` application: its
+`Microsoft.Dynamics.Nav.Server.runtimeconfig.json` asks the host for
+`Microsoft.NETCore.App` **and** `Microsoft.AspNetCore.App` 10.0.0, where
+BC 27/28 ask for 8.0.0. On a single-runtime image BC 29 dies before the
+startup hook ever runs, with "You must install or update .NET to run this
+application."
+
+The fix is **additive, not a migration**: the image installs both shared
+frameworks side by side and picks per BC version at boot. Nothing about the
+.NET 8 path changed.
+
+- **`src/Dockerfile`** — the builder stays on the bookworm-based `sdk:8.0`
+  and adds the .NET 10 SDK via `dotnet-install.sh`. Do **not** switch the
+  base to `sdk:10.0`: that image is trixie, and `libwin32_stubs.so` is
+  compiled here with gcc and has to keep running against the bookworm glibc
+  in the `aspnet:8.0` runtime stage. The runtime stage adds the .NET 10
+  ASP.NET Core runtime the same way (which brings `Microsoft.NETCore.App`
+  10 with it). A net8.0 app does **not** roll forward to 10 while 8 is
+  installed, so BC 27/28 keep resolving 8.0.
+- **The stub projects are multi-targeted** (`net8.0;net10.0`).
+  `HttpSysStub` and `WindowsPrincipalStub` impersonate BCL assemblies and
+  are copied INTO the shared framework directory, so their `AssemblyVersion`
+  is conditional on the TFM (8.0.0.0 / 10.0.0.0). The net10 outputs are
+  collected into `/bc/hook-net10/`.
+- **`scripts/entrypoint.sh` reads the framework major straight off BC's own
+  `runtimeconfig.json`** rather than mapping it from the BC major. That file
+  IS the contract the host uses to pick a framework, so the selector cannot
+  drift when Microsoft moves a version to a new runtime. From it the
+  entrypoint derives `NETCORE_RUNTIME_DIR` / `ASPNET_RUNTIME_DIR` (replacing
+  the old hardcoded `8.0.*` globs), `REFASM_DIR`, and the Add-Ins
+  `System.Drawing.Common` flavour.
+- **The net10 stubs are copied ONTO `/bc/hook`,** not pointed at.
+  `SetupStubWithResolver` reads stub bytes from the startup hook assembly's
+  own directory, so an override path would need a hook code change; the
+  overlay is idempotent and re-applied every boot.
+- **Reference assemblies for Cecil ship in two sets** — `/bc/refasm`
+  (net8.0) and `/bc/refasm-net10`. These feed the server-side AL compiler's
+  type-forward resolution (Patch #16's Add-Ins layer 1).
+- **Patch #15b is already version-agnostic**: it filters by the path
+  substring `/dotnet/shared/Microsoft.NETCore.App/`, which matches both. The
+  `Version=8.0.0.0` strings elsewhere in `StartupHook.cs` are inside the
+  Patch #15 diagnostic dump only.
+- **`Microsoft.Data.SqlClient` is deliberately NOT duplicated.** The 6.0.5
+  package's newest asset is `net8.0` and that assembly loads unmodified on
+  .NET 10.
+- **`scripts/download-artifacts.sh` falls back to the insider storage
+  account** when the released index has no match for the requested version
+  prefix. BC 29 is insider-only and, unlike the old bcinsider blob endpoint,
+  the AFD front door needs no SAS token. The fallback only fires where the
+  old code hard-errored.
+
+`src/WebClientHook/` and `tools/TestRunner/` still target `net8.0` and were
+not revisited. The web client PoC has not been tried against BC 29.
+
+### BC 29 status: boots and publishes extensions
+
+Verified 2026-08-07 against `sandbox/29.0.53450.0/w1`. BC 27.5, 28.1 and 29.0
+all reach `Ready for extensions` on one image, and on all three the
+entrypoint's own extension publishes succeed. AL tests have NOT been run on
+BC 29.
+
+BC-29-specific problems found on the way; they are compat gaps in BC 29
+itself, not .NET 10 problems:
+
+- **Missing OpenTelemetry exporters** — `Nav.Ncl` references
+  `OpenTelemetry.Exporter.Console` and `.OpenTelemetryProtocol`; neither DLL
+  is anywhere in the platform artifact. `NavEnvironment`'s ctor died with
+  `FileNotFoundException`. Staged from NuGet (see above).
+- **Patch #29, `NavDirectorySecurity.CreateSecurityForDomainDirectory`** —
+  BC 29 reaches it from `TempPathHelper.InitializeFolders` and it constructs
+  a `System.Security.AccessControl.DirectorySecurity`, which throws
+  `PlatformNotSupportedException` on Linux. On BC 27/28 the call was gated on
+  `IServiceTopology.IsServiceRunningInLocalEnvironment`, which Patch #9's
+  Linux topology proxy forces false. Now hooked to return null on every
+  version — a no-op on 27/28, which never reach it.
+- **`SecurityIdentifier` equality operators** — BC 29 calls
+  `op_Inequality`, which `WindowsPrincipalStub` didn't define
+  (`MissingMethodException`). Added; purely additive for 27/28.
+
+- **A JMP hook must never be applied twice to the same method.** This is what
+  segfaulted BC 29, and it is the single most important thing in this
+  section. **Patch #14** (`CecilDotNetTypeLoader.IsTypeForwardingCircular`)
+  and the Mono.Cecil `Mixin.CheckFileName` hook are the only two patches that
+  reached `ApplyJmpHook` twice: once from the `AssemblyLoad` event handler,
+  then again from `TryEagerPatch`, whose `Assembly.LoadFrom` is what raised
+  that event — so the eager call always landed on an already-hooked method.
+  .NET 8 tolerated the redundant re-apply. On .NET 10,
+  `RuntimeHelpers.PrepareMethod` against an overwritten entry point dies
+  inside `libcoreclr.so` with no managed frames, which is exactly the
+  "deterministic SIGSEGV, no managed frames, both hooks must be off" symptom.
+  It had nothing to do with the replacements' signatures — a standalone
+  repro on .NET 10.0.10 hooking an instance method with parameters to a
+  parameterless static works fine. `ApplyJmpHook` now refuses to re-hook:
+  `IsAlreadyJmpHooked` reads the entry point (WITHOUT `PrepareMethod`, which
+  is the call that crashes) and looks for our own `FF 25 00000000` stub — a
+  real StubPrecode also starts `FF 25` but always has a non-zero disp32.
+  The check is per method instance, so a second ALC still gets its own hook.
+- **`GenevaStub` needs the version-agnostic stub resolver, not just a file
+  copy.** BC 29's `Microsoft.BusinessCentral.Telemetry.OpenTelemetry` asks
+  for `OpenTelemetry.Exporter.Geneva` **1.15.2.1008**; the stub is 1.9.0.62.
+  `ReplaceWithStub` had already overwritten the file, so the default ALC
+  found it, rejected the identity, and the load failed. BC reported that as
+  a `FileNotFoundException` inside a "LazyEx factory threw an exception"
+  **without naming the assembly**, and every dev-endpoint publish returned
+  HTTP 500. `Initialize` now also calls `RegisterStubForResolver
+  ("OpenTelemetry.Exporter.Geneva")`, which answers any requested version the
+  same way `System.Drawing.Common` is handled. Additive for BC 27/28.
+
+`BC_DEBUG_ASSEMBLY_RESOLVE=1` is how the Geneva name was found and is the
+tool to reach for next time BC swallows an assembly load failure: it logs
+every `AssemblyLoadContext.Default.Resolving` and
+`AppDomain.AssemblyResolve` miss with the requesting assembly. Much cheaper
+than `BC_DEBUG_FIRSTCHANCE=1`. Both are docker-compose pass-throughs.
+
 ## Relationship to `PipelinePerformanceComparison`
 
 The sibling repo `../PipelinePerformanceComparison` is the **primary consumer** of this project and the reason most of the recent patches exist. It is *not* a dependency of bc-linux — the relationship goes the other way:

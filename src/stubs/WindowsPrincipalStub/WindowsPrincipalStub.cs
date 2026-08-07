@@ -81,8 +81,16 @@ namespace System.Security.Principal
         public override string Value => _value;
 
         public override bool Equals(object? o) => o is SecurityIdentifier sid && sid._value == _value;
+        public bool Equals(SecurityIdentifier? sid) => sid is not null && sid._value == _value;
         public override int GetHashCode() => _value.GetHashCode();
         public override string ToString() => _value;
+
+        // The real BCL type declares these; BC 29's NavEnvironment startup path
+        // calls op_Inequality and dies with MissingMethodException without them.
+        public static bool operator ==(SecurityIdentifier? left, SecurityIdentifier? right)
+            => left is null ? right is null : left.Equals(right);
+        public static bool operator !=(SecurityIdentifier? left, SecurityIdentifier? right)
+            => !(left == right);
         public bool IsAccountSid() => true;
         public bool IsWellKnown(WellKnownSidType type) => _value == "S-1-5-18" && type == WellKnownSidType.LocalSystemSid;
         public override bool IsValidTargetType(Type targetType) => true;

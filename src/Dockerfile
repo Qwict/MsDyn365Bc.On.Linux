@@ -6,6 +6,17 @@ FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/sdk:8.0 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev unzip && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# .NET 10 SDK alongside the 8.0 SDK this image ships. BC 27/28 target net8.0,
+# BC 29 targets net10.0, and the framework-impersonating stubs + Cecil reference
+# assemblies have to be produced for BOTH. Deliberately installed on top of the
+# bookworm-based sdk:8.0 image rather than switching the base to sdk:10.0
+# (trixie): libwin32_stubs.so is compiled here with gcc and has to keep running
+# against the bookworm glibc in the aspnet:8.0 runtime stage.
+RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && \
+    bash /tmp/dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet && \
+    rm /tmp/dotnet-install.sh && \
+    dotnet --list-sdks
+
 WORKDIR /build
 COPY src/ src/
 COPY tools/ tools/
@@ -14,6 +25,22 @@ RUN cd src/StartupHook && dotnet publish -c Release -o /build/output/hook
 RUN cd src/WebClientHook && dotnet publish -c Release -o /build/output/webclient-hook
 
 RUN cp /build/src/stubs/DrawingStub/bin/Release/net8.0/System.Drawing.Common.dll /build/output/DrawingStub.dll
+RUN cp /build/src/stubs/DrawingStub/bin/Release/net10.0/System.Drawing.Common.dll /build/output/DrawingStub-net10.dll
+
+# net10 flavour of every stub. StartupHook's BuildStubs target already built all
+# target frameworks (the stub projects are multi-targeted); this only collects the
+# net10.0 outputs into their own directory. The entrypoint overlays them onto
+# /bc/hook when the BC build it is running targets net10.0 — see "runtime
+# selection" there. Microsoft.Data.SqlClient is deliberately NOT duplicated: the
+# package's newest asset is net8.0 and that assembly loads unmodified on .NET 10.
+RUN mkdir -p /build/output/hook-net10 && \
+    for p in GenevaStub:OpenTelemetry.Exporter.Geneva \
+             DrawingStub:System.Drawing.Common \
+             PerfCounterStub:System.Diagnostics.PerformanceCounter \
+             WindowsPrincipalStub:System.Security.Principal.Windows \
+             HttpSysStub:Microsoft.AspNetCore.Server.HttpSys; do \
+      cp "/build/src/stubs/${p%%:*}/bin/Release/net10.0/${p##*:}.dll" /build/output/hook-net10/; \
+    done && ls -la /build/output/hook-net10
 
 # Publish tools
 RUN cd src/tools/MergeNetstandard && dotnet publish -c Release -o /build/output/tools 2>&1 | tail -3
@@ -35,11 +62,31 @@ RUN mkdir -p /build/output/skia && \
       rm /tmp/skia.nupkg; \
     done && ls -la /build/output/skia/*
 
-# Copy .NET 8 reference assemblies from SDK (needed for Cecil type resolution)
-RUN mkdir -p /build/output/refasm && \
+# OpenTelemetry exporters BC 29 references but Microsoft's artifact does not
+# ship. BC 29's Microsoft.Dynamics.Nav.Ncl.dll references
+# OpenTelemetry.Exporter.Console and .OpenTelemetryProtocol; neither DLL is
+# anywhere in the platform artifact, so NavEnvironment's ctor dies with
+# FileNotFoundException before the NST is up. BC 28's Ncl references neither,
+# so the entrypoint only stages the ones actually referenced and missing.
+# 1.15.3 = the OpenTelemetry version BC 29.0.53450 ships (read off the
+# OpenTelemetry.dll in its own service tier). nupkgs are plain zips, and
+# neither package has non-framework dependencies on net10.0.
+RUN mkdir -p /build/output/otel && \
+    for pkg in OpenTelemetry.Exporter.Console OpenTelemetry.Exporter.OpenTelemetryProtocol; do \
+      curl -fsSL "https://www.nuget.org/api/v2/package/$pkg/1.15.3" -o /tmp/otel.nupkg && \
+      unzip -j -o /tmp/otel.nupkg "lib/net10.0/$pkg.dll" -d /build/output/otel && \
+      rm /tmp/otel.nupkg; \
+    done && ls -la /build/output/otel
+
+# Copy .NET reference assemblies from SDK (needed for Cecil type resolution).
+# One set per runtime BC can target; the entrypoint picks by the framework version
+# in Microsoft.Dynamics.Nav.Server.runtimeconfig.json.
+RUN mkdir -p /build/output/refasm /build/output/refasm-net10 && \
     REF_DIR=$(find /usr/share/dotnet/packs/Microsoft.NETCore.App.Ref -maxdepth 3 -type d -name "net8.0" | head -1) && \
     cp "$REF_DIR"/*.dll /build/output/refasm/ && \
-    echo "Copied $(ls /build/output/refasm/*.dll | wc -l) reference assemblies"
+    REF_DIR10=$(find /usr/share/dotnet/packs/Microsoft.NETCore.App.Ref -maxdepth 3 -type d -name "net10.0" | head -1) && \
+    cp "$REF_DIR10"/*.dll /build/output/refasm-net10/ && \
+    echo "Copied $(ls /build/output/refasm/*.dll | wc -l) net8.0 + $(ls /build/output/refasm-net10/*.dll | wc -l) net10.0 reference assemblies"
 
 # Runtime stage: minimal image
 FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/aspnet:8.0
@@ -63,15 +110,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ACCEPT_EULA=Y apt-get update && ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-tools18 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /bc/hook /bc/patched /bc/refasm /bc/addins-overlay /bc/testrunner /bc/service /bc/artifacts /bc/scripts /bc/tools
+# Second shared framework, side by side with the 8.0 one this base image ships.
+# BC 27/28's Microsoft.Dynamics.Nav.Server.runtimeconfig.json asks for
+# Microsoft.NETCore.App + Microsoft.AspNetCore.App 8.0.0; BC 29's asks for 10.0.0.
+# Installing both means one image boots either — the host resolves the framework
+# per app, and a net8.0 app does NOT roll forward to 10 while 8 is present.
+# This is additive: nothing about the 8.0 path changes.
+RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && \
+    bash /tmp/dotnet-install.sh --channel 10.0 --runtime aspnetcore --install-dir /usr/share/dotnet && \
+    rm /tmp/dotnet-install.sh && \
+    dotnet --list-runtimes
+
+RUN mkdir -p /bc/hook /bc/hook-net10 /bc/patched /bc/refasm /bc/refasm-net10 /bc/addins-overlay /bc/testrunner /bc/service /bc/artifacts /bc/scripts /bc/tools
 
 # Copy built artifacts from builder
 COPY --from=builder /build/output/hook/ /bc/hook/
 COPY --from=builder /build/output/webclient-hook/ /bc/webclient-hook/
+COPY --from=builder /build/output/hook-net10/ /bc/hook-net10/
 COPY --from=builder /build/output/refasm/ /bc/refasm/
+COPY --from=builder /build/output/refasm-net10/ /bc/refasm-net10/
 COPY --from=builder /build/output/tools/ /bc/tools/
 COPY --from=builder /build/output/DrawingStub.dll /bc/addins-overlay/System.Drawing.Common.dll
+COPY --from=builder /build/output/DrawingStub-net10.dll /bc/addins-overlay/System.Drawing.Common.net10.dll
 COPY --from=builder /build/output/skia/ /bc/natives/skia/
+COPY --from=builder /build/output/otel/ /bc/natives/otel/
 
 # Copy scripts
 COPY scripts/ /bc/scripts/
