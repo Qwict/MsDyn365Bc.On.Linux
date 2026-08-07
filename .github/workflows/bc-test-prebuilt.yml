@@ -143,35 +143,11 @@ jobs:
       - name: Initialize timing
         run: bash bc-linux/scripts/workflow-summary.sh init
 
-      # ─── SQL Server image cache ──────────────────────────────────────
-      # The registry is the variable part of the fetch phase: the same SQL
-      # image has measured 105s, 45s and 104s on the same 2-vCPU runner
-      # class, with the compression format changing nothing. A local
-      # `docker load` measured 8s against a 49s pull, and the tar
-      # compresses to ~523 MB of the 10 GB repo cache budget.
-      #
-      # Keyed on the exact image digest, so a re-mirrored image rebuilds
-      # the entry. Only the SQL image is cached — bc-runner changes on
-      # every bc-linux push, and BC artifacts must NEVER be cached (they
-      # move revision several times a day and are ~3 GB per version; see
-      # CLAUDE.md).
-      - name: Resolve SQL image digest
-        id: sqlimg
-        working-directory: bc-linux
-        run: echo "digest=$(bash scripts/sql-image.sh digest)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache SQL Server image
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/bc-sql-image
-          key: bc-sql-image-${{ steps.sqlimg.outputs.digest }}
-
       # Artifact download + docker pull in parallel (independent network IO).
       - name: Download BC artifacts + pull docker images (parallel)
         env:
           BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
           BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache/${{ inputs.bc_version }}
-          SQL_IMAGE_TAR: ${{ runner.temp }}/bc-sql-image/sql.tar
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
@@ -184,21 +160,12 @@ jobs:
           ARTIFACT_PID=$!
           (
             cd bc-linux
-            # Restore the SQL image from the Actions cache when we have
-            # it and pull only bc-runner; otherwise pull both and write
-            # the tar for the cache's post-step to pick up.
-            #
             # compose-pull.sh retries transient registry failures (mcr
             # occasionally WAF-blocks runner IPs) but aborts immediately
             # on a permanent one. The inline loop it replaced slept 15s x5
             # on "manifest unknown", turning a wrong or not-yet-published
             # tag into 60s of silent dead time.
-            if bash scripts/sql-image.sh load "$SQL_IMAGE_TAR"; then
-              bash scripts/compose-pull.sh bc
-            else
-              bash scripts/compose-pull.sh
-              bash scripts/sql-image.sh save "$SQL_IMAGE_TAR"
-            fi
+            bash scripts/compose-pull.sh
           ) &
           PULL_PID=$!
           wait $ARTIFACT_PID || { echo "artifact download failed"; exit 1; }

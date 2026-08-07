@@ -357,16 +357,15 @@ BC_SQL_IMAGE=mcr.microsoft.com/mssql/server:2022-latest docker compose up -d
 BC_SQL_IMAGE=registry.example.com/mssql/server:2022-CU14 docker compose up -d
 ```
 
-The reusable CI workflows expose the same override as a `sql_image` input,
-and cache whichever image you name in the GitHub Actions cache keyed by
-digest — so after the first run the registry is off the critical path
-(measured: `docker load` 8s vs a 49s pull; the tar compresses to ~523 MB).
+The reusable CI workflows expose the same override as a `sql_image` input.
 
-**BC artifacts are deliberately not cached**, and shouldn't be: Microsoft
-moves the revision build several times a day, so the key would be
-invalidated about as often as it's written, and at ~3 GB per version a
-handful of versions exhausts the 10 GB repo cache before anything is
-reused.
+**Neither the BC artifacts nor the docker images are cached between CI
+runs**, and that's deliberate. Microsoft moves the artifact revision build
+several times a day, so an artifact cache key would be invalidated about
+as often as it's written, and at ~3 GB per version a handful of versions
+exhausts the 10 GB repo cache before anything is reused. Caching the SQL
+image was measured and is slower than pulling it — `docker load` of the
+1.6 GB tar takes ~78s on a runner against a 13-17s pull.
 
 **Custom license (ISVs / developer license):** by default the entrypoint
 imports the public Cronus.bclicense that ships with the BC artifact. To

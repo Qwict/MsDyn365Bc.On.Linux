@@ -20,14 +20,6 @@
 # found — abort immediately with the registry's own message, because no
 # amount of waiting fixes them.
 #
-# Usage:
-#   compose-pull.sh [service...]    pull all services, or only those named
-#
-# Naming services matters when one of them is already in the local image
-# store — e.g. the SQL image restored from the Actions cache by
-# sql-image.sh. `docker compose pull` would re-fetch it from the registry
-# regardless, throwing away the cache hit.
-#
 # Env:
 #   COMPOSE_PULL_ATTEMPTS   attempts before giving up (default 5)
 #   COMPOSE_PULL_DELAY      seconds between attempts  (default 15)
@@ -36,17 +28,13 @@ set -uo pipefail
 
 ATTEMPTS="${COMPOSE_PULL_ATTEMPTS:-5}"
 DELAY="${COMPOSE_PULL_DELAY:-15}"
-# Guarded expansion: `"${SERVICES[@]}"` on an empty array trips `set -u`
-# on bash < 4.4, and this script is short enough not to gamble on that.
-SERVICES=("$@")
-if [ "${#SERVICES[@]}" -eq 0 ]; then SERVICES=(); fi
 
 # Registry errors that will never resolve by waiting. Matched
 # case-insensitively against the combined stdout+stderr of the attempt.
 PERMANENT='manifest unknown|manifest for .* not found|not found: manifest|repository does not exist|name unknown|unauthorized|authentication required|denied: |access to the resource is denied|invalid reference format|no such host'
 
 for attempt in $(seq 1 "$ATTEMPTS"); do
-    out=$(docker compose pull --quiet "${SERVICES[@]}" 2>&1)
+    out=$(docker compose pull --quiet 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ]; then
         [ "$attempt" -gt 1 ] && echo "[compose-pull] succeeded on attempt $attempt/$ATTEMPTS"

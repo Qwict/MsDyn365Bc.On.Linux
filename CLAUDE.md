@@ -239,7 +239,7 @@ and races `mirror-sql-image.yml`. This cost two runs. The second one went
 *green* — the retry loop's last attempt landed after the tag appeared — and
 the only symptom was a fetch phase reporting 74s instead of ~14s.
 
-### Do NOT cache BC artifacts. Ever.
+### Do NOT cache BC artifacts (or the SQL image). Ever.
 
 This gets proposed roughly every time someone profiles the pipeline,
 including by me. The answer is no, and it isn't close:
@@ -258,9 +258,13 @@ of any BC version — the image is stable and cacheable, the artifacts are
 not. Don't add `actions/cache` around `artifact-cache/`, and don't
 propose it in a review.
 
-**The SQL Server image is the opposite case** and IS cached: one image,
-changes a few times a year, ~1.5 GB, exact digest as the key. See the
-`Cache SQL Server image` steps in the reusable workflows.
+**Caching the SQL Server image was tried too, and is also worse.** It
+looks like the good case — one image, changes a few times a year, exact
+digest as the key — and locally `docker load` from a tar took 8s against
+a 49s pull. On an actual runner it took **78s**, plus 10s to restore the
+cache, against a 13-17s registry pull. The 1.6 GB uncompressed tar is
+disk-bound and runner disks are far slower than a dev machine's NVMe.
+Measured on run 31155693451; don't re-derive it from a local benchmark.
 
 **Two false leads, so nobody re-chases them:**
 
