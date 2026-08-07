@@ -30,6 +30,14 @@ on:
 env:
   UPSTREAM: mcr.microsoft.com/mssql/server:2022-latest
   MIRROR: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022
+  # Same image content, layers recompressed with zstd instead of the
+  # gzip blobs mcr ships. Pulling 625 MB from GHCR still took ~45s on a
+  # private repo's 2-vCPU runner — GHCR shouldn't be network-limited
+  # there, which points at gzip inflate on two cores. zstd decompresses
+  # several times faster for a similar ratio. Published alongside the
+  # byte-identical :2022 tag so there's an instant rollback if a
+  # consumer's Docker can't handle zstd layers.
+  MIRROR_ZSTD: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd
 
 jobs:
   mirror:
@@ -120,6 +128,46 @@ jobs:
           fi
           echo "Mirror published: $MIRROR -> $got"
 
+      # ── zstd variant ────────────────────────────────────────────────
+      # buildx re-exports the same filesystem layers with a different
+      # compressor. force-compression is required — without it buildx
+      # passes the existing gzip blobs through untouched. provenance and
+      # sbom are off so the tag stays a plain image rather than gaining
+      # attestation manifests that consumers' Docker would have to skip.
+      - name: Set up Buildx
+        if: steps.compare.outputs.push == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Republish with zstd layers
+        if: steps.compare.outputs.push == 'true'
+        run: |
+          set -e
+          echo "FROM $UPSTREAM" > Dockerfile.mirror
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            --output "type=registry,name=$MIRROR_ZSTD,compression=zstd,compression-level=9,force-compression=true" \
+            -f Dockerfile.mirror .
+
+      # Pull it back on a clean daemon state to prove a consumer can, and
+      # to record what it costs. A failure here means the zstd tag is
+      # unusable and consumers should stay on :2022 — which is why the
+      # compose default doesn't point at this tag until it's proven.
+      - name: Pull the zstd tag back and time it
+        if: steps.compare.outputs.push == 'true'
+        run: |
+          set -e
+          docker image rm -f "$MIRROR_ZSTD" >/dev/null 2>&1 || true
+          for tag in "$MIRROR" "$MIRROR_ZSTD"; do
+            docker image rm -f "$tag" >/dev/null 2>&1 || true
+            start=$(date +%s)
+            docker pull -q "$tag" >/dev/null
+            echo "$tag pulled in $(( $(date +%s) - start ))s"
+          done
+          echo "NOTE: this runner is a PUBLIC-repo 4-vCPU box ($(nproc) cores)."
+          echo "      The gzip-vs-zstd gap should be wider on a private"
+          echo "      repo's 2-vCPU runner, which is where it matters."
+
       - name: Summary
         run: |
           {
@@ -128,7 +176,8 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Upstream | \`$UPSTREAM\` |"
-            echo "| Mirror | \`$MIRROR\` |"
+            echo "| Mirror (gzip, byte-copy) | \`$MIRROR\` |"
+            echo "| Mirror (zstd layers) | \`$MIRROR_ZSTD\` |"
             echo "| Digest | \`${{ steps.compare.outputs.digest }}\` |"
             echo "| Pushed | ${{ steps.compare.outputs.push }} |"
           } >> "$GITHUB_STEP_SUMMARY"

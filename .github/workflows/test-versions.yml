@@ -158,6 +158,15 @@ jobs:
       bc_version: ${{ matrix.bc_version }}
       bc_country: w1
       bc_type: sandbox
+      # bc-linux's own matrix runs the zstd-layer mirror ahead of the
+      # consumer default (:2022, gzip byte-copy). This is the correctness
+      # gate — "does every supported BC version still boot when SQL comes
+      # from a zstd-compressed image" — not the speed gate. The speed
+      # question only shows up on a private repo's 2-vCPU runner, where
+      # gzip inflate is the suspected cost; this repo is public and gets
+      # 4 vCPUs. Flip docker-compose.yml's default only after this has
+      # been green across the matrix.
+      sql_image: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd
       test_app_dirs: extensions/smoke-test
       # The smoke-test fixture ships a placeholder runtime ("14.0") so one
       # committed app.json spans the whole version matrix; "auto" opts into
