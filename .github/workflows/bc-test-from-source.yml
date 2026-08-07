@@ -132,12 +132,10 @@ on:
           Override the SQL Server image. Blank (default) uses bc-linux's
           GHCR mirror of mcr.microsoft.com/mssql/server:2022-latest with
           zstd-compressed layers, which isn't subject to mcr's
-          intermittent WAF blocks. Whichever image you name is cached in
-          the Actions cache by digest, so the registry is off the critical
-          path after the first run. Set this to
+          intermittent WAF blocks. Set this to
           "mcr.microsoft.com/mssql/server:2022-latest" to go straight to
-          Microsoft, ".../mssql:2022" for the gzip copy, or to any image
-          in your own registry.
+          Microsoft, ".../mssql:2022" for the byte-identical gzip copy, or
+          to any image in your own registry.
         required: false
         type: string
         default: ""
