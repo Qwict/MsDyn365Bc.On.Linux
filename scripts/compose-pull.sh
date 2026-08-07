@@ -20,6 +20,12 @@
 # found — abort immediately with the registry's own message, because no
 # amount of waiting fixes them.
 #
+# Args:
+#   Optional service names to limit the pull (e.g. `compose-pull.sh sql`).
+#   With no args it pulls every service, as before. The workflows pull sql
+#   on its own first so they can start it while the BC artifact is still
+#   downloading — see the call sites for why that ordering matters.
+#
 # Env:
 #   COMPOSE_PULL_ATTEMPTS   attempts before giving up (default 5)
 #   COMPOSE_PULL_DELAY      seconds between attempts  (default 15)
@@ -34,7 +40,7 @@ DELAY="${COMPOSE_PULL_DELAY:-15}"
 PERMANENT='manifest unknown|manifest for .* not found|not found: manifest|repository does not exist|name unknown|unauthorized|authentication required|denied: |access to the resource is denied|invalid reference format|no such host'
 
 for attempt in $(seq 1 "$ATTEMPTS"); do
-    out=$(docker compose pull --quiet 2>&1)
+    out=$(docker compose pull --quiet "$@" 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ]; then
         [ "$attempt" -gt 1 ] && echo "[compose-pull] succeeded on attempt $attempt/$ATTEMPTS"
@@ -48,7 +54,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
         echo "[compose-pull] The image name or tag is wrong, not yet published,"
         echo "[compose-pull] or this runner can't authenticate to the registry."
         echo "[compose-pull] Images this compose file resolves to:"
-        docker compose config --images 2>/dev/null | sed 's/^/[compose-pull]   /'
+        docker compose config --images "$@" 2>/dev/null | sed 's/^/[compose-pull]   /'
         exit 1
     fi
 
@@ -58,5 +64,5 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
     fi
 done
 
-echo "[compose-pull] ERROR: docker compose pull failed after $ATTEMPTS attempts"
+echo "[compose-pull] ERROR: docker compose pull ${*:+($*) }failed after $ATTEMPTS attempts"
 exit 1

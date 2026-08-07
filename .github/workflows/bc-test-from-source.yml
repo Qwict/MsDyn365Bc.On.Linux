@@ -331,9 +331,19 @@ jobs:
             # on a permanent one. The inline loop it replaced slept 15s x5
             # on "manifest unknown", turning a wrong or not-yet-published
             # tag into 60s of silent dead time.
-            bash scripts/compose-pull.sh
-            # Start SQL Server as soon as its image is local, while the BC
-            # artifact is still downloading. The bc service has
+            # Pull sql FIRST, on its own, then start it, then pull bc.
+            # The obvious `compose-pull.sh && up -d sql` is nearly useless:
+            # a combined pull returns only once BOTH images are local,
+            # which on a measured run was t+28s against a t+29s artifact
+            # download — a 1s head start. Pulling the smaller sql image
+            # alone gets the container up around t+12s instead, so its
+            # boot finishes well inside the download window. The two pulls
+            # are serialized rather than concurrent, which costs ~nothing:
+            # they contend for the same runner bandwidth and CPU anyway,
+            # and the pull is not the binding constraint of this step.
+            bash scripts/compose-pull.sh sql
+            # Start SQL Server now, while the BC artifact is still
+            # downloading. The bc service has
             # `depends_on: sql: condition: service_healthy`, so SQL's
             # time-to-healthy is otherwise dead time sitting at the head of
             # the BC boot window — the bc container stays in `Created` state
@@ -345,6 +355,7 @@ jobs:
             # Non-fatal: if this fails, the later `docker compose up -d`
             # starts sql the old way and we just lose the head start.
             docker compose up -d sql || echo "WARN: early sql start failed — continuing"
+            bash scripts/compose-pull.sh bc
           ) &
           PULL_PID=$!
           wait $ARTIFACT_PID || { echo "artifact download failed"; exit 1; }
