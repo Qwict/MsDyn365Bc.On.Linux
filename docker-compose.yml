@@ -98,6 +98,12 @@ services:
       # Diagnostic only — comma-separated patch IDs to skip (e.g. "14,15,15a,15b,checkfile").
       # Used to bisect Cecil patches that may cause AL→C# emission drift. Empty = production.
       BC_DISABLE_PATCHES: ${BC_DISABLE_PATCHES:-}
+      # Diagnostic only — 1 logs every thrown exception (very noisy).
+      BC_DEBUG_FIRSTCHANCE: ${BC_DEBUG_FIRSTCHANCE:-}
+      # Diagnostic only — 1 logs every managed assembly the runtime fails to find
+      # on its own (Default ALC Resolving + AppDomain.AssemblyResolve). This is how
+      # you turn BC's anonymous FileNotFoundException into an assembly name.
+      BC_DEBUG_ASSEMBLY_RESOLVE: ${BC_DEBUG_ASSEMBLY_RESOLVE:-}
       # Diagnostic only — when 1, NST suspends at startup waiting for a diagnostic
       # client (dotnet-trace) on /tmp/nst-diag.sock. Used to profile cold boot.
       BC_PROFILE_NST: ${BC_PROFILE_NST:-0}

@@ -620,15 +620,15 @@ frameworks side by side and picks per BC version at boot. Nothing about the
 `src/WebClientHook/` and `tools/TestRunner/` still target `net8.0` and were
 not revisited. The web client PoC has not been tried against BC 29.
 
-### BC 29 status: boots, does not publish extensions
+### BC 29 status: boots and publishes extensions
 
 Verified 2026-08-07 against `sandbox/29.0.53450.0/w1`. BC 27.5, 28.1 and 29.0
-all reach `Ready for extensions` on one image. On BC 29 every extension
-publish through the dev endpoint returns **HTTP 500**, so the version is not
-usable for tests yet.
+all reach `Ready for extensions` on one image, and on all three the
+entrypoint's own extension publishes succeed. AL tests have NOT been run on
+BC 29.
 
-Three BC-29-specific problems were found and fixed on the way to boot; they
-are compat gaps in BC 29 itself, not .NET 10 problems:
+BC-29-specific problems found on the way; they are compat gaps in BC 29
+itself, not .NET 10 problems:
 
 - **Missing OpenTelemetry exporters** — `Nav.Ncl` references
   `OpenTelemetry.Exporter.Console` and `.OpenTelemetryProtocol`; neither DLL
@@ -645,33 +645,40 @@ are compat gaps in BC 29 itself, not .NET 10 problems:
   `op_Inequality`, which `WindowsPrincipalStub` didn't define
   (`MissingMethodException`). Added; purely additive for 27/28.
 
-**Two JMP hooks segfault the CLR on .NET 10** and are skipped there
-(`SkipOnNet10` in `StartupHook.cs`): **Patch #14**
-(`CecilDotNetTypeLoader.IsTypeForwardingCircular`) and the Mono.Cecil
-`Mixin.CheckFileName` hook (`checkfile`). Evidence, so nobody re-derives it:
+- **A JMP hook must never be applied twice to the same method.** This is what
+  segfaulted BC 29, and it is the single most important thing in this
+  section. **Patch #14** (`CecilDotNetTypeLoader.IsTypeForwardingCircular`)
+  and the Mono.Cecil `Mixin.CheckFileName` hook are the only two patches that
+  reached `ApplyJmpHook` twice: once from the `AssemblyLoad` event handler,
+  then again from `TryEagerPatch`, whose `Assembly.LoadFrom` is what raised
+  that event — so the eager call always landed on an already-hooked method.
+  .NET 8 tolerated the redundant re-apply. On .NET 10,
+  `RuntimeHelpers.PrepareMethod` against an overwritten entry point dies
+  inside `libcoreclr.so` with no managed frames, which is exactly the
+  "deterministic SIGSEGV, no managed frames, both hooks must be off" symptom.
+  It had nothing to do with the replacements' signatures — a standalone
+  repro on .NET 10.0.10 hooking an instance method with parameters to a
+  parameterless static works fine. `ApplyJmpHook` now refuses to re-hook:
+  `IsAlreadyJmpHooked` reads the entry point (WITHOUT `PrepareMethod`, which
+  is the call that crashes) and looks for our own `FF 25 00000000` stub — a
+  real StubPrecode also starts `FF 25` but always has a non-zero disp32.
+  The check is per method instance, so a second ALC still gets its own hook.
+- **`GenevaStub` needs the version-agnostic stub resolver, not just a file
+  copy.** BC 29's `Microsoft.BusinessCentral.Telemetry.OpenTelemetry` asks
+  for `OpenTelemetry.Exporter.Geneva` **1.15.2.1008**; the stub is 1.9.0.62.
+  `ReplaceWithStub` had already overwritten the file, so the default ALC
+  found it, rejected the identity, and the load failed. BC reported that as
+  a `FileNotFoundException` inside a "LazyEx factory threw an exception"
+  **without naming the assembly**, and every dev-endpoint publish returned
+  HTTP 500. `Initialize` now also calls `RegisterStubForResolver
+  ("OpenTelemetry.Exporter.Geneva")`, which answers any requested version the
+  same way `System.Drawing.Common` is handled. Additive for BC 27/28.
 
-- The crash is deterministic, lands in `libcoreclr.so` with no managed
-  frames, and happens with either hook applied alone — only disabling both
-  lets BC 29 boot.
-- It is ours: with `DOTNET_STARTUP_HOOKS` empty, BC 29 gets past that point
-  and fails on the expected encryption error instead.
-- It is not W^X: `DOTNET_EnableWriteXorExecute=0` makes no difference.
-- **Every other JMP hook in the file applies cleanly on .NET 10**, so the
-  hooking machinery as such is fine. Both crashing replacements are
-  parameterless statics standing in for methods that take parameters (one an
-  instance method) — the obvious suspect, but unconfirmed.
-- `BC_FORCE_CECIL_HOOKS=1` re-enables them to reproduce.
-
-The HTTP 500 on publish was **not** traced to a root cause. What is known:
-the server-side error is a `FileNotFoundException` raised while constructing
-`Microsoft.BusinessCentral.Telemetry.OpenTelemetry.OpenTelemetryLogger<T>`
-(reported as "LazyEx factory threw an exception"), and BC does not log the
-assembly name. Whether it is a further missing telemetry assembly, a
-consequence of the two skipped Cecil hooks, or something in `GenevaStub`
-under .NET 10 is open. An attempt to isolate it by restoring the real Geneva
-DLL was inconclusive — the hand-built probe container failed earlier, on a
-`TypeLoadException` for `ServiceSecurityContextIdentityProvider`, because it
-skipped most of the entrypoint's setup.
+`BC_DEBUG_ASSEMBLY_RESOLVE=1` is how the Geneva name was found and is the
+tool to reach for next time BC swallows an assembly load failure: it logs
+every `AssemblyLoadContext.Default.Resolving` and
+`AppDomain.AssemblyResolve` miss with the requesting assembly. Much cheaper
+than `BC_DEBUG_FIRSTCHANCE=1`. Both are docker-compose pass-throughs.
 
 ## Relationship to `PipelinePerformanceComparison`
 

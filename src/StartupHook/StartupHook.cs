@@ -131,8 +131,9 @@ using System.Threading.Tasks;
 /// JMP hooks work ONLY on BC methods (JIT-compiled). BCL methods are ReadyToRun pre-compiled
 /// and cannot be patched this way.
 ///
-/// Patches #14 and 'checkfile' are SKIPPED on .NET 10 (BC 29+) — they segfault the CLR there.
-/// See SkipOnNet10 below and the "Two .NET runtimes in one image" section of CLAUDE.md.
+/// A JMP hook must be applied to a given method AT MOST ONCE. Re-applying one segfaults
+/// libcoreclr on .NET 10 with no managed frames (it was silently tolerated on .NET 8).
+/// ApplyJmpHook now detects and refuses a re-apply; see IsAlreadyJmpHooked.
 /// </summary>
 internal class StartupHook
 {
@@ -156,40 +157,6 @@ internal class StartupHook
             Console.Error.WriteLine($"[StartupHook] DIAGNOSTIC: patch '{name}' SKIPPED (BC_DISABLE_PATCHES)");
         }
         return disabled;
-    }
-
-    /// <summary>
-    /// True when the process is running on .NET 10 or newer (BC 29+ targets net10.0;
-    /// BC 27/28 target net8.0).
-    /// </summary>
-    private static readonly bool IsNet10OrLater = Environment.Version.Major >= 10;
-
-    /// <summary>
-    /// Two JMP hooks segfault the CLR on .NET 10 and only on .NET 10:
-    /// Patch #14 (CecilDotNetTypeLoader.IsTypeForwardingCircular) and the
-    /// Mono.Cecil Mixin.CheckFileName hook. The crash is deterministic, lands
-    /// inside libcoreclr with no managed frames, and happens whether either hook
-    /// is applied alone — disabling exactly these two lets BC 29 boot. Every
-    /// other JMP hook in this file applies cleanly on .NET 10.
-    ///
-    /// Both replacements are parameterless statics standing in for methods with
-    /// parameters (one of them an instance method), which is the obvious suspect,
-    /// but that was NOT confirmed — the root cause is still open.
-    ///
-    /// Consequence: on BC 29 the server-side AL compiler runs without the Cecil
-    /// type-forwarding and empty-path fixes. AL extension compilation on BC 29 is
-    /// therefore UNVALIDATED. Booting is strictly better than segfaulting, so this
-    /// skip stays until the hooks are made .NET 10-safe.
-    /// Set BC_FORCE_CECIL_HOOKS=1 to re-enable them and reproduce the crash.
-    /// </summary>
-    private static bool SkipOnNet10(string patchName)
-    {
-        if (!IsNet10OrLater) return false;
-        if (Environment.GetEnvironmentVariable("BC_FORCE_CECIL_HOOKS") == "1") return false;
-        Console.Error.WriteLine(
-            $"[StartupHook] WARN: patch '{patchName}' SKIPPED on .NET {Environment.Version.Major} " +
-            "— this JMP hook segfaults the CLR there. Server-side AL compilation is unvalidated on this runtime.");
-        return true;
     }
 
     private static bool _patchedLanguage;
@@ -234,6 +201,26 @@ internal class StartupHook
                 catch { /* never let the logger throw */ }
             };
             Console.WriteLine("[StartupHook] BC_DEBUG_FIRSTCHANCE=1: first-chance exception logging enabled");
+        }
+
+        // Debug aid (opt-in): BC_DEBUG_ASSEMBLY_RESOLVE=1 logs every managed assembly
+        // the runtime could not find on its own. BC catches FileNotFoundException in
+        // several places and rethrows something generic (e.g. "LazyEx factory threw an
+        // exception") WITHOUT the assembly name, so this is the only way to learn what
+        // is actually missing. Far cheaper than BC_DEBUG_FIRSTCHANCE.
+        if (Environment.GetEnvironmentVariable("BC_DEBUG_ASSEMBLY_RESOLVE") == "1")
+        {
+            AssemblyLoadContext.Default.Resolving += (alc, name) =>
+            {
+                try { Console.Error.WriteLine($"[AsmResolve] Default ALC could not find: {name}"); } catch { }
+                return null;
+            };
+            AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
+            {
+                try { Console.Error.WriteLine($"[AsmResolve] AppDomain.AssemblyResolve: {e.Name} (requested by {e.RequestingAssembly?.GetName().Name ?? "?"})"); } catch { }
+                return null;
+            };
+            Console.WriteLine("[StartupHook] BC_DEBUG_ASSEMBLY_RESOLVE=1: assembly resolution failure logging enabled");
         }
 
         // Patch #13 (early): Prevent Watson crash on unobserved task exceptions.
@@ -285,6 +272,15 @@ internal class StartupHook
 
         // Replace DLLs with stubs or cross-platform versions (unsigned, can copy directly)
         ReplaceWithStub("OpenTelemetry.Exporter.Geneva.dll", "Geneva ETW exporter");
+        // Overwriting the file is not enough once BC's reference version moves past the
+        // stub's. BC 29's Microsoft.BusinessCentral.Telemetry.OpenTelemetry asks for
+        // OpenTelemetry.Exporter.Geneva 1.15.2.1008; the stub is 1.9.0.62, so the default
+        // ALC rejects the file it just found and the load fails with FileNotFoundException.
+        // BC surfaces that as "LazyEx factory threw an exception" while constructing
+        // OpenTelemetryLogger<T>, which made every dev-endpoint publish return HTTP 500.
+        // Registering the bytes with the stub resolver satisfies ANY requested version,
+        // the same way System.Drawing.Common et al. are handled.
+        RegisterStubForResolver("OpenTelemetry.Exporter.Geneva");
         ReplaceWithStub("Microsoft.Data.SqlClient.dll", "cross-platform SqlClient");
 
         // Verify SqlClient loads correctly (catches version/dependency issues early)
@@ -802,7 +798,6 @@ internal class StartupHook
     private static void PatchCecilTypeForwarding(Assembly codeAnalysisAsm)
     {
         if (IsPatchDisabled("14")) return;
-        if (SkipOnNet10("14")) return;
         try
         {
             var loaderType = codeAnalysisAsm.GetType(
@@ -841,7 +836,6 @@ internal class StartupHook
     private static void PatchCecilCheckFileName(Assembly cecilAsm)
     {
         if (IsPatchDisabled("checkfile")) return;
-        if (SkipOnNet10("checkfile")) return;
         try
         {
             var mixinType = cecilAsm.GetType("Mono.Cecil.Mixin");
@@ -2369,6 +2363,26 @@ internal class StartupHook
     /// Move a signed DLL aside and register an assembly resolver that provides our
     /// unsigned stub via Assembly.Load(byte[]) — bypasses strong-name identity checks.
     /// </summary>
+    /// <summary>
+    /// Makes a stub in the hook directory available through <see cref="ResolveStubAssembly"/>
+    /// without moving any file aside. Use for stubs that were copied over the original in
+    /// place (ReplaceWithStub) but whose assembly identity no longer satisfies BC's
+    /// reference — the resolver answers regardless of requested version or public key token.
+    /// </summary>
+    private static void RegisterStubForResolver(string assemblyName)
+    {
+        var hookDir = Path.GetDirectoryName(typeof(StartupHook).Assembly.Location);
+        if (hookDir == null) return;
+        string stubDll = Path.Combine(hookDir, assemblyName + ".dll");
+        if (!File.Exists(stubDll))
+        {
+            Console.WriteLine($"[StartupHook] Stub for {assemblyName} not found — resolver not registered");
+            return;
+        }
+        _stubBytesMap[assemblyName] = File.ReadAllBytes(stubDll);
+        Console.WriteLine($"[StartupHook] {assemblyName} registered with stub resolver (version-agnostic)");
+    }
+
     private static void SetupStubWithResolver(string assemblyName)
     {
         string? baseDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -3189,6 +3203,25 @@ internal class StartupHook
     /// </summary>
     private static void ApplyJmpHook(MethodBase original, MethodInfo replacement, string name)
     {
+        // Never apply a JMP hook to a method that already carries one.
+        //
+        // Patch #14 and the Mono.Cecil 'checkfile' hook reach here TWICE: once from the
+        // AssemblyLoad event handler, then again from TryEagerPatch — whose
+        // Assembly.LoadFrom is what raised that event in the first place, so the eager
+        // call always landed on an already-hooked method. On .NET 8 the redundant
+        // re-apply was silently tolerated. On .NET 10 it kills the process:
+        // RuntimeHelpers.PrepareMethod against an overwritten entry point segfaults
+        // inside libcoreclr with no managed frames. Every OTHER hook in this file is
+        // applied exactly once, which is why only those two crashed BC 29.
+        //
+        // The check is per method instance, not a global flag, so an assembly loaded
+        // into a second ALC still gets its own hook.
+        //
+        // Our stub is `FF 25 00000000` — absolute indirect JMP with disp32 == 0. A
+        // genuine StubPrecode also starts FF 25 but always has a non-zero disp32, so
+        // the signature is unambiguous.
+        if (IsAlreadyJmpHooked(original, name)) return;
+
         RuntimeHelpers.PrepareMethod(original.MethodHandle);
         RuntimeHelpers.PrepareMethod(replacement.MethodHandle);
 
@@ -3265,6 +3298,30 @@ internal class StartupHook
             {
                 Console.WriteLine($"[StartupHook]   (compiled code patch failed: {ex.Message})");
             }
+        }
+    }
+
+    /// <summary>
+    /// True if this method's entry point already holds a JMP we wrote. Reads the entry
+    /// point WITHOUT calling PrepareMethod first — PrepareMethod is itself what dies on
+    /// an already-patched method under .NET 10.
+    /// </summary>
+    private static bool IsAlreadyJmpHooked(MethodBase original, string name)
+    {
+        try
+        {
+            IntPtr fp = original.MethodHandle.GetFunctionPointer();
+            byte[] head = new byte[6];
+            Marshal.Copy(fp, head, 0, 6);
+            bool hooked = head[0] == 0xFF && head[1] == 0x25
+                && head[2] == 0 && head[3] == 0 && head[4] == 0 && head[5] == 0;
+            if (hooked)
+                Console.WriteLine($"[StartupHook] {name} already hooked — skipping re-apply");
+            return hooked;
+        }
+        catch
+        {
+            return false;
         }
     }
 
