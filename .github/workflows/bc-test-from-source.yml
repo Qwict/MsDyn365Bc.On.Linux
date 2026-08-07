@@ -102,7 +102,16 @@ on:
         type: string
         default: ""
       al_tool_version:
-        description: "Linux AL compiler tool version (Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux NuGet). Auto-derived from bc_version when blank: BC 27 → 16.2.28.57946, BC 28 → 17.0.34.45391."
+        description: >-
+          Linux AL compiler tool version
+          (Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux on
+          nuget.org). Blank (default) resolves it from nuget.org via
+          scripts/resolve-al-tool-version.py: AL major is BC major - 11, and
+          it takes the newest stable of that major, falling back to the newest
+          prerelease when no stable exists. A BC version still in preview has
+          no stable compiler — BC 29 needs AL 18.x, which as of 2026-08 is
+          prerelease only — so that fallback is required to build against it.
+          Set this to pin an exact version.
         required: false
         type: string
         default: ""
@@ -444,14 +453,23 @@ jobs:
           AL_TOOL="${{ inputs.al_tool_version }}"
           BC_MAJOR=$(echo "${{ inputs.bc_version }}" | cut -d. -f1)
           if [ -z "$AL_TOOL" ]; then
-            case "$BC_MAJOR" in
-              27) AL_TOOL="16.2.28.57946" ;;
-              28) AL_TOOL="17.0.34.45391" ;;
-              *)
-                echo "::warning::bc_version major $BC_MAJOR is not in the al_tool lookup table — using fallback 16.2.28.57946"
-                AL_TOOL="16.2.28.57946"
-                ;;
-            esac
+            # Resolved from nuget.org rather than a hardcoded table. AL major
+            # is BC major - 11, and the resolver prefers the newest stable of
+            # that major, falling back to the newest prerelease when no stable
+            # exists. That fallback is what makes a preview BC version
+            # buildable at all: BC 29 needs AL 18.x, and as of 2026-08 there
+            # is no stable 18.x on nuget.org — only 18.0.39.10160-beta.
+            #
+            # The old table covered BC 27 and 28 only; anything else fell
+            # through to a ::warning:: and the BC 27 compiler, which does not
+            # fail loudly — it compiles against the wrong platform and the
+            # errors point somewhere unrelated. The resolver returns the same
+            # versions the table did for 27 and 28, so this is a
+            # generalization of the previous behavior, not a new guess.
+            if ! AL_TOOL=$(python3 bc-linux/scripts/resolve-al-tool-version.py "${{ inputs.bc_version }}"); then
+              echo "::error::could not resolve an AL compiler version for BC ${{ inputs.bc_version }}"
+              exit 1
+            fi
           fi
           echo "Installing AL compiler $AL_TOOL"
           PKG="microsoft.dynamics.businesscentral.development.tools.linux"
@@ -584,14 +602,13 @@ jobs:
           EFFECTIVE_RUNTIME="$RUNTIME_VERSION"
           BC_MAJOR=$(echo "${{ inputs.bc_version }}" | cut -d. -f1)
           if [ "$EFFECTIVE_RUNTIME" = "auto" ]; then
-            case "$BC_MAJOR" in
-              27) EFFECTIVE_RUNTIME="16.0" ;;
-              28) EFFECTIVE_RUNTIME="17.0" ;;
-              *)
-                echo "::warning::bc_version major $BC_MAJOR is not in the runtime lookup table — using fallback 14.0"
-                EFFECTIVE_RUNTIME="14.0"
-                ;;
-            esac
+            # Same BC-major-minus-11 rule as the compiler version; no network
+            # call needed for this one. The old table's fallback to 14.0 for
+            # an unknown major was silently wrong for anything newer than 28.
+            if ! EFFECTIVE_RUNTIME=$(python3 bc-linux/scripts/resolve-al-tool-version.py "${{ inputs.bc_version }}" --runtime); then
+              echo "::error::could not resolve an AL runtime version for BC ${{ inputs.bc_version }}"
+              exit 1
+            fi
           fi
           echo "Patching app.json runtime → $EFFECTIVE_RUNTIME"
           for d in $APP_DIRS $TEST_APP_DIRS; do
