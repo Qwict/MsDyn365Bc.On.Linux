@@ -120,8 +120,19 @@ using System.Threading.Tasks;
 ///   so out-of-folder paths proceed to the actual file operation and produce an honest
 ///   file-not-found instead of a bogus access-denied.
 ///
+/// Patch #29: NavDirectorySecurity.CreateSecurityForDomainDirectory (Nav.Ncl.dll)
+///   BC 29 reaches this from TempPathHelper.InitializeFolders during tenant configuration and
+///   constructs a System.Security.AccessControl.DirectorySecurity — Windows-only ACL APIs that
+///   throw PlatformNotSupportedException on Linux, killing NST startup. BC 27/28 never reach it
+///   (the call is gated on IServiceTopology.IsServiceRunningInLocalEnvironment, which Patch #9's
+///   Linux topology proxy forces false).
+///   Fix: return null, which is what the gated-off path produced. Applied on all versions.
+///
 /// JMP hooks work ONLY on BC methods (JIT-compiled). BCL methods are ReadyToRun pre-compiled
 /// and cannot be patched this way.
+///
+/// Patches #14 and 'checkfile' are SKIPPED on .NET 10 (BC 29+) — they segfault the CLR there.
+/// See SkipOnNet10 below and the "Two .NET runtimes in one image" section of CLAUDE.md.
 /// </summary>
 internal class StartupHook
 {
@@ -145,6 +156,40 @@ internal class StartupHook
             Console.Error.WriteLine($"[StartupHook] DIAGNOSTIC: patch '{name}' SKIPPED (BC_DISABLE_PATCHES)");
         }
         return disabled;
+    }
+
+    /// <summary>
+    /// True when the process is running on .NET 10 or newer (BC 29+ targets net10.0;
+    /// BC 27/28 target net8.0).
+    /// </summary>
+    private static readonly bool IsNet10OrLater = Environment.Version.Major >= 10;
+
+    /// <summary>
+    /// Two JMP hooks segfault the CLR on .NET 10 and only on .NET 10:
+    /// Patch #14 (CecilDotNetTypeLoader.IsTypeForwardingCircular) and the
+    /// Mono.Cecil Mixin.CheckFileName hook. The crash is deterministic, lands
+    /// inside libcoreclr with no managed frames, and happens whether either hook
+    /// is applied alone — disabling exactly these two lets BC 29 boot. Every
+    /// other JMP hook in this file applies cleanly on .NET 10.
+    ///
+    /// Both replacements are parameterless statics standing in for methods with
+    /// parameters (one of them an instance method), which is the obvious suspect,
+    /// but that was NOT confirmed — the root cause is still open.
+    ///
+    /// Consequence: on BC 29 the server-side AL compiler runs without the Cecil
+    /// type-forwarding and empty-path fixes. AL extension compilation on BC 29 is
+    /// therefore UNVALIDATED. Booting is strictly better than segfaulting, so this
+    /// skip stays until the hooks are made .NET 10-safe.
+    /// Set BC_FORCE_CECIL_HOOKS=1 to re-enable them and reproduce the crash.
+    /// </summary>
+    private static bool SkipOnNet10(string patchName)
+    {
+        if (!IsNet10OrLater) return false;
+        if (Environment.GetEnvironmentVariable("BC_FORCE_CECIL_HOOKS") == "1") return false;
+        Console.Error.WriteLine(
+            $"[StartupHook] WARN: patch '{patchName}' SKIPPED on .NET {Environment.Version.Major} " +
+            "— this JMP hook segfaults the CLR there. Server-side AL compilation is unvalidated on this runtime.");
+        return true;
     }
 
     private static bool _patchedLanguage;
@@ -420,6 +465,8 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
             PatchAssemblyProbing(args.LoadedAssembly);
+            // Patch #29: Windows ACL APIs in TempPathHelper (BC 29 reaches them).
+            PatchNavDirectorySecurity(args.LoadedAssembly);
         }
 
         // Patch #25: BaseDebugRuntime.IsDebuggedSessionClosedOrDisposed null-session NRE.
@@ -755,6 +802,7 @@ internal class StartupHook
     private static void PatchCecilTypeForwarding(Assembly codeAnalysisAsm)
     {
         if (IsPatchDisabled("14")) return;
+        if (SkipOnNet10("14")) return;
         try
         {
             var loaderType = codeAnalysisAsm.GetType(
@@ -793,6 +841,7 @@ internal class StartupHook
     private static void PatchCecilCheckFileName(Assembly cecilAsm)
     {
         if (IsPatchDisabled("checkfile")) return;
+        if (SkipOnNet10("checkfile")) return;
         try
         {
             var mixinType = cecilAsm.GetType("Mono.Cecil.Mixin");
@@ -3371,6 +3420,54 @@ internal class StartupHook
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static object? Replacement_ReturnNull() { return null; }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static object? Replacement_ReturnNull_1Arg(object? self) { return null; }
+
+    // ========================================================================
+    // Patch #29: NavDirectorySecurity.CreateSecurityForDomainDirectory
+    // ------------------------------------------------------------------------
+    // BC 29 calls this from TempPathHelper.InitializeFolders during
+    // NavTenantCollection.ConfigureTenants, and it constructs a
+    // System.Security.AccessControl.DirectorySecurity — Windows-only ACL APIs
+    // that throw PlatformNotSupportedException on Linux, taking NST startup
+    // with them.
+    //
+    // On BC 27/28 this never fired: the call was gated on
+    // IServiceTopology.IsServiceRunningInLocalEnvironment, which Patch #9's
+    // Linux topology proxy forces to false. BC 29 reaches it anyway, so the
+    // method itself is hooked to return null — which is exactly what the
+    // gated-off BC 28 path produced.
+    //
+    // Applied on every BC version. It is a no-op on 27/28 (the method is not
+    // reached there) and keeps working if Microsoft moves the gate again.
+    // ========================================================================
+    private static void PatchNavDirectorySecurity(Assembly navNclAsm)
+    {
+        if (IsPatchDisabled("29")) return;
+        try
+        {
+            var type = navNclAsm.GetType("Microsoft.Dynamics.Nav.Runtime.NavDirectorySecurity");
+            if (type == null) return;
+
+            foreach (var m in type.GetMethods(BindingFlags.Static | BindingFlags.Instance
+                                              | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (m.Name != "CreateSecurityForDomainDirectory") continue;
+                if (m.GetParameters().Length != 0) continue;
+
+                var replacement = typeof(StartupHook).GetMethod(
+                    m.IsStatic ? nameof(Replacement_ReturnNull) : nameof(Replacement_ReturnNull_1Arg),
+                    BindingFlags.Public | BindingFlags.Static)!;
+                ApplyJmpHook(m, replacement, "NavDirectorySecurity.CreateSecurityForDomainDirectory (Patch #29)");
+                Console.WriteLine("[StartupHook] Patch #29: CreateSecurityForDomainDirectory returns null (Windows ACLs unavailable)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #29 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
 
 
     // --- Patch #2: NavEnvironment replacements ---

@@ -1,9 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- Multi-targeted: BC 27/28 run on .NET 8, BC 29+ on .NET 10. This stub is
+         dropped INTO the shared Microsoft.NETCore.App framework directory, so its
+         assembly identity has to match the framework it replaces a member of. -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <AssemblyName>System.Security.Principal.Windows</AssemblyName>
-    <AssemblyVersion>8.0.0.0</AssemblyVersion>
-    <FileVersion>8.0.0.0</FileVersion>
+    <AssemblyVersion Condition="'$(TargetFramework)' == 'net8.0'">8.0.0.0</AssemblyVersion>
+    <FileVersion Condition="'$(TargetFramework)' == 'net8.0'">8.0.0.0</FileVersion>
+    <AssemblyVersion Condition="'$(TargetFramework)' == 'net10.0'">10.0.0.0</AssemblyVersion>
+    <FileVersion Condition="'$(TargetFramework)' == 'net10.0'">10.0.0.0</FileVersion>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 </Project>
