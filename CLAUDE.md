@@ -627,5 +627,35 @@ that touches `src/`, `scripts/`, or `extensions/`. Both
 registry layer cache via the same `:cache` tag.
 
 Trigger `test-versions` manually with a `versions: "27.0,28.1"`
-input to test specific versions. The default matrix runs every
-supported BC version on push/PR (currently 27.0–27.5 and 28.0–28.1).
+input to test specific versions — that input short-circuits discovery
+entirely, including the preview legs.
+
+### The version matrix is discovered at run time, not hardcoded
+
+`scripts/discover-bc-versions.py` reads Microsoft's artifact indexes and
+emits two matrices:
+
+- **Released (REQUIRED).** Public sandbox index, newest `majors_back`
+  majors (dispatch input, default **2** → 27 and 28 as of 2026-08).
+  Emitted as SHORT versions ("27.5", "28.3") on purpose:
+  `download-artifacts.sh` resolves a short version to the newest build
+  itself, so a hotfix landing between matrix computation and download is
+  picked up rather than missed. Capping at 2 majors is a cost decision —
+  the index carries every major back to 25 and one leg is a full BC boot.
+- **Preview (NON-BLOCKING).** Insider index
+  (`bcinsider-fvh2ekdjecfjd6gk.b02.azurefd.net`, anonymously readable, no
+  SAS token, same path shape as the public one). Two legs only: the next
+  major and the next minor of the current major. Emitted as FULL versions
+  plus a full `bc_artifact_url`, because insider builds move daily and
+  nothing in the public-index resolver knows about that host.
+
+**Preview legs must not fail the run.** GitHub does not allow
+`continue-on-error:` on a job that `uses:` a reusable workflow, so the
+knob lives in `bc-test-from-source.yml` as a `continue_on_error` input
+(default false) applied to the job it actually runs. Don't try to move it
+back to the caller — it silently does nothing there.
+
+**The next-major preview leg is expected to fail** until the image ships
+.NET 10: BC 29 targets .NET 10, `src/Dockerfile` ships the .NET 8 runtime,
+so the NST cannot start. `preview-note` writes that framing into the run
+summary so a red preview leg isn't misread as a regression.
