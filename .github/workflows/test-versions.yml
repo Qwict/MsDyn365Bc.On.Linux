@@ -11,20 +11,41 @@ name: Test BC Versions
 #  - hard fail when TESTS_TOTAL is 0
 # After the bc-copilot-blueprint debugging session uncovered all of those,
 # the cleanest fix was to just use the reusable workflow here too.
+#
+# The matrix is ROLLING, not hardcoded. scripts/discover-bc-versions.py
+# reads Microsoft's artifact indexes at run time and produces two groups:
+#
+#   test          REQUIRED. Released versions from the public sandbox index,
+#                 newest `majors_back` majors (default 2 → 27 and 28 today).
+#                 A failure here is a real bc-linux regression.
+#
+#   test-preview  NON-BLOCKING. The next major and the next minor from the
+#                 INSIDER index, fed in as a full BC_ARTIFACT_URL. These are
+#                 early warning about unreleased BC builds; the next-major
+#                 leg is expected to fail today (BC 29 targets .NET 10, the
+#                 bc-runner image ships .NET 8).
+#
+# The `versions:` dispatch input still short-circuits both: pass
+# "27.0,28.1" and you get exactly those two legs and no preview.
 
 on:
   workflow_dispatch:
     inputs:
       versions:
-        description: 'BC versions to test (comma-separated, e.g. "27.0,28.1"). Leave empty to auto-discover every version from oldest_version up to the latest Microsoft publishes.'
+        description: 'BC versions to test (comma-separated, e.g. "27.0,28.1"). Overrides discovery entirely — you get exactly these legs and no preview legs.'
         required: false
         default: ''
         type: string
-      oldest_version:
-        description: 'Oldest BC major.minor to include when auto-discovering (used when "versions" is empty)'
+      majors_back:
+        description: 'How many of the newest BC majors the REQUIRED matrix covers (2 = today''s 27 + 28). Used when "versions" is empty.'
         required: false
-        default: '27.0'
+        default: '2'
         type: string
+      include_preview:
+        description: 'Also run the non-blocking insider preview legs (next major + next minor). Ignored when "versions" is set.'
+        required: false
+        default: true
+        type: boolean
   push:
     branches: [main, master]
   pull_request:
@@ -45,50 +66,75 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
+      preview_matrix: ${{ steps.set.outputs.preview_matrix }}
+      has_preview: ${{ steps.set.outputs.has_preview }}
       alcops_url: ${{ steps.alcops.outputs.url }}
     steps:
+    - uses: actions/checkout@v4
+
     - id: set
+      name: Discover BC version matrix
+      env:
+        # Only workflow_dispatch supplies these; on push/PR/schedule they
+        # evaluate to empty and the defaults below apply.
+        VERSIONS: ${{ inputs.versions }}
+        MAJORS_BACK: ${{ inputs.majors_back }}
+        # Preview legs are on by default everywhere except when a dispatch
+        # explicitly unticks the box. `inputs.include_preview` is empty (not
+        # 'true') on push/PR/schedule, hence the event_name guard.
+        INCLUDE_PREVIEW: ${{ github.event_name != 'workflow_dispatch' || inputs.include_preview }}
       run: |
-        VERSIONS='${{ inputs.versions }}'
-        OLDEST='${{ inputs.oldest_version }}'
-        if [ -z "$OLDEST" ]; then
-          OLDEST="27.0"
+        set -euo pipefail
+        # Single write per output key at the end of each branch — GitHub's
+        # behavior on a duplicated key is not worth relying on.
+        PREVIEW='{"include":[]}'
+        HAS_PREVIEW=false
+
+        if [ -n "$VERSIONS" ]; then
+          # Explicit override: exactly these legs, no discovery, no preview.
+          # Someone debugging one version should not also pay for two
+          # insider boots.
+          echo "Explicit versions requested: $VERSIONS"
+          JSON=$(VERSIONS="$VERSIONS" python3 -c "import os,json; print(json.dumps({'bc_version':[v.strip() for v in os.environ['VERSIONS'].split(',') if v.strip()]}))")
+          {
+            echo "matrix=$JSON"
+            echo "preview_matrix=$PREVIEW"
+            echo "has_preview=$HAS_PREVIEW"
+          } >> "$GITHUB_OUTPUT"
+          echo "Required matrix: $JSON"
+          exit 0
         fi
-        if [ -z "$VERSIONS" ]; then
-          # No explicit override (push/PR/schedule, or workflow_dispatch with
-          # "versions" left empty): auto-discover every major.minor BC
-          # sandbox version Microsoft currently publishes, from $OLDEST up
-          # to whatever is latest. Uses the same per-country index file
-          # scripts/download-artifacts.sh resolves versions from, so the
-          # matrix and the actual artifact download always agree on what
-          # "latest" means.
-          echo "Auto-discovering BC versions >= $OLDEST from Microsoft's artifact index..."
-          VERSIONS=$(curl -sf --retry 3 --retry-delay 2 \
-              "https://bcartifacts-exdbf9fwegejdqak.b02.azurefd.net/sandbox/indexes/w1.json" | \
-            OLDEST="$OLDEST" python3 -c "import json, os, sys
-        oldest = tuple(int(x) for x in os.environ['OLDEST'].split('.'))
-        data = json.load(sys.stdin)
-        majors = set()
-        for d in data:
-            parts = d.get('Version', '').split('.')
-            if len(parts) < 2:
-                continue
-            try:
-                key = (int(parts[0]), int(parts[1]))
-            except ValueError:
-                continue
-            if key >= oldest:
-                majors.add(key)
-        print(','.join('%d.%d' % m for m in sorted(majors)))
-        ")
-          if [ -z "$VERSIONS" ]; then
-            echo "ERROR: could not auto-discover BC versions from the artifact index" >&2
-            exit 1
+
+        # Rolling discovery. scripts/discover-bc-versions.py reads the same
+        # per-country index file scripts/download-artifacts.sh resolves
+        # against, so the matrix and the actual download always agree on
+        # what "latest" means, and emits SHORT versions so a hotfix landing
+        # mid-run is picked up rather than skipped.
+        MB="${MAJORS_BACK:-2}"
+        if [ -z "$MB" ]; then MB=2; fi
+        echo "Discovering released BC versions (newest $MB majors)..."
+        MATRIX=$(python3 scripts/discover-bc-versions.py --mode released --majors-back "$MB")
+        echo "Required matrix: $MATRIX"
+
+        if [ "$INCLUDE_PREVIEW" = "true" ]; then
+          echo "Discovering insider preview versions..."
+          # A wobble on the insider index must not take the required matrix
+          # down with it — preview is a bonus, not a gate.
+          if P=$(python3 scripts/discover-bc-versions.py --mode preview --majors-back "$MB"); then
+            COUNT=$(P="$P" python3 -c "import os,json; print(len(json.loads(os.environ['P'])['include']))")
+            PREVIEW="$P"
+            if [ "$COUNT" -gt 0 ]; then HAS_PREVIEW=true; fi
+            echo "Preview matrix ($COUNT legs): $PREVIEW"
+          else
+            echo "::warning::insider preview discovery failed — skipping preview legs"
           fi
-          echo "Discovered: $VERSIONS"
         fi
-        JSON=$(echo "$VERSIONS" | python3 -c "import sys,json; print(json.dumps({'bc_version': sys.stdin.read().strip().split(',')}))")
-        echo "matrix=$JSON" >> $GITHUB_OUTPUT
+
+        {
+          echo "matrix=$MATRIX"
+          echo "preview_matrix=$PREVIEW"
+          echo "has_preview=$HAS_PREVIEW"
+        } >> "$GITHUB_OUTPUT"
 
     - id: alcops
       # Resolve the latest ALCops.Analyzers nupkg URL via the GitHub API.
@@ -210,6 +256,89 @@ jobs:
       # The smoke test has no #if guards so the symbol is a no-op at the AL
       # level, but it exercises the flag wiring through the workflow and alc.
       preprocessor_symbols: "SMOKE"
+
+  # ─── Preview matrix: NON-BLOCKING insider legs ──────────────────────────
+  #     The next BC major and the next minor, discovered from Microsoft's
+  #     INSIDER index (anonymously readable, no SAS token — same path shape
+  #     as the public one). These run the identical smoke test through the
+  #     identical reusable workflow, but their failure MUST NOT turn this
+  #     workflow red: they are an early-warning signal about a BC version
+  #     nobody supports yet, not a gate on bc-linux.
+  #
+  #     Expect the next-major leg to FAIL today: BC 29 targets .NET 10 and
+  #     the bc-runner image ships the .NET 8 runtime, so the NST cannot even
+  #     start. That is the news the leg exists to deliver — when it turns
+  #     green, .NET 10 support has landed.
+  #
+  #     Non-blocking is implemented via the reusable workflow's
+  #     `continue_on_error` input, NOT via `continue-on-error:` here:
+  #     GitHub does not allow that key on a job that `uses:` a reusable
+  #     workflow, so it has to be set on the job inside the callee.
+  test-preview:
+    needs: [prepare, build-image]
+    if: needs.prepare.outputs.has_preview == 'true'
+    name: "BC ${{ matrix.label }} — preview, non-blocking"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.preview_matrix) }}
+    uses: ./.github/workflows/bc-test-from-source.yml
+    with:
+      # Full version (e.g. "29.0.53450.0"), not a short one: insider builds
+      # move daily, and the artifact_url below already pins an exact build.
+      # Keeping the two in sync makes a preview failure reproducible, and
+      # keeps the JUnit artifact name unique against the required matrix.
+      bc_version: ${{ matrix.bc_version }}
+      bc_artifact_url: ${{ matrix.artifact_url }}
+      bc_country: w1
+      bc_type: sandbox
+      continue_on_error: true
+      test_app_dirs: extensions/smoke-test
+      runtime_version: auto
+      codeunit_range: "70000|70001"
+      runner_image: ${{ needs.build-image.outputs.runner_image }}
+      bc_linux_ref: ${{ github.sha }}
+      # Same analyzer wiring as the required matrix — a new BC major is
+      # exactly where a cop DLL stops loading, and the compile step runs on
+      # the runner whether or not the NST manages to boot.
+      enable_code_cop: true
+      enable_ui_cop: true
+      enable_app_source_cop: true
+      enable_per_tenant_extension_cop: true
+      custom_code_cops: ${{ needs.prepare.outputs.alcops_url }}
+      ruleset_file: "extensions/smoke-test/cops.rulset.json"
+      enable_external_rulesets: true
+      preprocessor_symbols: "SMOKE"
+
+  # Puts the "this was expected" framing in the run summary, so a red-ish
+  # preview leg in the job list doesn't read as a regression to whoever
+  # opens the run next.
+  preview-note:
+    needs: [prepare, test-preview]
+    if: always() && needs.prepare.outputs.has_preview == 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Explain the preview legs
+      env:
+        PREVIEW: ${{ needs.prepare.outputs.preview_matrix }}
+        RESULT: ${{ needs.test-preview.result }}
+      run: |
+        {
+          echo "## Preview (insider) legs — non-blocking"
+          echo
+          echo "Result: \`$RESULT\`"
+          echo
+          echo "These legs test BC builds from Microsoft's **insider** index"
+          echo "(next major + next minor). They do **not** gate this workflow."
+          echo "A failure here means an unreleased BC build does not run on"
+          echo "bc-linux yet — early warning, not a regression."
+          echo
+          echo "Known-expected failure: the next-major leg targets .NET 10"
+          echo "while the bc-runner image ships .NET 8, so the NST cannot start."
+          echo
+          echo '```json'
+          echo "$PREVIEW"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
 
   # Exercises the container's own artifact download path (no pre-cached
   # artifacts). Verifies the in-container download feature and lets us

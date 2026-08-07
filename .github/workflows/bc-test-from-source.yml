@@ -37,6 +37,33 @@ on:
         required: false
         type: string
         default: "sandbox"
+      bc_artifact_url:
+        description: >-
+          Full BC artifact URL to download instead of resolving
+          bc_type/bc_version/bc_country against Microsoft's PUBLIC index —
+          e.g. an insider build:
+          "https://bcinsider-fvh2ekdjecfjd6gk.b02.azurefd.net/sandbox/29.0.53450.0/w1".
+          The matching /platform URL is derived by download-artifacts.sh.
+          Blank (default) keeps the normal public-index path, so existing
+          consumers are unaffected. When set, still pass bc_version (the
+          full version is fine) — it's what the AL tool / runtime lookups
+          and the JUnit artifact name key off.
+        required: false
+        type: string
+        default: ""
+      continue_on_error:
+        description: >-
+          Mark the test job continue-on-error so a failure does NOT fail the
+          caller's workflow run. Default false — a failing test job fails the
+          run, which is what every normal consumer wants. bc-linux's own
+          version matrix sets this true for the insider/preview legs, where a
+          not-yet-supported BC build failing is expected news, not a
+          regression. GitHub does not allow continue-on-error on a job that
+          `uses:` a reusable workflow, so it has to live here, on the job
+          this workflow actually runs.
+        required: false
+        type: boolean
+        default: false
       app_dirs:
         description: "Space-separated dirs containing app.json for production apps (compile order)"
         required: false
@@ -233,6 +260,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes }}
+    # Default false — identical to the pre-input behavior. Only bc-linux's
+    # preview matrix legs set this. See the input's description for why it
+    # can't live on the calling job.
+    continue-on-error: ${{ inputs.continue_on_error }}
     env:
       BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
       # Blank passes through to docker-compose's `${BC_SQL_IMAGE:-<mirror>}`
@@ -270,14 +301,27 @@ jobs:
         env:
           BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
           BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache/${{ inputs.bc_version }}
+          BC_ARTIFACT_URL: ${{ inputs.bc_artifact_url }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
           mkdir -p "artifact-cache/$BC_VERSION"
           (
-            bc-linux/scripts/download-artifacts.sh \
-              "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" \
-              "$PWD/artifact-cache/$BC_VERSION"
+            # Two forms of download-artifacts.sh: the 2-arg form takes a
+            # fully-qualified app URL and derives /platform from it (this is
+            # the only way to reach the insider host, which the public index
+            # resolver knows nothing about); the 4-arg form resolves a short
+            # version against Microsoft's public index. Blank input keeps the
+            # 4-arg form, i.e. exactly what consumers had before.
+            if [ -n "$BC_ARTIFACT_URL" ]; then
+              bc-linux/scripts/download-artifacts.sh \
+                "$BC_ARTIFACT_URL" \
+                "$PWD/artifact-cache/$BC_VERSION"
+            else
+              bc-linux/scripts/download-artifacts.sh \
+                "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" \
+                "$PWD/artifact-cache/$BC_VERSION"
+            fi
           ) &
           ARTIFACT_PID=$!
           (
