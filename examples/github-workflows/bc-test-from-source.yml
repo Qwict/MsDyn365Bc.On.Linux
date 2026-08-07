@@ -237,14 +237,15 @@ jobs:
           TOOL="$AL_TOOL_VERSION"
           BC_MAJOR=$(echo "$BC_VERSION" | cut -d. -f1)
           if [ -z "$TOOL" ]; then
-            case "$BC_MAJOR" in
-              27) TOOL="16.2.28.57946" ;;
-              28) TOOL="17.0.34.45391" ;;
-              *)
-                echo "::warning::BC_VERSION major $BC_MAJOR not in al_tool table — using fallback 16.2.28.57946"
-                TOOL="16.2.28.57946"
-                ;;
-            esac
+            # Resolved from nuget.org: AL major is BC major - 11, newest
+            # stable of that major, falling back to the newest prerelease when
+            # no stable exists (a BC version still in preview has no stable
+            # compiler). Calling the shared script rather than keeping a table
+            # here means a new BC release needs no edit to this file.
+            if ! TOOL=$(python3 bc-linux/scripts/resolve-al-tool-version.py "$BC_VERSION"); then
+              echo "Could not resolve an AL compiler version for BC $BC_VERSION" >&2
+              exit 1
+            fi
           fi
           echo "Installing AL compiler $TOOL"
           PKG="microsoft.dynamics.businesscentral.development.tools.linux"
@@ -332,14 +333,11 @@ jobs:
           EFFECTIVE_RUNTIME="$RUNTIME_VERSION"
           BC_MAJOR=$(echo "$BC_VERSION" | cut -d. -f1)
           if [ -z "$EFFECTIVE_RUNTIME" ]; then
-            case "$BC_MAJOR" in
-              27) EFFECTIVE_RUNTIME="16.0" ;;
-              28) EFFECTIVE_RUNTIME="17.0" ;;
-              *)
-                echo "::warning::BC_VERSION major $BC_MAJOR not in runtime table — using fallback 14.0"
-                EFFECTIVE_RUNTIME="14.0"
-                ;;
-            esac
+            # Same BC-major-minus-11 rule as the compiler version.
+            if ! EFFECTIVE_RUNTIME=$(python3 bc-linux/scripts/resolve-al-tool-version.py "$BC_VERSION" --runtime); then
+              echo "Could not resolve an AL runtime version for BC $BC_VERSION" >&2
+              exit 1
+            fi
           fi
           echo "Patching app.json runtime → $EFFECTIVE_RUNTIME"
           for d in $APP_DIRS $TEST_APP_DIRS; do

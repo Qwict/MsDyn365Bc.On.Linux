@@ -1,0 +1,89 @@
+name: Check examples for drift
+
+# Runs on every push and PR that touches the reusable workflows, the starter
+# examples, or the shared scripts they call. Those are exactly the changes that
+# can put examples/ out of step with .github/workflows/, so there is no path
+# through which drift lands on master without this having run.
+#
+# Why it exists: the four starter pipelines under examples/ duplicate, in two
+# CI dialects, logic that also lives in the reusable workflows — and nothing
+# executes them, because they are templates for consumers to copy. Issue #19
+# found three separate cases where a fix reached the reusable workflow and
+# never reached the examples, so every consumer who copied one was broken for
+# weeks with nothing flagging it.
+#
+# Takes a few seconds and needs no BC container, so it is cheap enough to gate
+# every relevant push.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/bc-test-from-source.yml'
+      - '.github/workflows/bc-test-prebuilt.yml'
+      - '.github/workflows/check-example-drift.yml'
+      - 'examples/**'
+      - 'scripts/**'
+  pull_request:
+    paths:
+      - '.github/workflows/bc-test-from-source.yml'
+      - '.github/workflows/bc-test-prebuilt.yml'
+      - '.github/workflows/check-example-drift.yml'
+      - 'examples/**'
+      - 'scripts/**'
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check examples against the reusable workflows
+        run: python3 scripts/check-example-drift.py
+
+      - name: Validate example YAML and shell syntax
+        run: |
+          set -e
+          # A starter pipeline that doesn't parse is worse than one that
+          # drifts — the consumer's first run fails before anything happens.
+          # Nothing else in CI parses these files, since they are never run.
+          python3 - <<'PY'
+          import glob, os, subprocess, sys, tempfile, yaml
+
+          failures = 0
+          for f in sorted(glob.glob("examples/*/*.yml")):
+              try:
+                  doc = yaml.safe_load(open(f))
+              except Exception as e:
+                  print(f"::error file={f}::YAML does not parse: {e}")
+                  failures += 1
+                  continue
+
+              blocks = []
+              def walk(o):
+                  if isinstance(o, dict):
+                      for k, v in o.items():
+                          if k in ("run", "bash") and isinstance(v, str):
+                              blocks.append(v)
+                          else:
+                              walk(v)
+                  elif isinstance(o, list):
+                      for i in o:
+                          walk(i)
+              walk(doc)
+
+              for i, b in enumerate(blocks):
+                  with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as t:
+                      t.write(b)
+                      path = t.name
+                  r = subprocess.run(["bash", "-n", path], capture_output=True, text=True)
+                  os.unlink(path)
+                  if r.returncode != 0:
+                      print(f"::error file={f}::shell block {i} has a syntax error: {r.stderr.strip()}")
+                      failures += 1
+
+              print(f"{f}: OK ({len(blocks)} shell blocks)")
+
+          sys.exit(1 if failures else 0)
+          PY
