@@ -157,11 +157,10 @@ jobs:
           ARTIFACT_PID=$!
           (
             cd bc-linux
-            for attempt in 1 2 3 4 5; do
-              if docker compose pull --quiet; then break; fi
-              echo "docker compose pull failed (attempt $attempt/5); retrying in 15s..."
-              sleep 15
-            done
+            # Retries transient registry failures (mcr occasionally
+            # WAF-blocks runner IPs) but aborts immediately on a
+            # permanent one. See scripts/compose-pull.sh.
+            bash scripts/compose-pull.sh
           ) &
           PULL_PID=$!
           wait $ARTIFACT_PID || { echo "artifact download failed"; exit 1; }
