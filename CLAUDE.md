@@ -239,6 +239,29 @@ and races `mirror-sql-image.yml`. This cost two runs. The second one went
 *green* — the retry loop's last attempt landed after the tag appeared — and
 the only symptom was a fetch phase reporting 74s instead of ~14s.
 
+### Do NOT cache BC artifacts. Ever.
+
+This gets proposed roughly every time someone profiles the pipeline,
+including by me. The answer is no, and it isn't close:
+
+- Microsoft moves the revision build constantly — a given `28.0` resolves
+  to a new full version many times a day as hotfixes ship. The cache key
+  is invalidated about as often as it's written.
+- GitHub's Actions cache is capped at 10 GB per repo. One BC version is
+  ~3.1 GB extracted / 2.2 GB of zips. Any repo testing against more than
+  a couple of versions evicts its own entries before they're ever reused.
+- Combined, the cache thrashes: pay the upload cost every run, hit almost
+  never.
+
+This is the same reasoning behind the bc-runner image being independent
+of any BC version — the image is stable and cacheable, the artifacts are
+not. Don't add `actions/cache` around `artifact-cache/`, and don't
+propose it in a review.
+
+**The SQL Server image is the opposite case** and IS cached: one image,
+changes a few times a year, ~1.5 GB, exact digest as the key. See the
+`Cache SQL Server image` steps in the reusable workflows.
+
 **Two false leads, so nobody re-chases them:**
 
 - Test startup is ~3s, not the 33s the log implies. That gap was Python

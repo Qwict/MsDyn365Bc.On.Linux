@@ -130,11 +130,14 @@ on:
       sql_image:
         description: >-
           Override the SQL Server image. Blank (default) uses bc-linux's
-          GHCR mirror of mcr.microsoft.com/mssql/server:2022-latest, which
-          pulls roughly 5x faster from GitHub-hosted runners than mcr does
-          and isn't subject to mcr's intermittent WAF blocks. Set this to
+          GHCR mirror of mcr.microsoft.com/mssql/server:2022-latest with
+          zstd-compressed layers, which isn't subject to mcr's
+          intermittent WAF blocks. Whichever image you name is cached in
+          the Actions cache by digest, so the registry is off the critical
+          path after the first run. Set this to
           "mcr.microsoft.com/mssql/server:2022-latest" to go straight to
-          Microsoft, or to any image in your own registry.
+          Microsoft, ".../mssql:2022" for the gzip copy, or to any image
+          in your own registry.
         required: false
         type: string
         default: ""
@@ -256,6 +259,29 @@ jobs:
       - name: Initialize timing
         run: bash bc-linux/scripts/workflow-summary.sh init
 
+      # ─── SQL Server image cache ──────────────────────────────────────
+      # The registry is the variable part of the fetch phase: the same SQL
+      # image has measured 105s, 45s and 104s on the same 2-vCPU runner
+      # class, with the compression format changing nothing. A local
+      # `docker load` measured 8s against a 49s pull, and the tar
+      # compresses to ~523 MB of the 10 GB repo cache budget.
+      #
+      # Keyed on the exact image digest, so a re-mirrored image rebuilds
+      # the entry. Only the SQL image is cached — bc-runner changes on
+      # every bc-linux push, and BC artifacts must NEVER be cached (they
+      # move revision several times a day and are ~3 GB per version; see
+      # CLAUDE.md).
+      - name: Resolve SQL image digest
+        id: sqlimg
+        working-directory: bc-linux
+        run: echo "digest=$(bash scripts/sql-image.sh digest)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache SQL Server image
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bc-sql-image
+          key: bc-sql-image-${{ steps.sqlimg.outputs.digest }}
+
       # ─── Phase 2: artifact download + docker image pull (parallel) ───
       # Downloading the BC artifact from Microsoft's CDN and pulling the
       # bc-runner / mssql images from GHCR / mcr are independent network
@@ -266,6 +292,7 @@ jobs:
         env:
           BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
           BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache/${{ inputs.bc_version }}
+          SQL_IMAGE_TAR: ${{ runner.temp }}/bc-sql-image/sql.tar
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
@@ -278,12 +305,21 @@ jobs:
           ARTIFACT_PID=$!
           (
             cd bc-linux
-            # Retries transient registry failures (mcr occasionally
-            # WAF-blocks runner IPs) but aborts immediately on a
-            # permanent one. The inline loop this replaced slept 15s x5
-            # on "manifest unknown" too, turning a wrong or not-yet-
-            # published tag into 60s of silent dead time.
-            bash scripts/compose-pull.sh
+            # Restore the SQL image from the Actions cache when we have
+            # it and pull only bc-runner; otherwise pull both and write
+            # the tar for the cache's post-step to pick up.
+            #
+            # compose-pull.sh retries transient registry failures (mcr
+            # occasionally WAF-blocks runner IPs) but aborts immediately
+            # on a permanent one. The inline loop it replaced slept 15s x5
+            # on "manifest unknown", turning a wrong or not-yet-published
+            # tag into 60s of silent dead time.
+            if bash scripts/sql-image.sh load "$SQL_IMAGE_TAR"; then
+              bash scripts/compose-pull.sh bc
+            else
+              bash scripts/compose-pull.sh
+              bash scripts/sql-image.sh save "$SQL_IMAGE_TAR"
+            fi
           ) &
           PULL_PID=$!
           wait $ARTIFACT_PID || { echo "artifact download failed"; exit 1; }
