@@ -147,11 +147,12 @@ jobs:
           ARTIFACT_PID=$!
           (
             cd bc-linux
-            for attempt in 1 2 3 4 5; do
-              if docker compose pull --quiet; then break; fi
-              echo "docker compose pull failed (attempt $attempt/5); retrying in 15s..."
-              sleep 15
-            done
+            # compose-pull.sh retries transient registry failures (mcr
+            # occasionally WAF-blocks runner IPs) but aborts immediately
+            # on a permanent one. The inline loop it replaced slept 15s x5
+            # on "manifest unknown", turning a wrong or not-yet-published
+            # tag into 60s of silent dead time.
+            bash scripts/compose-pull.sh
           ) &
           PULL_PID=$!
           wait $ARTIFACT_PID || { echo "artifact download failed"; exit 1; }
@@ -246,22 +247,83 @@ jobs:
             esac
           fi
           echo "Installing AL compiler $TOOL"
-          dotnet tool install -g \
-            Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux \
-            --version "$TOOL" 2>/dev/null || true
-          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          PKG="microsoft.dynamics.businesscentral.development.tools.linux"
+          AL_TOOL_DIR=""
+
+          # Try dotnet global tool first (BC 27 / v16 packages ship with
+          # DotnetToolSettings.xml and install correctly this way).
+          # BC 28+ dropped the tool manifest — the package is now a plain
+          # library nupkg and `dotnet tool install` rejects it; fall through
+          # to the nupkg-extraction path in that case. Do NOT swallow the
+          # rejection with `|| true`: without the fallback below there is no
+          # `AL` command at all and the compile step dies with exit 127.
+          if dotnet tool install -g \
+              Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux \
+              --version "$TOOL" 2>&1 \
+          || dotnet tool update -g \
+              Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux \
+              --version "$TOOL" 2>&1; then
+            echo "Installed as dotnet global tool"
+            echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+            AL_TOOL_DIR=$(find "$HOME/.dotnet/tools/.store/$PKG" \
+              -type d -name "any" -path "*/tools/net8.0/any" 2>/dev/null \
+              | sort | tail -1)
+          else
+            # Not a dotnet tool — download and extract the nupkg directly.
+            echo "Package is not a dotnet global tool; extracting nupkg"
+            EXTRACT_DIR="$HOME/.al-tool-cache/$TOOL"
+            mkdir -p "$EXTRACT_DIR"
+            curl -fsSL \
+              "https://api.nuget.org/v3-flatcontainer/${PKG}/${TOOL}/${PKG}.${TOOL}.nupkg" \
+              -o "$EXTRACT_DIR/pkg.zip"
+            unzip -q -o "$EXTRACT_DIR/pkg.zip" -d "$EXTRACT_DIR"
+            rm "$EXTRACT_DIR/pkg.zip"
+            # Prefer dotnet tool layout (tools/net8.0/any); fall back to lib/net8.0
+            if [ -d "$EXTRACT_DIR/tools/net8.0/any" ]; then
+              AL_TOOL_DIR="$EXTRACT_DIR/tools/net8.0/any"
+            else
+              AL_TOOL_DIR="$EXTRACT_DIR/lib/net8.0"
+            fi
+            chmod +x "$AL_TOOL_DIR/alc" 2>/dev/null || true
+            # Create an AL wrapper so `AL compile ...` works in later steps.
+            # The v16 dotnet tool ships AL.dll which routes the `compile`
+            # subcommand; raw alc doesn't accept it — strip it here.
+            mkdir -p "$HOME/.al-bin"
+            printf '#!/bin/bash\n[ "$1" = compile ] && shift\nexec "%s/alc" "$@"\n' \
+              "$AL_TOOL_DIR" > "$HOME/.al-bin/AL"
+            chmod +x "$HOME/.al-bin/AL"
+            echo "$HOME/.al-bin" >> "$GITHUB_PATH"
+          fi
+
+          # Exported so the compile step can point resolve-analyzers.py at
+          # the Microsoft cop DLLs — its auto-detection only knows the
+          # dotnet-tool layout, not the extracted-nupkg one.
+          echo "AL_TOOL_DIR=$AL_TOOL_DIR" >> "$GITHUB_ENV"
+          echo "AL compiler ready: $AL_TOOL_DIR"
           bash bc-linux/scripts/workflow-summary.sh end AL_INSTALL
 
       - name: Stage symbols from BC artifacts
         run: |
           bash bc-linux/scripts/workflow-summary.sh begin SYMBOLS "Stage symbols"
           mkdir -p symbols
-          ART="artifact-cache/$BC_VERSION"
-          find "$ART/platform/ModernDev" -name "System.app" -exec cp {} symbols/ \; 2>/dev/null || true
-          find "$ART/app/Extensions" -name "*.app" -exec cp {} symbols/ \; 2>/dev/null || true
-          find "$ART/platform" -path "*testframework*" -name "*.app" -exec cp {} symbols/ \; 2>/dev/null || true
-          find "$ART/app/Applications" -name "*Test Library*.app" -exec cp {} symbols/ \; 2>/dev/null || true
-          find "$ART/app/Applications" -name "*Tests-TestLibraries*.app" -exec cp {} symbols/ \; 2>/dev/null || true
+          # Manifest-driven resolver: walks the artifact tree, indexes
+          # every .app by its declared id, then stages exactly the
+          # transitive dependency closure of the consumer's app.json
+          # files (plus System.app, which AL compile always needs).
+          # Robust to Microsoft moving apps between folders across BC
+          # versions — the old glob-based staging silently failed
+          # whenever an expected app moved (e.g. Tests-TestLibraries
+          # under platform/applications/BaseApp/Test/ in BC 27.5).
+          ARGS=""
+          for d in $APP_DIRS $TEST_APP_DIRS; do
+            [ -z "$d" ] && continue
+            [ -f "project/$d/app.json" ] && ARGS="$ARGS --app-json project/$d/app.json"
+          done
+          python3 bc-linux/scripts/stage-symbols.py \
+            $ARGS \
+            --artifact-dir "artifact-cache/$BC_VERSION" \
+            --out-dir symbols \
+            || true   # warnings about unresolved deps are non-fatal; AL compile gives the precise error if any
           echo "Staged $(ls symbols/*.app 2>/dev/null | wc -l) symbol files"
           bash bc-linux/scripts/workflow-summary.sh end SYMBOLS
 
@@ -329,8 +391,12 @@ jobs:
           ANALYZER_FLAGS=()
           if [ ${#HELPER_ARGS[@]} -gt 0 ]; then
             HELPER_OUT=$(mktemp)
+            # --al-tool-dir is where the Microsoft cop DLLs live. Pass it
+            # explicitly: on BC 28+ the compiler comes from an extracted
+            # nupkg, which the helper's auto-detection doesn't know about.
             if ! python3 bc-linux/scripts/resolve-analyzers.py \
                 --project-root project \
+                ${AL_TOOL_DIR:+--al-tool-dir "$AL_TOOL_DIR"} \
                 "${HELPER_ARGS[@]}" > "$HELPER_OUT"; then
               echo "ERROR: resolve-analyzers.py failed — check stderr above" >&2
               rm -f "$HELPER_OUT"
@@ -409,42 +475,35 @@ jobs:
       - name: Wait for BC healthy
         working-directory: bc-linux
         run: |
-          for i in $(seq 1 360); do
-            STATUS=$(docker inspect --format='{{.State.Health.Status}}' \
-              "$(docker compose ps -q bc)" 2>/dev/null || echo unknown)
-            case "$STATUS" in
-              healthy)   echo "BC ready after $((i*5))s"; break ;;
-              unhealthy) docker compose logs bc | tail -80; exit 1 ;;
-            esac
-            sleep 5
-          done
-          [ "$STATUS" = "healthy" ] || { docker compose logs bc | tail -100; exit 1; }
+          # Shared readiness loop — same one the reusable workflow uses.
+          # It prints what BC's entrypoint is doing every 60s instead of
+          # leaving you staring at silence for several minutes.
+          ./scripts/wait-for-bc-healthy.sh 30
           bash scripts/workflow-summary.sh end BC_BOOT
 
       # ─── Phase 7: publish compiled apps to the now-running BC ────────
       - name: Publish AL apps to BC
         env:
           AUTH: "BCRUNNER:Admin123!"
-          DEV: "http://localhost:7049"
+          DEV: "http://localhost:7049/BC/dev"
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin PUBLISH "Publish AL apps"
-          publish_app() {
-            local app="$1"
-            [ -f "$app" ] || { echo "missing: $app"; exit 1; }
-            echo ">>> Publishing $app"
-            local code
-            code=$(curl -s -o /tmp/pub.out -w "%{http_code}" --max-time 180 \
-              -u "$AUTH" -X POST \
-              -F "file=@${app};type=application/octet-stream" \
-              "$DEV/apps?SchemaUpdateMode=forcesync")
-            cat /tmp/pub.out; echo
-            [ "$code" = "200" ] || [ "$code" = "422" ] || { echo "publish failed: $code"; exit 1; }
-          }
+          # Source the canonical publish helper from bc-linux rather than
+          # inlining a copy. The inline version treated EVERY 422 as
+          # success, which silently swallowed missing-dependency errors
+          # and let the test run report "0 total, 0 passed, 0 failed"
+          # with no clue why. bc_publish_app reads the response body and
+          # only treats 422 as success when it actually says "already".
+          # shellcheck disable=SC1091
+          . bc-linux/scripts/publish-app.sh
           PUBLISHED_COUNT=0
           for d in $APP_DIRS $TEST_APP_DIRS; do
             [ -z "$d" ] && continue
-            publish_app "build/$(basename "$d").app"
+            app="build/$(basename "$d").app"
+            [ -f "$app" ] || { echo "missing: $app"; exit 1; }
+            echo ">>> Publishing $app"
+            bc_publish_app "$app" "$DEV" "$AUTH" || exit 1
             PUBLISHED_COUNT=$((PUBLISHED_COUNT + 1))
           done
           bash bc-linux/scripts/workflow-summary.sh count apps_published "$PUBLISHED_COUNT"

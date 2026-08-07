@@ -96,11 +96,12 @@ steps:
       ARTIFACT_PID=$!
       (
         cd "$(Agent.BuildDirectory)/bc-linux"
-        for attempt in 1 2 3 4 5; do
-          if docker compose pull --quiet; then break; fi
-          echo "docker compose pull failed (attempt $attempt/5); retrying in 15s..."
-          sleep 15
-        done
+        # compose-pull.sh retries transient registry failures (mcr
+        # occasionally WAF-blocks runner IPs) but aborts immediately on a
+        # permanent one. The inline loop it replaced slept 15s x5 on
+        # "manifest unknown", turning a wrong or not-yet-published tag
+        # into 60s of silent dead time.
+        bash scripts/compose-pull.sh
       ) &
       PULL_PID=$!
       wait $ARTIFACT_PID || { echo "artifact download failed"; exit 1; }
@@ -141,10 +142,22 @@ steps:
   # starts, so no boot/import/restart cycle is needed. No-op when unset.
   - bash: |
       set -e
-      if [ -z "${BC_LICENSE_B64:-}" ]; then
-        echo "BC_LICENSE_B64 not set; skipping (default Cronus license will be used)"
-        exit 0
-      fi
+      # Azure DevOps does NOT substitute an undefined variable: when
+      # BC_LICENSE_B64 doesn't exist, `env:` below passes through the
+      # literal string $(BC_LICENSE_B64), which is not empty. A plain
+      # `[ -z ... ]` guard therefore never fires and base64 -d chokes on
+      # the placeholder. Treat the un-substituted macro as "unset".
+      # The placeholder is spelled with a quote break ('$''(...') so that
+      # the agent's own macro expansion can't rewrite it here when the
+      # variable IS defined — otherwise the comparison would match the
+      # real license and silently skip it.
+      UNSET_PLACEHOLDER='$''(BC_LICENSE_B64)'
+      case "${BC_LICENSE_B64:-}" in
+        ''|"$UNSET_PLACEHOLDER")
+          echo "BC_LICENSE_B64 not set; skipping (default Cronus license will be used)"
+          exit 0
+          ;;
+      esac
       LICENSE_PATH="$(Agent.TempDirectory)/bc-license.bclicense"
       printf '%s' "$BC_LICENSE_B64" | base64 -d > "$LICENSE_PATH"
       [ -s "$LICENSE_PATH" ] || { echo "ERROR: BC_LICENSE_B64 decoded to an empty file"; exit 1; }
@@ -177,16 +190,10 @@ steps:
   - bash: |
       set -e
       cd "$(Agent.BuildDirectory)/bc-linux"
-      for i in $(seq 1 360); do
-        STATUS=$(docker inspect --format='{{.State.Health.Status}}' \
-          "$(docker compose ps -q bc)" 2>/dev/null || echo unknown)
-        case "$STATUS" in
-          healthy)   echo "BC ready after $((i*5))s"; break ;;
-          unhealthy) docker compose logs bc | tail -80; exit 1 ;;
-        esac
-        sleep 5
-      done
-      [ "$STATUS" = "healthy" ] || { docker compose logs bc | tail -100; exit 1; }
+      # Shared readiness loop — same one the reusable workflow uses. It
+      # prints what BC's entrypoint is doing every 60s instead of leaving
+      # you staring at silence for several minutes.
+      ./scripts/wait-for-bc-healthy.sh 30
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" end BC_BOOT
     displayName: 'Wait for BC healthy'
 
@@ -194,29 +201,21 @@ steps:
       set -e
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" begin PUBLISH "Publish .app files"
       AUTH="BCRUNNER:Admin123!"
-      DEV="http://localhost:7049"
-      publish_app() {
-        local app="$1"
-        [ -f "$app" ] || { echo "missing: $app"; exit 1; }
-        echo ">>> Publishing $app"
-        local code
-        code=$(curl -s -o /tmp/pub.out -w "%{http_code}" --max-time 180 \
-          -u "$AUTH" -X POST \
-          -F "file=@${app};type=application/octet-stream" \
-          "$DEV/apps?SchemaUpdateMode=forcesync")
-        cat /tmp/pub.out; echo
-        [ "$code" = "200" ] || [ "$code" = "422" ] || { echo "publish failed: $code"; exit 1; }
-      }
+      DEV="http://localhost:7049/BC/dev"
+      # Source the canonical publish helper from bc-linux rather than
+      # inlining a copy. The inline version treated EVERY 422 as success,
+      # which silently swallowed missing-dependency errors and let the
+      # test run report "0 total, 0 passed, 0 failed" with no clue why.
+      # bc_publish_app reads the response body and only treats 422 as
+      # success when it actually says "already".
+      # shellcheck disable=SC1091
+      . "$(Agent.BuildDirectory)/bc-linux/scripts/publish-app.sh"
       cd "$(Pipeline.Workspace)/project"
       PUBLISHED_COUNT=0
-      for app in $(APP_FILES); do
+      for app in $(APP_FILES) $(TEST_APP_FILES); do
         [ -z "$app" ] && continue
-        publish_app "$app"
-        PUBLISHED_COUNT=$((PUBLISHED_COUNT + 1))
-      done
-      for app in $(TEST_APP_FILES); do
-        [ -z "$app" ] && continue
-        publish_app "$app"
+        echo ">>> Publishing $app"
+        bc_publish_app "$app" "$DEV" "$AUTH" || exit 1
         PUBLISHED_COUNT=$((PUBLISHED_COUNT + 1))
       done
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" count apps_published "$PUBLISHED_COUNT"
