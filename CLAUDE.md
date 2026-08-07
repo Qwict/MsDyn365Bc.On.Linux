@@ -277,6 +277,11 @@ Measured on run 31155693451; don't re-derive it from a local benchmark.
 (~3m of a 7m job), then tests, then app publish. The fetch phase is the
 dominant cost only for bc-linux's own thin smoke-test matrix.
 
+Before proposing a reordering or parallelization change to the workflows,
+read `CI-STEP-ORDERING.md` — it has the step-level critical path for both
+workload shapes, the measured noise floor, and the reorderings already
+tried and reverted.
+
 ### The TestRunnerExtension app.json seed is load-bearing
 
 `resolve-keep-app-ids.py` **auto-seeds itself** with

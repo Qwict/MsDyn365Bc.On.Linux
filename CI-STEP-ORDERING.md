@@ -1,0 +1,114 @@
+# CI step ordering — what's on the critical path, and what's already been tried
+
+Read this before proposing a reordering or parallelization change to the
+reusable workflows. It is not required reading otherwise; `CLAUDE.md`'s
+"CI wall-clock" section covers the things that affect everyday work.
+
+Profiled 2026-08-07 against bc-linux's own version matrix (public repo,
+4-vCPU runners) and a Pageworks run (private, 2-vCPU, a real consumer
+workload).
+
+## The noise floor comes first
+
+Ten legs of a single matrix run, doing identical work, spread **83-118s**.
+Four consecutive runs had medians of 97 / 97 / 93 / 94s.
+
+Nothing below roughly 10s is measurable from one pair of runs. If you
+change something here, compare medians across all legs of several runs,
+and be suspicious of any win that shows up in a sub-metric but not in
+total job duration.
+
+## Where the time goes
+
+Both workload shapes are **BC-boot-bound**, and the boot window is
+already as full as it can be.
+
+bc-linux smoke leg (4-vCPU, ~88s):
+
+| | |
+|---|---|
+| download artifacts + pull images (parallel) | 29s |
+| `docker compose up -d` | 6s |
+| toolchain + compile — hidden behind BC boot | 20s |
+| **idle, waiting for BC** | **22s** |
+| tests | 7s |
+
+Pageworks (2-vCPU, 192s leg inside a 4m03s run):
+
+| | |
+|---|---|
+| download artifacts + pull images (parallel) | 58s |
+| `docker compose up -d` | 6s |
+| toolchain + compile — hidden behind BC boot | 70s (36s of it compile) |
+| **idle, waiting for BC** | **42s** |
+| publish + tests | ~0s |
+
+The consumer's compile finishes *entirely* inside the boot window and
+still leaves 42s of exposed wait. There is no remaining work to move
+into that window.
+
+Inside the container, after the artifacts are present (cold local boot,
+BC 28.0):
+
+| | |
+|---|---|
+| Step 2 service tier | 1s |
+| Step 2b merged assemblies + binary patches | 5s |
+| Step 3 SQL wait + restore + selective filter | 3s |
+| R2R pre-seed | 3s |
+| **NST startup** | **31s** |
+| **post-NST publish** | **24s** |
+
+## Dead ends
+
+### Starting SQL during the artifact download
+
+Reverted (3aec328, 6ff7e81). `bc` has `depends_on: sql: service_healthy`,
+so the bc container genuinely does sit in `Created` state until SQL's
+healthcheck passes, and that time is dead space at the head of the boot
+window. The idea was to start sql while the BC artifact was still
+downloading.
+
+It cannot work: **sql cannot start before its own image is pulled, and
+that pull takes about as long as the artifact download.** There is no
+window to hide the boot in. Measured: sql up at t+28s against a t+29s
+download — a 1s head start.
+
+The follow-up attempt was to pull sql on its own first, on the assumption
+it was the smaller and faster image. It is not. That made sql start at
+t+35s, i.e. *later* than pulling both together.
+
+Same root cause as the artifact-caching ban in `CLAUDE.md`: the transfer
+is the constraint, and it's on Microsoft's and GHCR's side.
+
+### Moving the toolchain install earlier
+
+Net zero by construction. `Setup .NET` + `Install AL compiler` + symbol
+staging currently hide behind BC boot. Pulling them into the parallel
+download phase doesn't shorten the job — it converts hidden work into
+exposed idle, because BC boot is the pole either way.
+
+### Overlapping entrypoint Step 2/2b with Step 3
+
+Costed and skipped. It looks like a 6s win (6s of local file work
+alongside 6s of DB work) but it is 3s: the R2R pre-seed depends on
+**both** halves — `CustomSettings.config` from Step 2 for the instance
+name, and the restored DB from Step 3 for the runtime-package-id map — so
+it can't move. The chain collapses from 12s to 9s, not to 6s. Not worth
+restructuring a load-bearing block with export-scope hazards for 3s that
+sits below the noise floor.
+
+### Parallel publishing to the dev endpoint
+
+Tried 2026-04-08, documented at the call site in `scripts/entrypoint.sh`.
+The NST serializes publishes server-side; layered concurrency=4 took the
+same ~27s as serial POSTs.
+
+## What would actually move the needle
+
+The two big blocks are BC's own work: NST startup (31s) and the post-NST
+publish (24s). Of the publish, ~22s is BC compiling the three test
+framework apps that ship **no** precompiled DLL — see `CLAUDE.md`, "Why
+the post-NST publish costs what it does". If Microsoft ever ships those
+as ReadyToRun packages, that time becomes addressable and the
+install-vs-republish question is worth reopening.
