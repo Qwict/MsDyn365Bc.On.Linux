@@ -142,41 +142,6 @@ jobs:
         run: bash bc-linux/scripts/workflow-summary.sh init
 
       # Artifact download + docker pull in parallel (independent network IO).
-      # Runs BEFORE the download phase because that phase starts the sql
-      # service early, and BC_LICENSE_HOST_PATH is part of sql's container
-      # config (the license bind mount is on both services — OPENROWSET BULK
-      # reads it from SQL's filesystem). Staging it afterwards would change
-      # sql's config hash and make the later `docker compose up -d` recreate
-      # the container, throwing away the head start.
-      #
-      # Stage the optional ISV license. When the consumer passed `bc_license`
-      # in the secrets: block, decode the base64 blob to a tempfile and export
-      # the env vars that wire it into the docker-compose mounts. The
-      # entrypoint will then import this license INSTEAD of the default
-      # Cronus.bclicense, before NST starts — no boot/import/restart cycle.
-      # No `if: secrets.bc_license != ''` — the `secrets` context isn't
-      # allowed in step `if:` expressions (rejected by GitHub at parse time).
-      # Step always runs, body skips itself when the env var is empty.
-      - name: Stage ISV license (if provided)
-        env:
-          BC_LICENSE_B64: ${{ secrets.bc_license }}
-        run: |
-          set -e
-          if [ -z "${BC_LICENSE_B64:-}" ]; then
-            echo "No bc_license secret provided — using default Cronus license"
-            exit 0
-          fi
-          LICENSE_PATH="$RUNNER_TEMP/bc-license.bclicense"
-          printf '%s' "$BC_LICENSE_B64" | base64 -d > "$LICENSE_PATH"
-          if [ ! -s "$LICENSE_PATH" ]; then
-            echo "ERROR: bc_license secret decoded to an empty file"
-            exit 1
-          fi
-          chmod 644 "$LICENSE_PATH"
-          echo "BC_LICENSE_HOST_PATH=$LICENSE_PATH" >> "$GITHUB_ENV"
-          echo "BC_LICENSE_FILE=/bc/custom-license.bclicense" >> "$GITHUB_ENV"
-          echo "ISV license staged for entrypoint import"
-
       - name: Download BC artifacts + pull docker images (parallel)
         env:
           BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
@@ -198,26 +163,7 @@ jobs:
             # on a permanent one. The inline loop it replaced slept 15s x5
             # on "manifest unknown", turning a wrong or not-yet-published
             # tag into 60s of silent dead time.
-            # Pull sql FIRST, on its own, then start it, then pull bc.
-            # A combined pull only returns once BOTH images are local,
-            # which lands at almost the same moment the artifact download
-            # finishes — measured as a 1s head start. Pulling the smaller
-            # sql image alone gets the container up much earlier, so its
-            # boot finishes inside the download window. Serializing the
-            # two pulls costs ~nothing: they contend for the same runner
-            # bandwidth and CPU anyway.
-            bash scripts/compose-pull.sh sql
-            # Start SQL Server now, while the BC artifact is still
-            # downloading. The bc service has
-            # `depends_on: sql: condition: service_healthy`, so SQL's
-            # time-to-healthy is otherwise dead time at the head of the BC
-            # boot window — the bc container stays in `Created` until the
-            # healthcheck passes, on a 5s interval. SQL needs nothing from
-            # the artifacts until the entrypoint restores the .bak ~5s into
-            # its run. Non-fatal: on failure the later `docker compose up -d`
-            # starts sql the old way and we just lose the head start.
-            docker compose up -d sql || echo "WARN: early sql start failed — continuing"
-            bash scripts/compose-pull.sh bc
+            bash scripts/compose-pull.sh
           ) &
           PULL_PID=$!
           wait $ARTIFACT_PID || { echo "artifact download failed"; exit 1; }
@@ -251,6 +197,34 @@ jobs:
           echo "BC_CLEAR_ALL_APPS=selective" >> "$GITHUB_ENV"
           echo "BC_KEEP_APP_IDS=$KEEP_IDS" >> "$GITHUB_ENV"
           bash bc-linux/scripts/workflow-summary.sh end RESOLVE
+
+      # Stage the optional ISV license. When the consumer passed `bc_license`
+      # in the secrets: block, decode the base64 blob to a tempfile and export
+      # the env vars that wire it into the docker-compose mounts. The
+      # entrypoint will then import this license INSTEAD of the default
+      # Cronus.bclicense, before NST starts — no boot/import/restart cycle.
+      # No `if: secrets.bc_license != ''` — the `secrets` context isn't
+      # allowed in step `if:` expressions (rejected by GitHub at parse time).
+      # Step always runs, body skips itself when the env var is empty.
+      - name: Stage ISV license (if provided)
+        env:
+          BC_LICENSE_B64: ${{ secrets.bc_license }}
+        run: |
+          set -e
+          if [ -z "${BC_LICENSE_B64:-}" ]; then
+            echo "No bc_license secret provided — using default Cronus license"
+            exit 0
+          fi
+          LICENSE_PATH="$RUNNER_TEMP/bc-license.bclicense"
+          printf '%s' "$BC_LICENSE_B64" | base64 -d > "$LICENSE_PATH"
+          if [ ! -s "$LICENSE_PATH" ]; then
+            echo "ERROR: bc_license secret decoded to an empty file"
+            exit 1
+          fi
+          chmod 644 "$LICENSE_PATH"
+          echo "BC_LICENSE_HOST_PATH=$LICENSE_PATH" >> "$GITHUB_ENV"
+          echo "BC_LICENSE_FILE=/bc/custom-license.bclicense" >> "$GITHUB_ENV"
+          echo "ISV license staged for entrypoint import"
 
       # No compile in prebuilt mode, so there's nothing CPU-bound to overlap
       # with BC startup — but we still kick off in the background to allow
