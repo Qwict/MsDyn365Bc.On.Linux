@@ -26,6 +26,53 @@ Remaining next steps: (1) rerun one suite under `run-tests.sh` to size the
 isolation + TestPage buckets honestly; (2) `NSClientCallback.CreateDotNetHandle`
 ("A call to IsAvailable failed": the creation-side hole, still open, see below).
 
+## Apps using `OptimizeForTextSearch` need the FTS SQL image (issue #20)
+
+No official SQL Server **Linux** image ships the Full-Text Search
+component — it's a separate `mssql-server-fts` package — so an app that
+declares `OptimizeForTextSearch = true` on any field cannot be installed
+on the default stack. The dev endpoint returns HTTP 422:
+
+```
+Text optimized index cannot be created/queried because the SQL Server
+Full-Text Search component is not installed.
+```
+
+**The follow-on error is the one you'll actually see first**, and it
+points somewhere completely wrong — every app depending on the one that
+failed to install then fails to compile with:
+
+```
+error AL1024: A package with publisher '<P>', name '<A>', and a version
+compatible with '27.0.0.0' could not be loaded. Symbols for the requested
+app ... could not be found in the database.
+```
+
+That reads like a symbol-staging problem and sends you into `.alpackages`
+and `stage-symbols.py`. It isn't: the app simply never installed.
+`scripts/publish-app.sh` now detects the FTS 422 and says so explicitly.
+
+**Fix** — switch to the FTS-capable SQL image:
+
+```bash
+BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts docker compose up -d --wait
+```
+
+or in the reusable workflows:
+
+```yaml
+with:
+  sql_image: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts
+```
+
+It is **opt-in, not the default**: FTS more than doubles the image
+(1.68 GB → 3.61 GB uncompressed, measured), and the SQL pull sits on the
+critical path of every CI run. The tag is built and verified
+(`SERVERPROPERTY('IsFullTextInstalled') = 1`) by
+`.github/workflows/mirror-sql-image.yml` alongside the other mirrors.
+
+Reported by @ChristianHovenbitzer.
+
 ## "User cannot be deleted because logged on" (~142 failures in SINGLESERVER)
 
 **Root cause**: Microsoft's test cleanup code does broad `User.DeleteAll()` or

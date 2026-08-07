@@ -135,7 +135,10 @@ on:
           intermittent WAF blocks. Set this to
           "mcr.microsoft.com/mssql/server:2022-latest" to go straight to
           Microsoft, ".../mssql:2022" for the byte-identical gzip copy, or
-          to any image in your own registry.
+          to any image in your own registry. Use ".../mssql:2022-fts" if
+          your apps declare OptimizeForTextSearch — no official SQL Server
+          Linux image ships Full-Text Search, so those apps fail to install
+          on every other variant (see KNOWN-LIMITATIONS.md).
         required: false
         type: string
         default: ""

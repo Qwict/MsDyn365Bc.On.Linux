@@ -82,6 +82,32 @@ bc_publish_app() {
     echo "       Body:"
     sed 's/^/         /' "$body"
     echo ""
+
+    # Full-Text Search is the one failure mode whose follow-on error points
+    # somewhere completely wrong: the app never installs, and everything
+    # depending on it then fails with AL1024 "symbols could not be found",
+    # which sends people digging through .alpackages and stage-symbols.py.
+    # Name it explicitly. No official SQL Server Linux image ships FTS.
+    if grep -qi "Full-Text Search component is not installed" "$body"; then
+        echo "       CAUSE: this app uses AL's OptimizeForTextSearch, which needs the"
+        echo "              SQL Server Full-Text Search component. No official SQL"
+        echo "              Server Linux image ships it, so the default SQL container"
+        echo "              can't install the app."
+        echo ""
+        echo "       FIX:   switch to the FTS-capable SQL image:"
+        echo "                BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts"
+        echo "              or, in the reusable workflows:"
+        echo "                sql_image: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts"
+        echo "              It is not the default because FTS more than doubles the"
+        echo "              image size. See KNOWN-LIMITATIONS.md."
+        echo ""
+        echo "       NOTE:  apps that depend on this one will fail next with"
+        echo "              'AL1024 ... symbols could not be found'. That is a"
+        echo "              follow-on symptom, not a symbol-staging problem."
+        rm -f "$body"
+        return 1
+    fi
+
     echo "       Common causes:"
     echo "         - Missing dependency that isn't installed in BC. (Putting"
     echo "           the symbol file in .alpackages makes it visible at"

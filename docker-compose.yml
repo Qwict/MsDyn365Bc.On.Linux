@@ -23,6 +23,12 @@ services:
     # from your own registry, or to pin a different SQL Server version:
     #   BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022 docker compose up -d
     #   BC_SQL_IMAGE=mcr.microsoft.com/mssql/server:2022-latest docker compose up -d
+    #
+    # Apps using AL's `OptimizeForTextSearch = true` need the Full-Text
+    # Search component, which no official SQL Server Linux image ships.
+    # Use the :2022-fts variant for those — opt-in because FTS more than
+    # doubles the image size. See KNOWN-LIMITATIONS.md (issue #20):
+    #   BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts docker compose up -d
     image: ${BC_SQL_IMAGE:-ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd}
     environment:
       ACCEPT_EULA: "Y"

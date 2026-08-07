@@ -38,6 +38,14 @@ env:
   # byte-identical :2022 tag so there's an instant rollback if a
   # consumer's Docker can't handle zstd layers.
   MIRROR_ZSTD: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd
+  # Same image plus the SQL Server Full-Text Search component. No official
+  # SQL Server Linux image ships FTS — it's a separate mssql-server-fts
+  # package — so AL's `OptimizeForTextSearch = true` cannot be installed on
+  # the stock stack (issue #20). This variant is OPT-IN via BC_SQL_IMAGE and
+  # deliberately NOT the compose default: FTS more than doubles the image
+  # (1.68 GB → 3.61 GB uncompressed, measured), and the SQL pull is on the
+  # critical path of every CI run. Only pay for it if your apps need it.
+  MIRROR_FTS: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts
 
 jobs:
   mirror:
@@ -106,7 +114,16 @@ jobs:
           fi
           echo "zstd tag present:  $zstd_present"
 
-          if [ "$up" = "$mir" ] && [ "$zstd_present" = "yes" ] && [ "${{ inputs.force }}" != "true" ]; then
+          # Same reasoning for the FTS variant — it's an opt-in tag, so a
+          # silently-missing one would only surface as issue #20 all over
+          # again for the consumer who switched to it.
+          fts_present=no
+          if docker buildx imagetools inspect --raw "$MIRROR_FTS" >/dev/null 2>&1; then
+            fts_present=yes
+          fi
+          echo "fts tag present:   $fts_present"
+
+          if [ "$up" = "$mir" ] && [ "$zstd_present" = "yes" ] && [ "$fts_present" = "yes" ] && [ "${{ inputs.force }}" != "true" ]; then
             echo "push=false" >> "$GITHUB_OUTPUT"
             echo "Mirror is already current — nothing to do."
           else
@@ -163,6 +180,70 @@ jobs:
             --output "type=registry,name=$MIRROR_ZSTD,compression=zstd,compression-level=9,force-compression=true" \
             -f Dockerfile.mirror .
 
+      # ── Full-Text Search variant ────────────────────────────────────
+      # Adds mssql-server-fts on top of the mirrored image so apps using
+      # AL's `OptimizeForTextSearch = true` can be installed (issue #20).
+      # The Microsoft package repo isn't configured inside the SQL image,
+      # so it has to be added before the package resolves — installing
+      # mssql-server-fts against the stock sources.list fails with
+      # "Unable to locate package".
+      #
+      # Opt-in only. See the MIRROR_FTS comment above for why it isn't the
+      # compose default.
+      - name: Build the Full-Text Search variant
+        if: steps.compare.outputs.push == 'true'
+        run: |
+          set -e
+          cat > Dockerfile.fts <<'EOF'
+          FROM mcr.microsoft.com/mssql/server:2022-latest
+          USER root
+          RUN apt-get update \
+           && apt-get install -y --no-install-recommends curl gnupg ca-certificates \
+           && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+                | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+           && echo "deb [arch=amd64,armhf,arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/mssql-server-2022 jammy main" \
+                > /etc/apt/sources.list.d/mssql-server-2022.list \
+           && apt-get update \
+           && ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-server-fts \
+           && apt-get purge -y curl gnupg && apt-get autoremove -y \
+           && apt-get clean && rm -rf /var/lib/apt/lists/*
+          USER mssql
+          EOF
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            --output "type=registry,name=$MIRROR_FTS,compression=zstd,compression-level=9,force-compression=true" \
+            -f Dockerfile.fts .
+
+      # Prove FTS is actually active rather than just installed — a
+      # published tag that still reports IsFullTextInstalled=0 would fail
+      # exactly the same way the stock image does, just 2 GB slower.
+      - name: Verify Full-Text Search is active
+        if: steps.compare.outputs.push == 'true'
+        run: |
+          set -e
+          docker pull -q "$MIRROR_FTS"
+          docker run -d --name fts-verify \
+            -e ACCEPT_EULA=Y -e SA_PASSWORD='Passw0rd123!' -e MSSQL_PID=Developer \
+            "$MIRROR_FTS"
+          for i in $(seq 1 60); do
+            if docker exec fts-verify /opt/mssql-tools18/bin/sqlcmd \
+                 -S localhost -U sa -P 'Passw0rd123!' -C -No -Q "SELECT 1" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 3
+          done
+          got=$(docker exec fts-verify /opt/mssql-tools18/bin/sqlcmd \
+                  -S localhost -U sa -P 'Passw0rd123!' -C -No -h -1 -W \
+                  -Q "SET NOCOUNT ON; SELECT CONVERT(varchar,SERVERPROPERTY('IsFullTextInstalled'))" \
+                | tr -d '[:space:]')
+          docker rm -f fts-verify >/dev/null 2>&1 || true
+          echo "IsFullTextInstalled = $got"
+          if [ "$got" != "1" ]; then
+            echo "ERROR: $MIRROR_FTS does not have Full-Text Search active."
+            exit 1
+          fi
+
       # Pull it back on a clean daemon state to prove a consumer can, and
       # to record what it costs. A failure here means the zstd tag is
       # unusable and consumers should stay on :2022 — which is why the
@@ -192,6 +273,7 @@ jobs:
             echo "| Upstream | \`$UPSTREAM\` |"
             echo "| Mirror (gzip, byte-copy) | \`$MIRROR\` |"
             echo "| Mirror (zstd layers) | \`$MIRROR_ZSTD\` |"
+            echo "| Mirror (zstd + Full-Text Search, opt-in) | \`$MIRROR_FTS\` |"
             echo "| Digest | \`${{ steps.compare.outputs.digest }}\` |"
             echo "| Pushed | ${{ steps.compare.outputs.push }} |"
           } >> "$GITHUB_STEP_SUMMARY"
