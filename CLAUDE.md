@@ -215,108 +215,47 @@ hardened. Don't undo them without understanding why they exist.
   weeks. Don't move this without auditing every consumer's
   `runner_image` default.
 
-## CI wall-clock: what was measured and what's load-bearing
+## CI wall-clock
 
-Profiled 2026-08-07 against a real consumer run (Pageworks PR #27, BC
-28.0, 7m33s total). Critical path was: 9s setup → **1m50s** fetch →
-10s resolve → **3m16s** BC boot (2m09s of it idle after compile
-finished) → 34s publish → **1m34s** tests. Anyone trying to make CI
-faster should re-measure before assuming — two "obvious" targets turned
-out to be measurement artifacts.
+Profiled 2026-08-07 against Pageworks PR #27 (private repo, real consumer
+workload) and bc-linux's own version matrix. The rationale for each change
+lives next to the code — `docker-compose.yml`'s `sql` service,
+`scripts/download-artifacts.sh`, `scripts/compose-pull.sh`,
+`.github/workflows/mirror-sql-image.yml`. What's recorded here is only the
+part you can't read off the code.
 
-**Things that are NOT slow, despite how the log reads:**
+**Runner tiers differ by repo visibility.** GitHub gives public repos
+4-vCPU/16GB `ubuntu-latest` and private repos 2-vCPU/7GB, same runner image,
+nothing in the log saying which you got. That is the answer to "why does
+bc-linux's matrix finish the fetch phase in ~30s while a private consumer
+repo takes ~60s on identical work" — the same gzip SQL image measured 16s
+vs ~45s. It applies to zip extraction, AL compile and BC boot too.
+`workflow-summary.sh` records `nproc`/RAM and puts them on every telemetry
+event; **durations are only comparable within one tier.**
 
-- **Test startup is ~3s, not 33s.** The log appears to sit silent for
-  33s after `=== Running tests in … ===`. That's Python block-buffering
-  stdout through `| tee` — output lands in ~8KB batches, so every
-  timestamp is a flush time, not an event time. Measured against a live
-  container: company detect 0.02s, hub negotiate + connect + handshake +
-  `Initialize` 3.0s. **The workflows now run `python3 -u`** for exactly
-  this reason; don't drop the `-u`, or the next person profiling this
-  will chase the same ghost.
-- **The test execution itself.** 1067 tests in ~90s over one persistent
-  hub connection. Note the per-method durations BC reports sum to 535s
-  — far more than the wall time they occurred in. They are not
-  wall-clock and must not be summed to "find" slow tests.
+**Publish an image tag before pointing compose at it.** `test-versions.yml`
+has no path filter, so any push to master triggers the matrix immediately
+and races `mirror-sql-image.yml`. This cost two runs. The second one went
+*green* — the retry loop's last attempt landed after the tag appeared — and
+the only symptom was a fetch phase reporting 74s instead of ~14s.
 
-**Where the time actually is,** in descending order: BC boot (of which
-~30s locally / proportionally more in CI is the post-NST extension
-publish — see below), the artifact + image fetch, then app publish.
+**Two false leads, so nobody re-chases them:**
 
-### The docker pull was the fetch bottleneck, not the artifacts
+- Test startup is ~3s, not the 33s the log implies. That gap was Python
+  block-buffering through `| tee`; the workflows run `python3 -u` now.
+- BC's per-method test durations are not wall-clock — they summed to 535s
+  inside a 90s run. Don't add them up looking for slow tests.
 
-Measured: BC artifacts 2.2 GB from Azure Front Door in 95s (~34 MB/s);
-the 625 MB `mssql/server:2022-latest` image from mcr in **105s (~6
-MB/s)**. Since the two run in parallel, the SQL image was the binding
-constraint of the whole phase. mcr also intermittently WAF-blocks runner
-IPs — that's why the workflows wrap `docker compose pull` in a 5-attempt
-retry loop.
-
-`docker-compose.yml` therefore defaults the `sql` service to
-`ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022`, a mirror refreshed
-weekly by `.github/workflows/mirror-sql-image.yml` (digest-compared, so
-a no-change run is one manifest request). `BC_SQL_IMAGE` overrides it;
-the reusable workflows expose the same thing as a `sql_image` input and
-pass it through as an empty string when unset — `${BC_SQL_IMAGE:-…}`
-treats empty and unset alike, so that's safe.
-
-**The mirror workflow has to have run at least once before this default
-resolves.** If you ever rename the mirror repo or the tag, run
-`mirror-sql-image.yml` first, then change `docker-compose.yml` — never
-the other way around.
-
-### Artifact download: the stream split exists for extraction overlap
-
-`download-artifacts.sh` HEADs both zips, then gives the **larger** one
-~70% of the 32-stream budget (`BC_DL_BIG_SHARE`, 50 = even split) and
-extracts each zip the moment it lands rather than waiting for both.
-
-The point is not download speed. The link is the bottleneck, not the
-per-connection rate — 32 streams measured 34 MB/s aggregate, ~2 MB/s
-each, well under AFD's ~4-8 MB/s per-connection ceiling — so the total
-download time is fixed however you split it. What the split controls is
-*which zip finishes first*, and therefore how much of its extraction
-runs for free under the other download. With an even split the bigger
-zip finished last and its 30s extraction was pure serial tail. Verified
-end-to-end on 28.1 w1: platform landed 24s before the app, and the
-extract tail dropped to 3.3s. Extracted tree diffs clean against a
-BcContainerHelper-populated cache (only `lastused` and the two Windows
-prerequisite installers differ, neither of which comes from the zip).
-
-Both `wait` calls have to stay in the top-level shell — bash can only
-wait on its own children, so moving them into a backgrounded helper
-fails with "not a child of this shell".
-
-### Company detection: OData page first, evaluation company, name only
-
-Both runners resolve the company from `ODataV4/Company`, **not**
-`api/v2.0/companies`, and pick the row with `Evaluation_Company` set.
-
-- `ODataV4/Company` is the exact URL the container healthcheck polls
-  every 2s, so it's warm: 3.8ms measured, vs 190ms for API v2.0.
-- API v2.0 lives in `_Exclude_APIV2_`, which is **not** in the keep set
-  on a minimal selective-clear boot. Asking for it first returns 404 on
-  exactly the lean configurations we recommend, and only the port-7052
-  fallback rescued the run.
-- `Evaluation_Company` matters because the demo database ships more than
-  one company — taking `value[0]` picks whichever sorts first.
-
-**There is no id-based form.** Both `al runtests --company` and the
-TestRunnerHub's `Initialize [company, "", 0]` take a company *name*. A
-hard-coded CRONUS GUID is not usable here even though the OData page
-exposes one, and the SystemId is baked per-version and per-country into
-Microsoft's `.bak` anyway. Pinning is done by name via `--company` /
-the `test_company` workflow input. In the workflows that has to be a
-bash **array** (`COMPANY_ARGS=(--company "$TEST_COMPANY")`) — company
-names contain spaces and `${TEST_COMPANY:+--company "$TEST_COMPANY"}`
-expands unquoted.
+**Where the time actually is,** for a consumer-shaped workload: BC boot
+(~3m of a 7m job), then tests, then app publish. The fetch phase is the
+dominant cost only for bc-linux's own thin smoke-test matrix.
 
 ### Known, not yet acted on: the post-NST extension publish
 
-Local boot breaks down as 8s prep/restore/R2R-seed → 25s NST startup →
-**31s publishing the test framework apps + TestRunnerExtension through
-the dev endpoint**. That last third is expensive because dev-endpoint
-publishes disable ReadyToRun:
+Local boot splits as 8s prep/restore/R2R-seed → 25s NST startup → **31s
+publishing the test framework apps + TestRunnerExtension through the dev
+endpoint**. That last third is expensive because dev-endpoint publishes
+disable ReadyToRun:
 
 ```
 Ready to run app Microsoft_Test Runner_… is disabled to run in this
@@ -324,12 +263,12 @@ environment. The app will be published as a normal app.
 ```
 
 so those apps get fully compiled at publish time, bypassing the R2R
-pre-seed. Two untaken options: skip the TestRunnerExtension publish
-entirely when the altool runner is active (it isn't used there), or
-write the `[NAV App Installed App]` tenant rows in SQL pre-NST instead
-of the stuck-publish wipe + republish dance, so the apps keep their R2R.
-The second is the one that would actually recover the time, and it
-means writing to BC's app tables directly.
+pre-seed. Two untaken options: skip the TestRunnerExtension publish when
+the altool runner is active (it isn't used there), or write the
+`[NAV App Installed App]` tenant rows in SQL pre-NST instead of the
+stuck-publish wipe + republish dance, so the apps keep their R2R. The
+second is the one that would actually recover the time, and it means
+writing to BC's app tables directly.
 
 ## JUnit XML test result emission
 

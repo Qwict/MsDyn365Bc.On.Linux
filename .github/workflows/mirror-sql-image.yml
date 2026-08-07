@@ -92,7 +92,21 @@ jobs:
           mir=$(effective_digests "$MIRROR") || mir=""
           echo "upstream image(s): $up"
           echo "mirror image(s):   ${mir:-<not published yet>}"
-          if [ "$up" = "$mir" ] && [ "${{ inputs.force }}" != "true" ]; then
+
+          # The zstd tag is what docker-compose.yml actually defaults to,
+          # so its presence is checked independently. Otherwise a run
+          # where the gzip copy succeeded and the zstd build failed would
+          # report "already current" forever, leaving every consumer on a
+          # stale SQL image with nothing flagging it. Existence is the
+          # test, not digest equality — recompressed layers necessarily
+          # hash differently from the gzip originals.
+          zstd_present=no
+          if docker buildx imagetools inspect --raw "$MIRROR_ZSTD" >/dev/null 2>&1; then
+            zstd_present=yes
+          fi
+          echo "zstd tag present:  $zstd_present"
+
+          if [ "$up" = "$mir" ] && [ "$zstd_present" = "yes" ] && [ "${{ inputs.force }}" != "true" ]; then
             echo "push=false" >> "$GITHUB_OUTPUT"
             echo "Mirror is already current — nothing to do."
           else
