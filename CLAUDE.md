@@ -333,6 +333,28 @@ container: 12 seeded entries, only 3 still valid, 11 of 14 published apps
 with no usable entry. So the pre-seed currently pays off for the baseline
 apps only.
 
+### Don't synthesize the tenant-install rows in SQL — it breaks the tenant
+
+Tried 2026-08-07 and reverted. The idea was to stop the stuck-publish
+wipe from deleting keep-set apps, and instead flip them to installed in
+place by inserting the two rows that distinguish "published" from
+"installed" (`[NAV App Installed App]` and `[Installed Application]`).
+Every column that isn't already on `[Published Application]` really is a
+constant, and the INSERTs run clean.
+
+BC then refuses to work:
+
+```
+Cannot install apps due to the state of the tenant: OperationalWithSyncPending
+The tenant 'default' is not accessible.
+```
+
+Installing an app does more than write those tables — there's tenant
+schema synchronization behind it, and hand-written rows leave the tenant
+in sync-pending, which takes every later publish down with it. Whatever
+replaces the wipe has to run BC's real install logic. The automation API
+below does; raw SQL does not.
+
 ### Installing a published app without republishing IS possible
 
 The design assumption that "without the management endpoint there's no way
