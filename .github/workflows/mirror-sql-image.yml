@@ -42,9 +42,9 @@ env:
   # SQL Server Linux image ships FTS — it's a separate mssql-server-fts
   # package — so AL's `OptimizeForTextSearch = true` cannot be installed on
   # the stock stack (issue #20). This variant is OPT-IN via BC_SQL_IMAGE and
-  # deliberately NOT the compose default: FTS more than doubles the image
-  # (1.68 GB → 3.61 GB uncompressed, measured), and the SQL pull is on the
-  # critical path of every CI run. Only pay for it if your apps need it.
+  # deliberately NOT the compose default: FTS adds ~550 MB (1.68 GB → 2.23 GB
+  # uncompressed, measured), and the SQL pull is on the critical path of every
+  # CI run. Only pay for it if your apps need it.
   MIRROR_FTS: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts
 
 jobs:
@@ -194,19 +194,38 @@ jobs:
         if: steps.compare.outputs.push == 'true'
         run: |
           set -e
+          # Extract the FTS package payload instead of `apt-get install`ing it.
+          #
+          # The base image ships SQL Server WITHOUT registering it in dpkg, so
+          # apt considers mssql-server "not installed" and pulls it in as a
+          # dependency of mssql-server-fts — reinstalling the whole ~1.2 GB
+          # engine on top of byte-identical files. The overlay filesystem then
+          # copies every one of those files up into the new layer. Measured:
+          # a 1.93 GB layer of which only ~410 MB (sqlservr.fts.sfp) was new.
+          #
+          # `apt-get download` + `dpkg-deb -x` takes the FTS payload alone and
+          # skips dependency resolution entirely. 1.93 GB layer -> 586 MB,
+          # total image 3.61 GB -> 2.23 GB. The engine finds sqlservr.fts.sfp
+          # on its own at startup; there is no postinst step that matters,
+          # which the functional check below proves rather than assumes.
           cat > Dockerfile.fts <<'EOF'
           FROM mcr.microsoft.com/mssql/server:2022-latest
           USER root
-          RUN apt-get update \
-           && apt-get install -y --no-install-recommends curl gnupg ca-certificates \
-           && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-                | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
-           && echo "deb [arch=amd64,armhf,arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/mssql-server-2022 jammy main" \
-                > /etc/apt/sources.list.d/mssql-server-2022.list \
-           && apt-get update \
-           && ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-server-fts \
-           && apt-get purge -y curl gnupg && apt-get autoremove -y \
-           && apt-get clean && rm -rf /var/lib/apt/lists/*
+          RUN set -eux; \
+              apt-get update; \
+              apt-get install -y --no-install-recommends curl gnupg ca-certificates; \
+              curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+                | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg; \
+              echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/mssql-server-2022 jammy main" \
+                > /etc/apt/sources.list.d/mssql-server-2022.list; \
+              apt-get update; \
+              cd /tmp; \
+              apt-get download mssql-server-fts; \
+              dpkg-deb -x mssql-server-fts_*.deb /; \
+              rm -f mssql-server-fts_*.deb; \
+              apt-get purge -y curl gnupg; apt-get autoremove -y; \
+              apt-get clean; \
+              rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/mssql-server-2022.list
           USER mssql
           EOF
           docker buildx build \
@@ -237,12 +256,38 @@ jobs:
                   -S localhost -U sa -P 'Passw0rd123!' -C -No -h -1 -W \
                   -Q "SET NOCOUNT ON; SELECT CONVERT(varchar,SERVERPROPERTY('IsFullTextInstalled'))" \
                 | tr -d '[:space:]')
-          docker rm -f fts-verify >/dev/null 2>&1 || true
           echo "IsFullTextInstalled = $got"
           if [ "$got" != "1" ]; then
+            docker rm -f fts-verify >/dev/null 2>&1 || true
             echo "ERROR: $MIRROR_FTS does not have Full-Text Search active."
             exit 1
           fi
+
+          # SERVERPROPERTY alone only proves the component is present. Since
+          # the image extracts the package payload without running its
+          # postinst, actually build a full-text index and query it — that is
+          # the operation BC performs for OptimizeForTextSearch, and it is the
+          # only check that would catch a missing registration step.
+          out=$(docker exec fts-verify /opt/mssql-tools18/bin/sqlcmd \
+                  -S localhost -U sa -P 'Passw0rd123!' -C -No -Q "
+          CREATE DATABASE ftsverify;
+          GO
+          USE ftsverify;
+          CREATE TABLE t (id INT NOT NULL CONSTRAINT PK_t PRIMARY KEY, txt NVARCHAR(200));
+          INSERT INTO t VALUES (1, N'business central on linux');
+          CREATE FULLTEXT CATALOG ftcat AS DEFAULT;
+          CREATE FULLTEXT INDEX ON t(txt) KEY INDEX PK_t;
+          GO
+          WAITFOR DELAY '00:00:10';
+          SELECT 'FTSMATCH=' + CONVERT(varchar,id) FROM t WHERE CONTAINS(txt, 'linux');
+          GO" 2>&1)
+          docker rm -f fts-verify >/dev/null 2>&1 || true
+          echo "$out"
+          if ! echo "$out" | grep -q "FTSMATCH=1"; then
+            echo "ERROR: $MIRROR_FTS could not create or query a full-text index."
+            exit 1
+          fi
+          echo "Full-text index created and queried successfully."
 
       # Pull it back on a clean daemon state to prove a consumer can, and
       # to record what it costs. A failure here means the zstd tag is

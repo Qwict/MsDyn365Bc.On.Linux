@@ -65,9 +65,9 @@ with:
   sql_image: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts
 ```
 
-It is **opt-in, not the default**: FTS more than doubles the image
-(1.68 GB → 3.61 GB uncompressed, measured), and the SQL pull sits on the
-critical path of every CI run. The tag is built and verified
+It is **opt-in, not the default**: FTS adds ~550 MB (1.68 GB → 2.23 GB
+uncompressed, measured), and the SQL pull sits on the critical path of
+every CI run. The tag is built and verified
 (`SERVERPROPERTY('IsFullTextInstalled') = 1`) by
 `.github/workflows/mirror-sql-image.yml` alongside the other mirrors.
 

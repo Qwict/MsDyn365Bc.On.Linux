@@ -26,8 +26,8 @@ services:
     #
     # Apps using AL's `OptimizeForTextSearch = true` need the Full-Text
     # Search component, which no official SQL Server Linux image ships.
-    # Use the :2022-fts variant for those — opt-in because FTS more than
-    # doubles the image size. See KNOWN-LIMITATIONS.md (issue #20):
+    # Use the :2022-fts variant for those — opt-in because FTS adds ~550 MB
+    # to the image. See KNOWN-LIMITATIONS.md (issue #20):
     #   BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts docker compose up -d
     image: ${BC_SQL_IMAGE:-ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd}
     environment:
