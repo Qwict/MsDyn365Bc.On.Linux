@@ -194,6 +194,16 @@ on:
         required: false
         type: number
         default: 45
+      health_timeout_minutes:
+        description: >-
+          How long to wait for the BC container to report healthy. Default 30.
+          BC normally reaches healthy in 1-2 minutes in CI, so the default is
+          mostly headroom for a slow artifact restore. Lower it for a leg that
+          is expected to fail — a preview BC version that cannot boot otherwise
+          burns the full 30 minutes doing nothing, on every run.
+        required: false
+        type: number
+        default: 30
 
       # ─── Analyzer / ruleset configuration ──────────────────────────────
       # All optional. Default behavior is "no analyzers, no ruleset" — same
@@ -800,7 +810,7 @@ jobs:
       - name: Wait for BC healthy
         working-directory: bc-linux
         run: |
-          ./scripts/wait-for-bc-healthy.sh 30
+          ./scripts/wait-for-bc-healthy.sh ${{ inputs.health_timeout_minutes }}
           bash scripts/workflow-summary.sh end BC_BOOT
 
       # ─── Phase 7: publish compiled apps to the now-running BC ────────

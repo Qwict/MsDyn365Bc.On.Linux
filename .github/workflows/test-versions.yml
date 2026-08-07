@@ -292,6 +292,11 @@ jobs:
       bc_country: w1
       bc_type: sandbox
       continue_on_error: true
+      # A preview version that cannot boot would otherwise sit in the default
+      # 30-minute health wait on every run. BC reaches healthy in 1-2 min in
+      # CI, so 8 is generous while capping the waste on a leg we expect to
+      # fail. Required legs keep the 30-minute default.
+      health_timeout_minutes: 8
       test_app_dirs: extensions/smoke-test
       runtime_version: auto
       codeunit_range: "70000|70001"
