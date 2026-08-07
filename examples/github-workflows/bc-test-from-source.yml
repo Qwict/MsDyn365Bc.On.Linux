@@ -266,9 +266,9 @@ jobs:
               --version "$TOOL" 2>&1; then
             echo "Installed as dotnet global tool"
             echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-            AL_TOOL_DIR=$(find "$HOME/.dotnet/tools/.store/$PKG" \
-              -type d -name "any" -path "*/tools/net8.0/any" 2>/dev/null \
-              | sort | tail -1)
+            # Locate alc by searching, not by assuming a TFM directory.
+            AL_TOOL_DIR=$(dirname "$(find "$HOME/.dotnet/tools/.store/$PKG" \
+              -type f -name alc 2>/dev/null | sort | tail -1)")
           else
             # Not a dotnet tool — download and extract the nupkg directly.
             echo "Package is not a dotnet global tool; extracting nupkg"
@@ -279,13 +279,23 @@ jobs:
               -o "$EXTRACT_DIR/pkg.zip"
             unzip -q -o "$EXTRACT_DIR/pkg.zip" -d "$EXTRACT_DIR"
             rm "$EXTRACT_DIR/pkg.zip"
-            # Prefer dotnet tool layout (tools/net8.0/any); fall back to lib/net8.0
-            if [ -d "$EXTRACT_DIR/tools/net8.0/any" ]; then
-              AL_TOOL_DIR="$EXTRACT_DIR/tools/net8.0/any"
-            else
-              AL_TOOL_DIR="$EXTRACT_DIR/lib/net8.0"
+            # Find alc wherever the package puts it. The TFM directory is NOT
+            # stable across AL majors: v17 ships lib/net8.0/alc, v18 ships
+            # lib/net10.0/alc plus a lib/net8.0 holding only analyzer DLLs —
+            # so a directory test on net8.0 finds the wrong place and
+            # succeeds. Hardcoding it made the BC 29 leg fail with exit 127.
+            # No runtime install is needed: alc is self-contained (its
+            # runtimeconfig declares includedFrameworks), verified for v17
+            # and v18.
+            ALC_PATH=$(find "$EXTRACT_DIR" -type f -name alc 2>/dev/null | sort | tail -1)
+            if [ -z "$ALC_PATH" ]; then
+              echo "No 'alc' binary found in $PKG $TOOL" >&2
+              find "$EXTRACT_DIR" -maxdepth 3 -type d | sed 's/^/  /' >&2
+              exit 1
             fi
-            chmod +x "$AL_TOOL_DIR/alc" 2>/dev/null || true
+            AL_TOOL_DIR=$(dirname "$ALC_PATH")
+            echo "Found alc at $ALC_PATH"
+            chmod +x "$ALC_PATH" 2>/dev/null || true
             # Create an AL wrapper so `AL compile ...` works in later steps.
             # The v16 dotnet tool ships AL.dll which routes the `compile`
             # subcommand; raw alc doesn't accept it — strip it here.

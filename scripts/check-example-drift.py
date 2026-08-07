@@ -80,6 +80,22 @@ FORBIDDEN = [
      "hardcoded AL compiler version — use scripts/resolve-al-tool-version.py"),
     (r'EFFECTIVE_RUNTIME="1[4-9]\.0"',
      "hardcoded AL runtime version — use resolve-al-tool-version.py --runtime"),
+    # Matches the real shape of this bug: the TFM appears on the line that
+    # ASSIGNS the tool dir (or in the find -path filter), while `alc` itself
+    # is referenced further down. An earlier version of this rule required
+    # both on one line and therefore caught nothing.
+    (r'AL_TOOL_DIR=.*(lib|tools)/net[0-9]+\.[0-9]+',
+     "hardcoded TFM directory for the AL tool dir — the AL package moves the "
+     "alc binary between majors (v17 lib/net8.0, v18 lib/net10.0), so this "
+     "breaks at the next release. Locate it with "
+     "`find \"$EXTRACT_DIR\" -type f -name alc` instead."),
+    (r'-path .*net[0-9]+\.[0-9]+',
+     "hardcoded TFM directory in a find filter — search for the alc file by "
+     "name rather than assuming which TFM directory holds it"),
+    (r'-d "\$EXTRACT_DIR/(lib|tools)/net[0-9]+\.[0-9]+',
+     "directory test on a hardcoded TFM — v18 ships a lib/net8.0 that holds "
+     "only analyzer DLLs, so this test succeeds and then points at a "
+     "directory with no alc in it"),
 ]
 
 SCRIPT_REF = re.compile(r"scripts/[A-Za-z0-9_.-]+\.(?:sh|py)")
