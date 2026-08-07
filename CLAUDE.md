@@ -302,6 +302,8 @@ explicit `--app-json` in the reusable workflows is now redundant but kept
 deliberately — it's idempotent (set union) and survives a future refactor
 of the auto-seed.
 
+`extensions/smoke-test` is the regression guard: it deliberately depends on Library Assert and **not** on Test Runner, so a broken seed fails the version matrix. It declared Test Runner until 2026-08-07, which is why the matrix stayed green while every example-pipeline consumer was broken. The reason is written at the top of `SmokeTest1.Codeunit.al` — don't 'fix' that app.json.
+
 `--no-test-runner-seed` opts out. Seed via `--app-json`, **not**
 `--extra-ids` with a hardcoded GUID list: the app.json route stays correct
 when TestRunnerExtension's dependencies change, and it keeps the "no
