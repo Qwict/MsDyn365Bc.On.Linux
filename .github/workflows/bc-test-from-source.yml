@@ -257,6 +257,53 @@ jobs:
       - name: Initialize timing
         run: bash bc-linux/scripts/workflow-summary.sh init
 
+      # ─── Phase 1.5: stage the optional ISV license ───────────────────
+      # When the consumer passed `bc_license` in the secrets: block, decode
+      # the base64 blob to a tempfile and export the env vars that wire it
+      # into the docker-compose mounts. The entrypoint will then import this
+      # license INSTEAD of the default Cronus.bclicense, before NST starts —
+      # no boot/import/restart cycle needed.
+      #
+      # This runs BEFORE the download phase specifically because that phase
+      # starts the sql service early (see below), and BC_LICENSE_HOST_PATH is
+      # part of the sql container's config (the license bind mount is on both
+      # services — OPENROWSET BULK reads it from SQL's filesystem). Staging
+      # the license afterwards would change sql's config hash and make the
+      # later `docker compose up -d` recreate the container, throwing away
+      # the head start. Nothing here depends on the artifacts.
+      #
+      # We must NOT print the secret length, decoded path contents, or
+      # anything else that could leak. Just write the file and propagate
+      # the env vars.
+      # We can NOT use `if: secrets.bc_license != ''` here — the `secrets`
+      # context isn't allowed in step `if:` expressions (verified by
+      # actionlint and confirmed by GitHub at parse time, which rejects
+      # the entire workflow file). Reading the secret into env at step
+      # level IS allowed, so we always run the step and skip its body
+      # when the env var is empty. Same shape used in bc-test-prebuilt.yml.
+      - name: Stage ISV license (if provided)
+        env:
+          BC_LICENSE_B64: ${{ secrets.bc_license }}
+        run: |
+          set -e
+          if [ -z "${BC_LICENSE_B64:-}" ]; then
+            echo "No bc_license secret provided — using default Cronus license"
+            exit 0
+          fi
+          LICENSE_PATH="$RUNNER_TEMP/bc-license.bclicense"
+          printf '%s' "$BC_LICENSE_B64" | base64 -d > "$LICENSE_PATH"
+          if [ ! -s "$LICENSE_PATH" ]; then
+            echo "ERROR: bc_license secret decoded to an empty file"
+            exit 1
+          fi
+          # Make sure the SQL container's UID can read it (mssql runs as
+          # uid 10001 by default; world-readable is the simplest thing
+          # that works without messing with ownership).
+          chmod 644 "$LICENSE_PATH"
+          echo "BC_LICENSE_HOST_PATH=$LICENSE_PATH" >> "$GITHUB_ENV"
+          echo "BC_LICENSE_FILE=/bc/custom-license.bclicense" >> "$GITHUB_ENV"
+          echo "ISV license staged for entrypoint import"
+
       # ─── Phase 2: artifact download + docker image pull (parallel) ───
       # Downloading the BC artifact from Microsoft's CDN and pulling the
       # bc-runner / mssql images from GHCR / mcr are independent network
@@ -285,6 +332,19 @@ jobs:
             # on "manifest unknown", turning a wrong or not-yet-published
             # tag into 60s of silent dead time.
             bash scripts/compose-pull.sh
+            # Start SQL Server as soon as its image is local, while the BC
+            # artifact is still downloading. The bc service has
+            # `depends_on: sql: condition: service_healthy`, so SQL's
+            # time-to-healthy is otherwise dead time sitting at the head of
+            # the BC boot window — the bc container stays in `Created` state
+            # until the healthcheck passes, and that check has a 5s interval
+            # on top. SQL needs nothing from the artifacts until the
+            # entrypoint restores the .bak, which is ~5s into its run, so by
+            # then this is long finished. Measured 5s to healthy on a 4-vCPU
+            # box; a 2-vCPU consumer runner is meaningfully slower.
+            # Non-fatal: if this fails, the later `docker compose up -d`
+            # starts sql the old way and we just lose the head start.
+            docker compose up -d sql || echo "WARN: early sql start failed — continuing"
           ) &
           PULL_PID=$!
           wait $ARTIFACT_PID || { echo "artifact download failed"; exit 1; }
@@ -328,45 +388,6 @@ jobs:
           echo "BC_CLEAR_ALL_APPS=selective" >> "$GITHUB_ENV"
           echo "BC_KEEP_APP_IDS=$KEEP_IDS" >> "$GITHUB_ENV"
           bash bc-linux/scripts/workflow-summary.sh end RESOLVE
-
-      # ─── Phase 3.5: stage the optional ISV license ───────────────────
-      # When the consumer passed `bc_license` in the secrets: block, decode
-      # the base64 blob to a tempfile and export the env vars that wire it
-      # into the docker-compose mounts. The entrypoint will then import this
-      # license INSTEAD of the default Cronus.bclicense, before NST starts —
-      # no boot/import/restart cycle needed.
-      #
-      # We must NOT print the secret length, decoded path contents, or
-      # anything else that could leak. Just write the file and propagate
-      # the env vars.
-      # We can NOT use `if: secrets.bc_license != ''` here — the `secrets`
-      # context isn't allowed in step `if:` expressions (verified by
-      # actionlint and confirmed by GitHub at parse time, which rejects
-      # the entire workflow file). Reading the secret into env at step
-      # level IS allowed, so we always run the step and skip its body
-      # when the env var is empty. Same shape used in bc-test-prebuilt.yml.
-      - name: Stage ISV license (if provided)
-        env:
-          BC_LICENSE_B64: ${{ secrets.bc_license }}
-        run: |
-          set -e
-          if [ -z "${BC_LICENSE_B64:-}" ]; then
-            echo "No bc_license secret provided — using default Cronus license"
-            exit 0
-          fi
-          LICENSE_PATH="$RUNNER_TEMP/bc-license.bclicense"
-          printf '%s' "$BC_LICENSE_B64" | base64 -d > "$LICENSE_PATH"
-          if [ ! -s "$LICENSE_PATH" ]; then
-            echo "ERROR: bc_license secret decoded to an empty file"
-            exit 1
-          fi
-          # Make sure the SQL container's UID can read it (mssql runs as
-          # uid 10001 by default; world-readable is the simplest thing
-          # that works without messing with ownership).
-          chmod 644 "$LICENSE_PATH"
-          echo "BC_LICENSE_HOST_PATH=$LICENSE_PATH" >> "$GITHUB_ENV"
-          echo "BC_LICENSE_FILE=/bc/custom-license.bclicense" >> "$GITHUB_ENV"
-          echo "ISV license staged for entrypoint import"
 
       # ─── Phase 4: kick off BC startup in the background ──────────────
       # docker compose up -d returns immediately. BC then takes ~5 minutes
