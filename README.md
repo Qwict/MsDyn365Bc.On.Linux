@@ -237,6 +237,20 @@ When `--app` is provided the script reads `SymbolReference.json` from the
 `--codeunit-range` if also provided. This avoids the SetupSuite call having
 to iterate tens of thousands of nonexistent IDs.
 
+**Which company tests run in:** by default both runners read the OData
+`Company` page and pick the evaluation (demo) company. That works on any
+localization without knowing the name in advance — the CRONUS company is
+called something different in every country, and the demo database ships
+a second company ("My Company") alongside it. Pass `--company` to pin it:
+
+```bash
+./scripts/run-tests.sh --app MyTestApp.app --company "CRONUS Deutschland GmbH"
+```
+
+It has to be the company *name*; neither the AL tool nor the
+TestRunnerHub accepts a company id. The CI workflows expose the same
+thing as a `test_company` input.
+
 Sample output:
 
 ```
@@ -313,6 +327,27 @@ BC_DEV_PORT=17049 docker compose up -d
 | `BC_CLIENT_PORT`  | `7085`           | WebSocket client services port (used by `run-tests.sh`)                      |
 | `BC_LICENSE_HOST_PATH` | unset       | Optional host path to a `.bclicense` file. Mounted into bc + sql containers and imported INSTEAD of the default Cronus license. See "Custom license" below. |
 | `BC_LICENSE_FILE` | unset            | Path INSIDE the container of the license file to import. Set to `/bc/custom-license.bclicense` together with `BC_LICENSE_HOST_PATH`. |
+| `BC_SQL_IMAGE`    | GHCR mirror      | SQL Server image. See "SQL Server image" below.                              |
+| `BC_DL_STREAMS`   | `16`             | Parallel byte-range streams per artifact zip (32 total across the two).       |
+| `BC_DL_BIG_SHARE` | `70`             | Percent of the stream budget given to the larger zip so it lands first and its extraction overlaps the other download. `50` restores an even split. |
+
+**SQL Server image:** the `sql` service defaults to
+`ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022`, a mirror of
+`mcr.microsoft.com/mssql/server:2022-latest` refreshed weekly by
+`.github/workflows/mirror-sql-image.yml`. The mirror exists because mcr
+serves GitHub runners at roughly 6 MB/s — the 625 MB image was taking
+~105s of every CI run and intermittently getting WAF-blocked. Point it
+anywhere you like:
+
+```bash
+# straight from Microsoft
+BC_SQL_IMAGE=mcr.microsoft.com/mssql/server:2022-latest docker compose up -d
+
+# your own registry or a pinned CU
+BC_SQL_IMAGE=registry.example.com/mssql/server:2022-CU14 docker compose up -d
+```
+
+The reusable CI workflows expose the same override as a `sql_image` input.
 
 **Custom license (ISVs / developer license):** by default the entrypoint
 imports the public Cronus.bclicense that ships with the BC artifact. To

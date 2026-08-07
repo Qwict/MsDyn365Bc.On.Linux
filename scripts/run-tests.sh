@@ -120,21 +120,61 @@ if [ ! -f "$TEST_RUNNER_APP" ]; then
 fi
 
 # === Company Auto-Detection ===
+# ODataV4/Company is tried FIRST, ahead of the API v2.0 endpoint:
+#   - It's the URL the container healthcheck polls every 2s, so it's
+#     already warm by the time any test runs.
+#   - API v2.0 lives in the _Exclude_APIV2_ extension, which is NOT in
+#     the keep set for a minimal selective-clear boot — asking for it
+#     first means a 404 and a pointless fallback hop on exactly the
+#     lean configurations we recommend.
+#   - It exposes Evaluation_Company, which is what actually identifies
+#     the CRONUS demo company. Taking value[0] blind picks whichever row
+#     sorts first, and the demo database ships more than one company
+#     ("My Company" is in there too).
+# The API v2.0 endpoints stay as fallbacks for servers where the OData
+# Company page isn't exposed.
 COMPANIES_JSON=""
-for url in "${BASE_URL}/api/v2.0/companies" "${_API_FALLBACK}/api/v2.0/companies"; do
+for url in "${BASE_URL}/ODataV4/Company" \
+           "${BASE_URL}/api/v2.0/companies" \
+           "${_API_FALLBACK}/api/v2.0/companies"; do
     COMPANIES_JSON=$(curl -sf --max-time 10 -u "$AUTH" "$url" 2>/dev/null || true)
     [ -n "$COMPANIES_JSON" ] && break
 done
-if [ -z "$COMPANIES_JSON" ]; then
-    COMPANIES_JSON=$(curl -sf --max-time 10 -u "$AUTH" "${BASE_URL}/ODataV4/Company" 2>/dev/null || true)
-fi
 if [ -z "$COMPANIES_JSON" ]; then
     echo "ERROR: Cannot reach BC. Is it running?"
     exit 1
 fi
 
-COMPANY_AUTO=$(echo "$COMPANIES_JSON" | py3 -c "import sys,json; c=json.load(sys.stdin)['value'][0]; m={k.lower():v for k,v in c.items()}; print(m.get('name',''))" 2>/dev/null || true)
-COMPANY_ID=$(echo "$COMPANIES_JSON" | py3 -c "import sys,json; c=json.load(sys.stdin)['value'][0]; m={k.lower():v for k,v in c.items()}; print(m.get('id',m.get('systemid','')))" 2>/dev/null || true)
+# Resolve name AND id in one pass. When --company was given, its row is
+# looked up by name so the id belongs to the requested company rather
+# than to whichever one auto-detect would have picked. Otherwise prefer
+# the evaluation (demo) company, falling back to the first row when the
+# payload doesn't carry the flag. Keys are lowercased because the OData
+# page and the API v2.0 entity spell them differently
+# (Evaluation_Company vs evaluationCompany, Id vs id vs SystemId).
+COMPANY_PICK=$(echo "$COMPANIES_JSON" | py3 -c "
+import sys, json
+want = sys.argv[1]
+rows = [{k.lower(): v for k, v in c.items()} for c in json.load(sys.stdin)['value']]
+if not rows:
+    sys.exit(0)
+if want:
+    chosen = next((r for r in rows if r.get('name', '') == want), None)
+    if chosen is None:
+        sys.stderr.write(
+            'ERROR: company %r not found on this server. Available: %s\n'
+            % (want, ', '.join(repr(r.get('name', '')) for r in rows))
+        )
+        sys.exit(1)
+else:
+    chosen = next(
+        (r for r in rows if r.get('evaluation_company') or r.get('evaluationcompany')),
+        rows[0],
+    )
+print('%s\t%s' % (chosen.get('name', ''), chosen.get('id', chosen.get('systemid', ''))))
+" "$COMPANY") || exit 1
+COMPANY_AUTO=${COMPANY_PICK%%$'\t'*}
+COMPANY_ID=${COMPANY_PICK#*$'\t'}
 [ -z "$COMPANY" ] && COMPANY="${COMPANY_AUTO:-CRONUS International Ltd.}"
 
 if [ -z "$COMPANY_ID" ]; then

@@ -159,18 +159,52 @@ def discover_test_codeunits(app_path: str, spans: list[tuple[int, int]]) -> list
     return sorted(set(ids))
 
 
+def _pick_company(rows: list[dict]) -> str | None:
+    """Choose the demo company out of a companies payload.
+
+    Prefers the evaluation company over "first row wins": the CRONUS demo
+    database ships more than one company ("My Company" is in there too),
+    and which one sorts first isn't something we control. Keys are
+    lowercased because the OData Company page and the API v2.0 entity
+    spell them differently (Evaluation_Company vs evaluationCompany).
+    """
+    norm = [{k.lower(): v for k, v in r.items()} for r in rows]
+    if not norm:
+        return None
+    chosen = next(
+        (r for r in norm if r.get("evaluation_company") or r.get("evaluationcompany")),
+        norm[0],
+    )
+    return chosen.get("name") or None
+
+
 def detect_company(base_urls: list[str], user: str, password: str) -> str | None:
-    """Auto-detect the first company name via the OData companies API."""
+    """Auto-detect the demo company name.
+
+    ODataV4/Company is tried first, ahead of API v2.0, for two reasons:
+
+      * It's the exact URL the bc-runner healthcheck polls every 2s, so
+        it's already warm — measured at 3.8ms against a live container.
+      * API v2.0 lives in the _Exclude_APIV2_ extension, which is not in
+        the keep set on a minimal selective-clear boot. Asking for it
+        first returns 404 on exactly the lean configurations we
+        recommend, and only the port-7052 fallback saves the run.
+
+    API v2.0 remains as a fallback for servers that don't expose the
+    OData Company page. Returns None when nothing answers, which the
+    caller treats as "let the server pick its default company".
+    """
     token = base64.b64encode(f"{user}:{password}".encode()).decode()
-    for base in base_urls:
-        url = f"{base}/api/v2.0/companies"
+    urls = [f"{base}/ODataV4/Company" for base in base_urls]
+    urls += [f"{base}/api/v2.0/companies" for base in base_urls]
+    for url in urls:
         req = urllib.request.Request(url, headers={"Authorization": f"Basic {token}"})
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            companies = data.get("value", [])
-            if companies:
-                return companies[0].get("name") or companies[0].get("Name")
+            name = _pick_company(data.get("value", []))
+            if name:
+                return name
         except (urllib.error.URLError, OSError, ValueError, KeyError):
             continue
     return None
@@ -980,13 +1014,24 @@ def main() -> int:
         return 1
 
     company = args.company
-    if not company:
+    if company:
+        print(f"Company: {company} (pinned via --company)")
+    else:
         origin = re.sub(r"(https?://[^:/]+).*", r"\1", args.base_url)
+        detect_start = time.monotonic()
         company = detect_company(
             [args.base_url, f"{origin}:7052/BC"], user, password
         )
+        detect_elapsed = time.monotonic() - detect_start
         if company:
-            print(f"Company: {company}")
+            print(f"Company: {company} (auto-detected in {detect_elapsed:.2f}s)")
+            # The warm OData path answers in milliseconds. Anything slow
+            # means we fell through to an endpoint that had to be compiled
+            # on demand, which is worth telling the caller about once
+            # rather than having them pay it on every run.
+            if detect_elapsed > 5:
+                print("      Tip: pin the company to skip this lookup — pass "
+                      "--company, or set the workflow's test_company input.")
         else:
             print("WARN: company auto-detect failed — letting the server pick the default company")
 

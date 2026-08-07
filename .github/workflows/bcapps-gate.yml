@@ -147,7 +147,10 @@ jobs:
           # if the hub connection breaks rather than silently change runners
           # between legs. Wide range = run every Subtype=Test codeunit the
           # script discovers in the app.
-          python3 scripts/run-tests-altool.py \
+          # -u: unbuffered, so results stream into the log as they happen
+          # instead of arriving in ~8KB batches whose timestamps are flush
+          # times rather than event times.
+          python3 -u scripts/run-tests-altool.py \
             --app "$APP" \
             --codeunit-range "1..2147483647" \
             --transport hub \
