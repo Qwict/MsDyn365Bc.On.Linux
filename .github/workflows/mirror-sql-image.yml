@@ -50,16 +50,40 @@ jobs:
         id: compare
         run: |
           set -uo pipefail
-          up=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$UPSTREAM" 2>/dev/null || echo "")
+
+          # Compare the IMAGE digests, not the top-level tag digests.
+          # mcr publishes mssql/server as a bare single manifest, while
+          # `imagetools create` always writes a manifest LIST — even when
+          # copying one source. The mirror therefore ends up as a
+          # one-entry list wrapping the identical image, and its top-level
+          # digest can never equal upstream's by construction. Comparing
+          # those directly made the first run report a false mismatch.
+          #
+          # So: resolve each tag to the set of image digests it actually
+          # points at — child digests for a list, the manifest's own
+          # digest for a bare manifest — and compare those.
+          # The jq filter drops attestation/provenance entries, which carry
+          # the synthetic "unknown/unknown" platform and aren't the image.
+          effective_digests() {
+            local ref="$1" raw
+            raw=$(docker buildx imagetools inspect --raw "$ref" 2>/dev/null) || return 1
+            if jq -e 'has("manifests")' >/dev/null <<<"$raw"; then
+              jq -r '[.manifests[] | select(.platform.os != "unknown") | .digest] | sort | join(",")' <<<"$raw"
+            else
+              docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref"
+            fi
+          }
+
+          up=$(effective_digests "$UPSTREAM") || up=""
           if [ -z "$up" ]; then
             echo "ERROR: could not read the upstream manifest for $UPSTREAM"
             exit 1
           fi
           # A missing mirror is the expected state on the very first run —
-          # empty digest, so the comparison below decides to push.
-          mir=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$MIRROR" 2>/dev/null || echo "")
-          echo "upstream: $up"
-          echo "mirror:   ${mir:-<not published yet>}"
+          # empty, so the comparison below decides to push.
+          mir=$(effective_digests "$MIRROR") || mir=""
+          echo "upstream image(s): $up"
+          echo "mirror image(s):   ${mir:-<not published yet>}"
           if [ "$up" = "$mir" ] && [ "${{ inputs.force }}" != "true" ]; then
             echo "push=false" >> "$GITHUB_OUTPUT"
             echo "Mirror is already current — nothing to do."
@@ -81,17 +105,20 @@ jobs:
             --tag "ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-latest" \
             "$UPSTREAM"
 
-      - name: Verify the mirror serves the same digest
+      - name: Verify the mirror serves the same image
         if: steps.compare.outputs.push == 'true'
         run: |
           set -e
-          got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$MIRROR")
+          # Same image-digest comparison as the compare step — see the
+          # comment there for why the top-level tag digests differ.
+          got=$(docker buildx imagetools inspect --raw "$MIRROR" \
+            | jq -r '[.manifests[] | select(.platform.os != "unknown") | .digest] | sort | join(",")')
           want='${{ steps.compare.outputs.digest }}'
           if [ "$got" != "$want" ]; then
-            echo "ERROR: mirror digest $got does not match upstream $want"
+            echo "ERROR: mirror serves image(s) $got, upstream has $want"
             exit 1
           fi
-          echo "Mirror published: $MIRROR ($got)"
+          echo "Mirror published: $MIRROR -> $got"
 
       - name: Summary
         run: |
