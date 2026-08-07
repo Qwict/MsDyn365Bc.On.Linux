@@ -1,6 +1,18 @@
 services:
   sql:
-    image: mcr.microsoft.com/mssql/server:2022-latest
+    # Defaults to our GHCR mirror of mcr.microsoft.com/mssql/server:2022-latest.
+    # mcr serves GitHub runners at roughly 6 MB/s, so the 625 MB SQL image took
+    # ~105s of every CI run and was the binding constraint of the parallel
+    # "download artifacts + pull images" phase (the artifacts themselves land
+    # in ~95s at 34 MB/s). It's also the reason the workflows wrap
+    # `docker compose pull` in a 5-attempt retry loop — mcr intermittently
+    # WAF-blocks runner IPs. GHCR is same-network for GitHub-hosted runners.
+    #
+    # The mirror is refreshed by .github/workflows/mirror-sql-image.yml.
+    # Override with BC_SQL_IMAGE to pull from mcr directly, from your own
+    # registry, or to pin a different SQL Server version:
+    #   BC_SQL_IMAGE=mcr.microsoft.com/mssql/server:2022-latest docker compose up -d
+    image: ${BC_SQL_IMAGE:-ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022}
     environment:
       ACCEPT_EULA: "Y"
       SA_PASSWORD: ${SA_PASSWORD:-Passw0rd123!}

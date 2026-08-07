@@ -62,6 +62,31 @@ on:
         required: false
         type: string
         default: "ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest"
+      test_company:
+        description: >-
+          Company to run the tests in. Blank (default) auto-detects: the
+          runner reads the OData Company page — already warm because the
+          container healthcheck polls it — and picks the evaluation
+          (demo) company, which is correct on every localization without
+          knowing its name in advance. Set this when your database has
+          more than one evaluation company, when tests must run in a
+          non-demo company, or to skip the lookup entirely. Must be the
+          company NAME as BC reports it (e.g. "CRONUS International
+          Ltd.", "CRONUS Deutschland GmbH").
+        required: false
+        type: string
+        default: ""
+      sql_image:
+        description: >-
+          Override the SQL Server image. Blank (default) uses bc-linux's
+          GHCR mirror of mcr.microsoft.com/mssql/server:2022-latest, which
+          pulls roughly 5x faster from GitHub-hosted runners than mcr does
+          and isn't subject to mcr's intermittent WAF blocks. Set this to
+          "mcr.microsoft.com/mssql/server:2022-latest" to go straight to
+          Microsoft, or to any image in your own registry.
+        required: false
+        type: string
+        default: ""
       bc_linux_ref:
         description: "Git ref of StefanMaron/MsDyn365Bc.On.Linux to check out for scripts"
         required: false
@@ -91,6 +116,10 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     env:
       BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
+      # Blank passes through to docker-compose's `${BC_SQL_IMAGE:-<mirror>}`
+      # default — `:-` treats empty and unset alike, so an unset input keeps
+      # the mirror rather than resolving to an empty image name.
+      BC_SQL_IMAGE: ${{ inputs.sql_image }}
       BC_VERSION: ${{ inputs.bc_version }}
       BC_COUNTRY: ${{ inputs.bc_country }}
       BC_TYPE: ${{ inputs.bc_type }}
@@ -256,11 +285,18 @@ jobs:
         working-directory: bc-linux
         env:
           TEST_APP_FILES: ${{ inputs.test_app_files }}
+          TEST_COMPANY: ${{ inputs.test_company }}
         run: |
           set -e
           bash scripts/workflow-summary.sh begin TESTS "Run AL tests"
           TESTS_TOTAL=0; TESTS_PASSED=0; TESTS_FAILED=0; CODEUNITS_TOTAL=0
           ANY_TEST_FAILED=0
+          # Array, not `${TEST_COMPANY:+...}`: company names contain spaces
+          # ("CRONUS International Ltd.") and the :+ form expands unquoted.
+          COMPANY_ARGS=()
+          if [ -n "${TEST_COMPANY:-}" ]; then
+            COMPANY_ARGS=(--company "$TEST_COMPANY")
+          fi
           # Per-app JUnit XML — see bc-test-from-source.yml for the rationale.
           mkdir -p ../build
           for app in $TEST_APP_FILES; do
@@ -273,6 +309,7 @@ jobs:
               --app "../project/$app" \
               --codeunit-range "${{ inputs.codeunit_range }}" \
               --junit-output "$junit_file" \
+              "${COMPANY_ARGS[@]}" \
               --timeout 30 2>&1 | tee "$tmplog"
             # `tee` always exits 0; capture run-tests.sh's real exit code.
             RUN_TESTS_RC=${PIPESTATUS[0]}

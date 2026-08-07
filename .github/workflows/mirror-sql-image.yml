@@ -1,0 +1,107 @@
+name: Mirror SQL Server image to GHCR
+
+# Copies mcr.microsoft.com/mssql/server:2022-latest into GHCR so CI runs
+# don't have to pull it from mcr.
+#
+# Why this exists: measured on a real consumer run (Pageworks #27), the
+# 625 MB SQL image took ~105s to pull from mcr — about 6 MB/s — while BC
+# artifacts downloaded from Azure Front Door at 34 MB/s in the same
+# window. That made the SQL pull the binding constraint of the whole
+# "download artifacts + pull images" phase. mcr also intermittently
+# WAF-blocks GitHub runner IPs, which is why the reusable workflows wrap
+# `docker compose pull` in a 5-attempt retry loop.
+#
+# The digest is compared before pushing, so a scheduled run that finds no
+# upstream change costs one manifest request and exits.
+
+on:
+  schedule:
+    # Weekly, Monday 04:17 UTC. Microsoft publishes mssql CU updates on no
+    # fixed cadence; weekly is enough to stay within a few days of latest.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Push even when the upstream digest already matches the mirror"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  UPSTREAM: mcr.microsoft.com/mssql/server:2022-latest
+  MIRROR: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare digests
+        id: compare
+        run: |
+          set -uo pipefail
+          up=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$UPSTREAM" 2>/dev/null || echo "")
+          if [ -z "$up" ]; then
+            echo "ERROR: could not read the upstream manifest for $UPSTREAM"
+            exit 1
+          fi
+          # A missing mirror is the expected state on the very first run —
+          # empty digest, so the comparison below decides to push.
+          mir=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$MIRROR" 2>/dev/null || echo "")
+          echo "upstream: $up"
+          echo "mirror:   ${mir:-<not published yet>}"
+          if [ "$up" = "$mir" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            echo "Mirror is already current — nothing to do."
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "digest=$up" >> "$GITHUB_OUTPUT"
+
+      # `imagetools create` copies the manifest and its layers registry-to-
+      # registry without pulling them onto the runner's disk, so this stays
+      # fast regardless of image size. It also preserves the multi-arch
+      # index rather than flattening to whatever the runner's platform is.
+      - name: Copy image to GHCR
+        if: steps.compare.outputs.push == 'true'
+        run: |
+          set -e
+          docker buildx imagetools create \
+            --tag "$MIRROR" \
+            --tag "ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-latest" \
+            "$UPSTREAM"
+
+      - name: Verify the mirror serves the same digest
+        if: steps.compare.outputs.push == 'true'
+        run: |
+          set -e
+          got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$MIRROR")
+          want='${{ steps.compare.outputs.digest }}'
+          if [ "$got" != "$want" ]; then
+            echo "ERROR: mirror digest $got does not match upstream $want"
+            exit 1
+          fi
+          echo "Mirror published: $MIRROR ($got)"
+
+      - name: Summary
+        run: |
+          {
+            echo "### SQL Server image mirror"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream | \`$UPSTREAM\` |"
+            echo "| Mirror | \`$MIRROR\` |"
+            echo "| Digest | \`${{ steps.compare.outputs.digest }}\` |"
+            echo "| Pushed | ${{ steps.compare.outputs.push }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

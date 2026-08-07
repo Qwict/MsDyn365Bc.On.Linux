@@ -79,6 +79,21 @@ on:
         required: false
         type: string
         default: ""
+      test_company:
+        description: >-
+          Company to run the tests in. Blank (default) auto-detects: the
+          runner reads the OData Company page — already warm because the
+          container healthcheck polls it — and picks the evaluation
+          (demo) company, which is correct on every localization without
+          knowing its name in advance. Set this when your database has
+          more than one evaluation company, when tests must run in a
+          non-demo company, or to skip the lookup entirely. Must be the
+          company NAME as BC reports it (e.g. "CRONUS International
+          Ltd.", "CRONUS Deutschland GmbH") — there is no id-based form,
+          both the AL tool and the TestRunnerHub take a name.
+        required: false
+        type: string
+        default: ""
       test_runner:
         description: >-
           Test execution engine. "auto" (default) = probe the live server
@@ -112,6 +127,17 @@ on:
         required: false
         type: string
         default: "ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest"
+      sql_image:
+        description: >-
+          Override the SQL Server image. Blank (default) uses bc-linux's
+          GHCR mirror of mcr.microsoft.com/mssql/server:2022-latest, which
+          pulls roughly 5x faster from GitHub-hosted runners than mcr does
+          and isn't subject to mcr's intermittent WAF blocks. Set this to
+          "mcr.microsoft.com/mssql/server:2022-latest" to go straight to
+          Microsoft, or to any image in your own registry.
+        required: false
+        type: string
+        default: ""
       bc_linux_ref:
         description: "Git ref of StefanMaron/MsDyn365Bc.On.Linux to check out for scripts (master, a tag, or a commit SHA)"
         required: false
@@ -205,6 +231,10 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     env:
       BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
+      # Blank passes through to docker-compose's `${BC_SQL_IMAGE:-<mirror>}`
+      # default — `:-` treats empty and unset alike, so an unset input keeps
+      # the mirror rather than resolving to an empty image name.
+      BC_SQL_IMAGE: ${{ inputs.sql_image }}
       BC_VERSION: ${{ inputs.bc_version }}
       BC_COUNTRY: ${{ inputs.bc_country }}
       BC_TYPE: ${{ inputs.bc_type }}
@@ -714,6 +744,7 @@ jobs:
         working-directory: bc-linux
         env:
           TEST_APP_DIRS: ${{ inputs.test_app_dirs }}
+          TEST_COMPANY: ${{ inputs.test_company }}
         run: |
           set -e
           bash scripts/workflow-summary.sh begin TESTS "Run AL tests"
@@ -731,6 +762,14 @@ jobs:
           # exactly the bug that wasted multiple debugging cycles in the
           # bc-copilot-blueprint session.
           ANY_TEST_FAILED=0
+          # Company names contain spaces ("CRONUS International Ltd."), so
+          # this has to be an array — `${TEST_COMPANY:+--company
+          # "$TEST_COMPANY"}` expands unquoted and would hand the runner
+          # four separate arguments.
+          COMPANY_ARGS=()
+          if [ -n "${TEST_COMPANY:-}" ]; then
+            COMPANY_ARGS=(--company "$TEST_COMPANY")
+          fi
           # ─── Select the effective test runner ─────────────────────────
           # "auto" probes the LIVE server (BC is healthy at this point):
           # GET /dev/metadata must advertise Dev API 7.0+ for the
@@ -777,18 +816,25 @@ jobs:
               # all codeunits (~0.4s saved per codeunit vs spawning `al
               # runtests` each time), falling back to the per-codeunit CLI
               # path if the hub connection can't be established.
-              python3 scripts/run-tests-altool.py \
+              #
+              # python3 -u: without it Python block-buffers stdout through
+              # the `| tee`, so results land in ~8KB batches and every
+              # timestamp in the log is the flush time, not the event time.
+              # That made a 3s startup look like 33s when reading the log.
+              python3 -u scripts/run-tests-altool.py \
                 --app "$app" \
                 --codeunit-range "${{ inputs.codeunit_range }}" \
                 --junit-output "$junit_file" \
                 --altool-cmd "$HOME/.dotnet/tools/al" \
                 --transport auto \
+                "${COMPANY_ARGS[@]}" \
                 --timeout 30 2>&1 | tee "$tmplog"
             else
               ./scripts/run-tests.sh \
                 --app "$app" \
                 --codeunit-range "${{ inputs.codeunit_range }}" \
                 --junit-output "$junit_file" \
+                "${COMPANY_ARGS[@]}" \
                 --timeout 30 2>&1 | tee "$tmplog"
             fi
             RUN_TESTS_RC=${PIPESTATUS[0]}
