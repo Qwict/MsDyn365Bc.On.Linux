@@ -269,7 +269,39 @@ def main():
                         help="BC artifact root (e.g. artifact-cache/27.5)")
     parser.add_argument("--extra-ids", default="",
                         help="Comma-separated extra GUIDs to always include")
+    parser.add_argument("--no-test-runner-seed", action="store_true",
+                        help="Don't auto-seed bc-linux's TestRunnerExtension "
+                             "app.json into the closure (see below). Only use "
+                             "this if the entrypoint won't publish it.")
     args = parser.parse_args()
+
+    # Auto-seed bc-linux's own TestRunnerExtension app.json.
+    #
+    # The entrypoint ALWAYS publishes /bc/testrunner/TestRunner.app, and that
+    # extension depends on Microsoft's Test Runner. Consumer test apps
+    # generally do NOT declare Test Runner — they declare Library Assert and
+    # Tests-TestLibraries. So without this seed Test Runner falls outside the
+    # closure, the selective filter deletes it in SQL, and the entrypoint's
+    # own publish then fails AL1024, taking test execution down with it.
+    #
+    # This used to be every caller's job. The two reusable workflows passed
+    # it; all four inlined example pipelines did not, so anyone who copied an
+    # example instead of calling the reusable workflow had a broken test run
+    # and an error message pointing nowhere near the cause. Seeding here
+    # rather than at the call site means the fix reaches those consumers too
+    # — they check bc-linux out at run time, so they get this script.
+    #
+    # Callers may still pass the same --app-json explicitly; the seed is a
+    # set union, so it's idempotent.
+    if not args.no_test_runner_seed:
+        tre = Path(__file__).resolve().parent.parent / "extensions" / "TestRunnerExtension" / "app.json"
+        if tre.is_file():
+            if str(tre) not in args.app_json:
+                args.app_json = list(args.app_json) + [str(tre)]
+        else:
+            print(f"WARN: TestRunnerExtension app.json not found at {tre} — "
+                  f"Test Runner may be missing from the keep set",
+                  file=sys.stderr)
 
     keep = set(BASELINE)
     extras = parse_id_list(args.extra_ids)

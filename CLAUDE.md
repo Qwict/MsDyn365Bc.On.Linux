@@ -279,23 +279,33 @@ dominant cost only for bc-linux's own thin smoke-test matrix.
 
 ### The TestRunnerExtension app.json seed is load-bearing
 
-`resolve-keep-app-ids.py` must be seeded with
-`bc-linux/extensions/TestRunnerExtension/app.json` in addition to the
-consumer's own app.json files. That extension declares a dependency on
-Microsoft's **Test Runner**, and most consumer test apps do not — they
-declare Library Assert and Tests-TestLibraries. Without the seed, Test
-Runner falls outside the closure, the selective filter deletes it in SQL,
-and the entrypoint's own TestRunnerExtension publish then fails `AL1024`.
+`resolve-keep-app-ids.py` **auto-seeds itself** with
+`extensions/TestRunnerExtension/app.json`, resolved relative to the
+script. Don't remove that.
 
-Reproduced with a test app declaring only Library Assert +
-Tests-TestLibraries: 11 apps without the seed (Test Runner absent), 12
-with it. All four inlined example pipelines were missing it while the two
-reusable workflows had it — fixed 2026-08-07.
+Why it has to be in the script and not at the call site: the entrypoint
+always publishes `/bc/testrunner/TestRunner.app`, and that extension
+depends on Microsoft's **Test Runner**, which consumer test apps generally
+do not declare — they declare Library Assert and Tests-TestLibraries.
+Without the seed Test Runner falls outside the closure, the selective
+filter deletes it in SQL, and the entrypoint's own publish then fails
+`AL1024`, taking test execution with it and pointing nowhere near the
+cause. Reproduced with a test app declaring only Library Assert +
+Tests-TestLibraries: 11 apps without the seed, 12 with it.
 
-Seed via `--app-json`, **not** `--extra-ids` with a hardcoded GUID list.
-The app.json route stays correct when TestRunnerExtension's dependencies
-change, and it keeps the "no hand-curated app lists" property the whole
-keep-set design rests on.
+It was the caller's job until 2026-08-07. The two reusable workflows
+passed it; all four inlined example pipelines did not, so every consumer
+who copied an example rather than calling the reusable workflow was
+broken. Seeding inside the script fixes those consumers without them
+changing anything, because they check bc-linux out at run time. The
+explicit `--app-json` in the reusable workflows is now redundant but kept
+deliberately — it's idempotent (set union) and survives a future refactor
+of the auto-seed.
+
+`--no-test-runner-seed` opts out. Seed via `--app-json`, **not**
+`--extra-ids` with a hardcoded GUID list: the app.json route stays correct
+when TestRunnerExtension's dependencies change, and it keeps the "no
+hand-curated app lists" property the whole keep-set design rests on.
 
 ### Why the post-NST publish costs what it does
 
