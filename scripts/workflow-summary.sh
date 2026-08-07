@@ -70,6 +70,21 @@ case "$cmd" in
         date +%s > "$TIMINGS_DIR/T_WORKFLOW_START"
         # Order tracking: phases are listed in this file in begin-call order.
         : > "$TIMINGS_DIR/PHASE_ORDER"
+
+        # Record the runner's hardware tier. GitHub gives PUBLIC repos
+        # 4-vCPU/16GB `ubuntu-latest` runners and PRIVATE repos 2-vCPU/7GB
+        # ones, same runner image either way — so two repos running the
+        # identical workflow can differ ~2x on anything CPU-bound (image
+        # layer decompression, zip extraction, AL compile) with nothing in
+        # the log to explain it. Comparing bc-linux's own matrix (public,
+        # ~30s fetch) against a private consumer repo (~60s fetch) cost a
+        # round of head-scratching before this line existed. Cheap to
+        # capture, so capture it.
+        {
+            echo "cpus=$(nproc 2>/dev/null || echo '?')"
+            echo "mem_gb=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo '?')"
+        } > "$TIMINGS_DIR/RUNNER_SPEC"
+        echo "[workflow-summary] runner: $(tr '\n' ' ' < "$TIMINGS_DIR/RUNNER_SPEC")"
         ;;
 
     begin)
@@ -157,8 +172,18 @@ case "$cmd" in
             failure)   STATUS_ICON="❌"; STATUS_LABEL="failure" ;;
             cancelled) STATUS_ICON="⚠️";  STATUS_LABEL="cancelled" ;;
         esac
+        # Runner tier line — see the `init` branch for why this matters
+        # when comparing durations between a public and a private repo.
+        RUNNER_LINE=""
+        if [ -f "$TIMINGS_DIR/RUNNER_SPEC" ]; then
+            R_CPUS=$(awk -F= '/^cpus=/{print $2}' "$TIMINGS_DIR/RUNNER_SPEC")
+            R_MEM=$(awk -F= '/^mem_gb=/{print $2}' "$TIMINGS_DIR/RUNNER_SPEC")
+            RUNNER_LINE="Runner: ${R_CPUS} vCPU / ${R_MEM} GB"
+        fi
         SUMMARY=$(cat <<EOF
 ## ${STATUS_ICON} Workflow ${STATUS_LABEL} — ${TOTAL_M}m ${TOTAL_S}s
+
+${RUNNER_LINE}
 
 | Phase | Duration | % of total |
 |---|---:|---:|
@@ -284,6 +309,18 @@ tags = {
     "ai.application.ver": os.environ.get("BC_VERSION", "unknown"),
 }
 
+# Runner spec recorded at `init`, if it's there. Missing file just means
+# an older init ran; the properties fall back to "unknown".
+_runner_spec = {}
+try:
+    with open(os.path.join(timings_dir, "RUNNER_SPEC")) as _f:
+        for _line in _f:
+            if "=" in _line:
+                _k, _, _v = _line.strip().partition("=")
+                _runner_spec[_k] = _v
+except OSError:
+    pass
+
 # Properties carried on every event so a single dimension query can
 # slice all of them by repo / BC version / OS / status.
 common_props = {
@@ -296,6 +333,11 @@ common_props = {
     "bc_type":         os.environ.get("BC_TYPE", "unknown"),
     "operation_id":    operation_id,
     "status":          job_status,  # success | failure | cancelled
+    # Runner hardware tier. GitHub hands public repos 4-vCPU/16GB
+    # ubuntu-latest and private repos 2-vCPU/7GB, so durations are only
+    # comparable across runs with the same value here.
+    "runner_cpus":     _runner_spec.get("cpus", "unknown"),
+    "runner_mem_gb":   _runner_spec.get("mem_gb", "unknown"),
 }
 
 def now_iso():
