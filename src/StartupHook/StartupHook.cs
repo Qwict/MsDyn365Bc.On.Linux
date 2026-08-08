@@ -120,8 +120,20 @@ using System.Threading.Tasks;
 ///   so out-of-folder paths proceed to the actual file operation and produce an honest
 ///   file-not-found instead of a bogus access-denied.
 ///
+/// Patch #29: NavDirectorySecurity.CreateSecurityForDomainDirectory (Nav.Ncl.dll)
+///   BC 29 reaches this from TempPathHelper.InitializeFolders during tenant configuration and
+///   constructs a System.Security.AccessControl.DirectorySecurity — Windows-only ACL APIs that
+///   throw PlatformNotSupportedException on Linux, killing NST startup. BC 27/28 never reach it
+///   (the call is gated on IServiceTopology.IsServiceRunningInLocalEnvironment, which Patch #9's
+///   Linux topology proxy forces false).
+///   Fix: return null, which is what the gated-off path produced. Applied on all versions.
+///
 /// JMP hooks work ONLY on BC methods (JIT-compiled). BCL methods are ReadyToRun pre-compiled
 /// and cannot be patched this way.
+///
+/// A JMP hook must be applied to a given method AT MOST ONCE. Re-applying one segfaults
+/// libcoreclr on .NET 10 with no managed frames (it was silently tolerated on .NET 8).
+/// ApplyJmpHook now detects and refuses a re-apply; see IsAlreadyJmpHooked.
 /// </summary>
 internal class StartupHook
 {
@@ -191,6 +203,26 @@ internal class StartupHook
             Console.WriteLine("[StartupHook] BC_DEBUG_FIRSTCHANCE=1: first-chance exception logging enabled");
         }
 
+        // Debug aid (opt-in): BC_DEBUG_ASSEMBLY_RESOLVE=1 logs every managed assembly
+        // the runtime could not find on its own. BC catches FileNotFoundException in
+        // several places and rethrows something generic (e.g. "LazyEx factory threw an
+        // exception") WITHOUT the assembly name, so this is the only way to learn what
+        // is actually missing. Far cheaper than BC_DEBUG_FIRSTCHANCE.
+        if (Environment.GetEnvironmentVariable("BC_DEBUG_ASSEMBLY_RESOLVE") == "1")
+        {
+            AssemblyLoadContext.Default.Resolving += (alc, name) =>
+            {
+                try { Console.Error.WriteLine($"[AsmResolve] Default ALC could not find: {name}"); } catch { }
+                return null;
+            };
+            AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
+            {
+                try { Console.Error.WriteLine($"[AsmResolve] AppDomain.AssemblyResolve: {e.Name} (requested by {e.RequestingAssembly?.GetName().Name ?? "?"})"); } catch { }
+                return null;
+            };
+            Console.WriteLine("[StartupHook] BC_DEBUG_ASSEMBLY_RESOLVE=1: assembly resolution failure logging enabled");
+        }
+
         // Patch #13 (early): Prevent Watson crash on unobserved task exceptions.
         // Watson's SendReport → GetRegistryValue crashes on Linux (NullRef, no registry).
         // BC registers its handler on NavEnvironment..ctor that calls Watson and crashes.
@@ -240,6 +272,15 @@ internal class StartupHook
 
         // Replace DLLs with stubs or cross-platform versions (unsigned, can copy directly)
         ReplaceWithStub("OpenTelemetry.Exporter.Geneva.dll", "Geneva ETW exporter");
+        // Overwriting the file is not enough once BC's reference version moves past the
+        // stub's. BC 29's Microsoft.BusinessCentral.Telemetry.OpenTelemetry asks for
+        // OpenTelemetry.Exporter.Geneva 1.15.2.1008; the stub is 1.9.0.62, so the default
+        // ALC rejects the file it just found and the load fails with FileNotFoundException.
+        // BC surfaces that as "LazyEx factory threw an exception" while constructing
+        // OpenTelemetryLogger<T>, which made every dev-endpoint publish return HTTP 500.
+        // Registering the bytes with the stub resolver satisfies ANY requested version,
+        // the same way System.Drawing.Common et al. are handled.
+        RegisterStubForResolver("OpenTelemetry.Exporter.Geneva");
         ReplaceWithStub("Microsoft.Data.SqlClient.dll", "cross-platform SqlClient");
 
         // Verify SqlClient loads correctly (catches version/dependency issues early)
@@ -420,6 +461,8 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
             PatchAssemblyProbing(args.LoadedAssembly);
+            // Patch #29: Windows ACL APIs in TempPathHelper (BC 29 reaches them).
+            PatchNavDirectorySecurity(args.LoadedAssembly);
         }
 
         // Patch #25: BaseDebugRuntime.IsDebuggedSessionClosedOrDisposed null-session NRE.
@@ -2320,6 +2363,26 @@ internal class StartupHook
     /// Move a signed DLL aside and register an assembly resolver that provides our
     /// unsigned stub via Assembly.Load(byte[]) — bypasses strong-name identity checks.
     /// </summary>
+    /// <summary>
+    /// Makes a stub in the hook directory available through <see cref="ResolveStubAssembly"/>
+    /// without moving any file aside. Use for stubs that were copied over the original in
+    /// place (ReplaceWithStub) but whose assembly identity no longer satisfies BC's
+    /// reference — the resolver answers regardless of requested version or public key token.
+    /// </summary>
+    private static void RegisterStubForResolver(string assemblyName)
+    {
+        var hookDir = Path.GetDirectoryName(typeof(StartupHook).Assembly.Location);
+        if (hookDir == null) return;
+        string stubDll = Path.Combine(hookDir, assemblyName + ".dll");
+        if (!File.Exists(stubDll))
+        {
+            Console.WriteLine($"[StartupHook] Stub for {assemblyName} not found — resolver not registered");
+            return;
+        }
+        _stubBytesMap[assemblyName] = File.ReadAllBytes(stubDll);
+        Console.WriteLine($"[StartupHook] {assemblyName} registered with stub resolver (version-agnostic)");
+    }
+
     private static void SetupStubWithResolver(string assemblyName)
     {
         string? baseDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -3140,6 +3203,25 @@ internal class StartupHook
     /// </summary>
     private static void ApplyJmpHook(MethodBase original, MethodInfo replacement, string name)
     {
+        // Never apply a JMP hook to a method that already carries one.
+        //
+        // Patch #14 and the Mono.Cecil 'checkfile' hook reach here TWICE: once from the
+        // AssemblyLoad event handler, then again from TryEagerPatch — whose
+        // Assembly.LoadFrom is what raised that event in the first place, so the eager
+        // call always landed on an already-hooked method. On .NET 8 the redundant
+        // re-apply was silently tolerated. On .NET 10 it kills the process:
+        // RuntimeHelpers.PrepareMethod against an overwritten entry point segfaults
+        // inside libcoreclr with no managed frames. Every OTHER hook in this file is
+        // applied exactly once, which is why only those two crashed BC 29.
+        //
+        // The check is per method instance, not a global flag, so an assembly loaded
+        // into a second ALC still gets its own hook.
+        //
+        // Our stub is `FF 25 00000000` — absolute indirect JMP with disp32 == 0. A
+        // genuine StubPrecode also starts FF 25 but always has a non-zero disp32, so
+        // the signature is unambiguous.
+        if (IsAlreadyJmpHooked(original, name)) return;
+
         RuntimeHelpers.PrepareMethod(original.MethodHandle);
         RuntimeHelpers.PrepareMethod(replacement.MethodHandle);
 
@@ -3216,6 +3298,30 @@ internal class StartupHook
             {
                 Console.WriteLine($"[StartupHook]   (compiled code patch failed: {ex.Message})");
             }
+        }
+    }
+
+    /// <summary>
+    /// True if this method's entry point already holds a JMP we wrote. Reads the entry
+    /// point WITHOUT calling PrepareMethod first — PrepareMethod is itself what dies on
+    /// an already-patched method under .NET 10.
+    /// </summary>
+    private static bool IsAlreadyJmpHooked(MethodBase original, string name)
+    {
+        try
+        {
+            IntPtr fp = original.MethodHandle.GetFunctionPointer();
+            byte[] head = new byte[6];
+            Marshal.Copy(fp, head, 0, 6);
+            bool hooked = head[0] == 0xFF && head[1] == 0x25
+                && head[2] == 0 && head[3] == 0 && head[4] == 0 && head[5] == 0;
+            if (hooked)
+                Console.WriteLine($"[StartupHook] {name} already hooked — skipping re-apply");
+            return hooked;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -3371,6 +3477,54 @@ internal class StartupHook
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static object? Replacement_ReturnNull() { return null; }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static object? Replacement_ReturnNull_1Arg(object? self) { return null; }
+
+    // ========================================================================
+    // Patch #29: NavDirectorySecurity.CreateSecurityForDomainDirectory
+    // ------------------------------------------------------------------------
+    // BC 29 calls this from TempPathHelper.InitializeFolders during
+    // NavTenantCollection.ConfigureTenants, and it constructs a
+    // System.Security.AccessControl.DirectorySecurity — Windows-only ACL APIs
+    // that throw PlatformNotSupportedException on Linux, taking NST startup
+    // with them.
+    //
+    // On BC 27/28 this never fired: the call was gated on
+    // IServiceTopology.IsServiceRunningInLocalEnvironment, which Patch #9's
+    // Linux topology proxy forces to false. BC 29 reaches it anyway, so the
+    // method itself is hooked to return null — which is exactly what the
+    // gated-off BC 28 path produced.
+    //
+    // Applied on every BC version. It is a no-op on 27/28 (the method is not
+    // reached there) and keeps working if Microsoft moves the gate again.
+    // ========================================================================
+    private static void PatchNavDirectorySecurity(Assembly navNclAsm)
+    {
+        if (IsPatchDisabled("29")) return;
+        try
+        {
+            var type = navNclAsm.GetType("Microsoft.Dynamics.Nav.Runtime.NavDirectorySecurity");
+            if (type == null) return;
+
+            foreach (var m in type.GetMethods(BindingFlags.Static | BindingFlags.Instance
+                                              | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (m.Name != "CreateSecurityForDomainDirectory") continue;
+                if (m.GetParameters().Length != 0) continue;
+
+                var replacement = typeof(StartupHook).GetMethod(
+                    m.IsStatic ? nameof(Replacement_ReturnNull) : nameof(Replacement_ReturnNull_1Arg),
+                    BindingFlags.Public | BindingFlags.Static)!;
+                ApplyJmpHook(m, replacement, "NavDirectorySecurity.CreateSecurityForDomainDirectory (Patch #29)");
+                Console.WriteLine("[StartupHook] Patch #29: CreateSecurityForDomainDirectory returns null (Windows ACLs unavailable)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #29 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
 
 
     // --- Patch #2: NavEnvironment replacements ---

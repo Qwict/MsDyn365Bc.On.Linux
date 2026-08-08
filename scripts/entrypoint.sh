@@ -18,16 +18,18 @@ log_step() {
 # Restore runtime DLLs from .bak if they exist (container restart recovery).
 # Patch #15 renames runtime DLLs AFTER BC loads them into memory.
 # On restart, BC needs the real DLLs to boot, so we restore first.
-RUNTIME_DIR=$(ls -d /usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.* 2>/dev/null | head -1)
-if [ -n "$RUNTIME_DIR" ]; then
-    RESTORE_COUNT=0
+# The image ships more than one shared framework (net8.0 for BC 27/28, net10.0
+# for BC 29+), so sweep all of them — we don't know yet which one this BC needs.
+RESTORE_COUNT=0
+for RUNTIME_DIR in /usr/share/dotnet/shared/Microsoft.NETCore.App/*/; do
+    [ -d "$RUNTIME_DIR" ] || continue
     for bak in "$RUNTIME_DIR"/*.dll.bak; do
         [ -f "$bak" ] || continue
         mv "$bak" "${bak%.bak}"
         RESTORE_COUNT=$((RESTORE_COUNT + 1))
     done
-    [ $RESTORE_COUNT -gt 0 ] && log_step "Restored $RESTORE_COUNT runtime DLLs from .bak (restart recovery)"
-fi
+done
+[ $RESTORE_COUNT -gt 0 ] && log_step "Restored $RESTORE_COUNT runtime DLLs from .bak (restart recovery)"
 
 BC_TYPE="${BC_TYPE:-sandbox}"
 BC_VERSION="${BC_VERSION:-27.5.46862.48004}"
@@ -165,9 +167,78 @@ if [ -n "$WC_DIR" ] && [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Client.Action
     echo "[entrypoint] Copied WebClient DLLs for TestPage support"
 fi
 
+# =============================================================================
+# .NET runtime selection (must run every container start)
+# =============================================================================
+# BC 27/28 are net8.0 apps, BC 29 is net10.0. The image ships BOTH shared
+# frameworks, so the only thing that has to be version-aware is where our
+# framework-impersonating stubs get copied and which reference assemblies the
+# server-side AL compiler sees. Read the answer straight off BC's own
+# runtimeconfig instead of mapping it from the BC major — that file IS the
+# contract the host uses to pick a framework, so it cannot drift.
+BC_FX_VERSION=$(python3 - "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.runtimeconfig.json" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    rc = json.load(open(sys.argv[1]))["runtimeOptions"]
+except Exception:
+    sys.exit(1)
+fws = rc.get("frameworks") or ([rc["framework"]] if "framework" in rc else [])
+for fw in fws:
+    if fw.get("name") == "Microsoft.NETCore.App":
+        print(fw.get("version", ""))
+        break
+PYEOF
+)
+BC_FX_MAJOR="${BC_FX_VERSION%%.*}"
+case "$BC_FX_MAJOR" in
+    8|10) : ;;
+    *)
+        log_step "WARN: could not read a supported framework version from Microsoft.Dynamics.Nav.Server.runtimeconfig.json (got '${BC_FX_VERSION:-<none>}') — assuming .NET 8"
+        BC_FX_MAJOR=8
+        ;;
+esac
+
+NETCORE_RUNTIME_DIR=$(ls -d /usr/share/dotnet/shared/Microsoft.NETCore.App/${BC_FX_MAJOR}.0.* 2>/dev/null | sort -V | tail -1)
+ASPNET_RUNTIME_DIR=$(ls -d /usr/share/dotnet/shared/Microsoft.AspNetCore.App/${BC_FX_MAJOR}.0.* 2>/dev/null | sort -V | tail -1)
+if [ -z "$NETCORE_RUNTIME_DIR" ] || [ -z "$ASPNET_RUNTIME_DIR" ]; then
+    log_step "FATAL: BC needs .NET ${BC_FX_MAJOR}.0 but that shared framework is not installed in this image"
+    ls -d /usr/share/dotnet/shared/*/* 2>/dev/null
+    exit 1
+fi
+
+# Per-runtime asset selection. Defaults are the .NET 8 set (unchanged for BC 27/28).
+REFASM_DIR=/bc/refasm
+ADDINS_DRAWING_STUB=/bc/addins-overlay/System.Drawing.Common.dll
+if [ "$BC_FX_MAJOR" = "10" ]; then
+    REFASM_DIR=/bc/refasm-net10
+    ADDINS_DRAWING_STUB=/bc/addins-overlay/System.Drawing.Common.net10.dll
+    # The stubs the StartupHook serves through its resolver are read from the
+    # hook's own directory (SetupStubWithResolver uses the hook assembly's path),
+    # so the net10 flavours have to land there rather than being pointed at.
+    if [ -d /bc/hook-net10 ]; then
+        cp /bc/hook-net10/*.dll /bc/hook/
+        log_step "Overlaid net10.0 stub assemblies onto /bc/hook"
+    fi
+fi
+log_step "BC targets .NET ${BC_FX_VERSION:-unknown} — runtime $NETCORE_RUNTIME_DIR, refasm $REFASM_DIR"
+
 # Override framework DLLs (must run every container start, not just first setup)
-cp /bc/hook/System.Security.Principal.Windows.dll /usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.*/
-cp /bc/hook/Microsoft.AspNetCore.Server.HttpSys.dll /usr/share/dotnet/shared/Microsoft.AspNetCore.App/8.0.*/
+cp /bc/hook/System.Security.Principal.Windows.dll "$NETCORE_RUNTIME_DIR/"
+cp /bc/hook/Microsoft.AspNetCore.Server.HttpSys.dll "$ASPNET_RUNTIME_DIR/"
+# BC 29's Nav.Ncl references OpenTelemetry exporter assemblies that the artifact
+# doesn't ship, so NavEnvironment's ctor dies with FileNotFoundException before
+# the NST comes up. Stage the real package assemblies, but only the ones Ncl
+# actually references and the service dir actually lacks — BC 27/28 reference
+# none of them, so this is a no-op there.
+for otel in /bc/natives/otel/*.dll; do
+    [ -f "$otel" ] || continue
+    otel_name=$(basename "$otel" .dll)
+    [ -f "$SERVICE_DIR/$otel_name.dll" ] && continue
+    grep -aq "$otel_name" "$SERVICE_DIR/Microsoft.Dynamics.Nav.Ncl.dll" 2>/dev/null || continue
+    cp "$otel" "$SERVICE_DIR/"
+    log_step "Staged $otel_name.dll (referenced by Nav.Ncl, missing from artifact)"
+done
+
 # Replace stub DLLs in service dir
 for stub in OpenTelemetry.Exporter.Geneva.dll Microsoft.Data.SqlClient.dll; do
     if [ -f "/bc/hook/$stub" ]; then
@@ -247,10 +318,10 @@ ADDINS_DIR="$SERVICE_DIR/Add-Ins"
 #      (eliminates type identity duplication between AL code and BC DLL params)
 #   3. Merged assemblies: netstandard/OpenXml/Drawing/Core with resolved type-forwards
 #   4. DrawingStub: compile-time System.Drawing.Common with framework type refs
-if [ ! -f "$ADDINS_DIR/System.Runtime.dll" ] && [ -d /bc/refasm ]; then
-    # Layer 1: base reference assemblies
-    cp /bc/refasm/*.dll "$ADDINS_DIR/" 2>/dev/null || true
-    log_step "Copied .NET reference assemblies to Add-Ins ($(ls /bc/refasm/*.dll 2>/dev/null | wc -l) files)"
+if [ ! -f "$ADDINS_DIR/System.Runtime.dll" ] && [ -d "$REFASM_DIR" ]; then
+    # Layer 1: base reference assemblies (matched to the runtime BC targets)
+    cp "$REFASM_DIR"/*.dll "$ADDINS_DIR/" 2>/dev/null || true
+    log_step "Copied .NET reference assemblies to Add-Ins ($(ls "$REFASM_DIR"/*.dll 2>/dev/null | wc -l) files from $REFASM_DIR)"
 
     # Layer 2: forwarding assemblies (override refasm with type-forwards to netstandard)
     if [ -d /bc/patched/refasm-forwarding ]; then
@@ -269,8 +340,8 @@ if [ ! -f "$ADDINS_DIR/System.Runtime.dll" ] && [ -d /bc/refasm ]; then
     log_step "Applied merged type-forward assemblies"
 
     # Layer 4: DrawingStub for compile-time (uses framework Color/Rectangle refs)
-    if [ -f /bc/addins-overlay/System.Drawing.Common.dll ]; then
-        cp /bc/addins-overlay/System.Drawing.Common.dll "$ADDINS_DIR/System.Drawing.Common.dll"
+    if [ -f "$ADDINS_DRAWING_STUB" ]; then
+        cp "$ADDINS_DRAWING_STUB" "$ADDINS_DIR/System.Drawing.Common.dll"
         log_step "Applied DrawingStub to Add-Ins (compile-time)"
     fi
 
