@@ -157,10 +157,32 @@ jobs:
         echo "url=$URL" >> $GITHUB_OUTPUT
 
   build-image:
-    # Build the bc-runner image from THIS commit as a compile/smoke check,
-    # but never push it from this workflow. test-versions consumes an existing
-    # repository image tag for runtime execution.
+    # Build the bc-runner image from THIS commit AND run the matrix against
+    # it, by pushing a throwaway `ci-<sha>` tag.
+    #
+    # This job used to build with `push: false` and then hand the matrix
+    # `:latest` — i.e. it verified that the current commit still *builds*,
+    # then tested a completely different image. Any change to src/Dockerfile
+    # (or anything else baked into the image) was therefore untestable on a
+    # branch: the build succeeded, the tests ran against whatever master last
+    # published, and the run went green while proving nothing about the diff.
+    #
+    # It bit for real on `net10-integration`. That branch adds the .NET 10
+    # runtime to the image so BC 29 can start; the preview leg still failed
+    # with "You must install or update .NET ... 10.0.0 ... The following
+    # frameworks were found: 8.0.29", because it booted master's .NET 8
+    # `:latest`. The summary's "known-expected failure: BC 29 targets .NET 10
+    # while the image ships .NET 8" note made that read as nothing new.
+    #
+    # `ci-<sha>` deliberately is NOT `:latest` and NOT the bare `:<sha>` that
+    # build-image.yml publishes from master — this workflow must never move
+    # the tags consumers pull, and a `ci-` prefix keeps untested branch builds
+    # visibly distinct from published ones. They accumulate in GHCR; the
+    # prefix is what makes them safe to prune in bulk if that ever matters.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     outputs:
       runner_image: ${{ steps.select-image.outputs.runner_image }}
     steps:
@@ -169,25 +191,59 @@ jobs:
     - name: Set lowercase image name
       run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/bc-runner" >> $GITHUB_ENV
 
+    # A pull_request from a fork gets a read-only GITHUB_TOKEN, so it cannot
+    # push to GHCR at all. Those runs keep the old behaviour (build as a
+    # compile check, test against `:latest`) rather than failing outright —
+    # but they say so, because that combination cannot validate an image
+    # change and a green run must not be mistaken for one that did.
+    - id: can-push
+      name: Decide whether this run can push an image
+      run: |
+        if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+          echo "value=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "value=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Log in to GHCR
+      if: steps.can-push.outputs.value == 'true'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Build BC runner image (no push)
+    - name: Build BC runner image
       uses: docker/build-push-action@v6
       with:
         context: .
         file: src/Dockerfile
-        push: false
-        # Keep build acceleration without requiring registry push rights.
+        push: ${{ steps.can-push.outputs.value == 'true' }}
+        tags: ${{ env.IMAGE }}:ci-${{ github.sha }}
+        # Stays on the GHA cache rather than the registry `:cache` tag that
+        # build-image.yml uses: this job also has to work on fork PRs, which
+        # have no registry write access at all.
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
     - id: select-image
       name: Select runner image reference
-      # The build job verifies the current commit still builds successfully.
-      # The matrix/container test jobs intentionally run against the latest
-      # published runner image because this workflow does not push.
-      run: echo "runner_image=${{ env.IMAGE }}:latest" >> "$GITHUB_OUTPUT"
+      run: |
+        if [ "${{ steps.can-push.outputs.value }}" = "true" ]; then
+          REF="${{ env.IMAGE }}:ci-${{ github.sha }}"
+          echo "Testing the image built from this commit: $REF"
+        else
+          REF="${{ env.IMAGE }}:latest"
+          echo "::warning::Fork PR: GITHUB_TOKEN cannot push to GHCR, so the"
+          echo "::warning::matrix runs against the published $REF, NOT the image"
+          echo "::warning::built from this commit. Image changes in this PR are"
+          echo "::warning::compile-checked only — re-run from a branch in this"
+          echo "::warning::repository to actually test them."
+        fi
+        echo "runner_image=$REF" >> "$GITHUB_OUTPUT"
 
   # ─── Matrix test: each BC version runs through the canonical reusable
   #     workflow with the smoke test extension. The reusable workflow

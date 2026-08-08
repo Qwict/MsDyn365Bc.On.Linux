@@ -52,8 +52,9 @@ jobs:
         tags: |
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-        # Share registry cache with test-versions.yml's inline build job
-        # so the two workflows reuse each other's layers instead of
-        # rebuilding from scratch on every push.
+        # Registry-backed layer cache for this workflow's own rebuilds.
+        # test-versions.yml's build job deliberately does NOT share it: that
+        # job has to work on fork PRs, which have no registry write access,
+        # so it caches to type=gha instead.
         cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache
         cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache,mode=max
