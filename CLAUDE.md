@@ -622,9 +622,40 @@ The bc-linux project ships **three** reusable workflows in
 
 `build-image.yml` builds and publishes the bc-runner image to
 `ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner` on every push
-that touches `src/`, `scripts/`, or `extensions/`. Both
-`build-image.yml` and `test-versions.yml`'s inline build job share
-registry layer cache via the same `:cache` tag.
+to master that touches `src/`, `scripts/`, or `extensions/`, tagging
+`:latest` and `:<sha>`. It caches layers to the registry `:cache` tag;
+`test-versions.yml`'s build job caches to `type=gha` instead, because
+it also has to run on fork PRs, which cannot write to the registry.
+
+### test-versions.yml tests the image it just built
+
+`test-versions.yml`'s `build-image` job pushes a throwaway
+**`ci-<sha>`** tag and feeds that to every matrix leg, required and
+preview. It must never push `:latest` or the bare `:<sha>` —
+those are what consumers pull and what `build-image.yml` publishes
+from master, and this workflow runs on arbitrary branches.
+
+Until 2026-08 the job built with `push: false` and then handed the
+matrix `:latest`. So it verified that the current commit still *built*
+and then tested a different image entirely: **no change to
+`src/Dockerfile` — or to anything else baked into the image — was
+testable on a branch.** The run went green having proven nothing about
+the diff.
+
+That is what hid the .NET 10 work on `net10-integration`. The branch
+adds the .NET 10 runtime so BC 29's NST can start; the BC 29 preview
+leg still died in the host resolver (`Framework:
+'Microsoft.NETCore.App', version '10.0.0'` … `The following frameworks
+were found: 8.0.29`) because it booted master's .NET 8 `:latest`. Two
+things kept it quiet: 27/28 pass fine on the stale image so the run
+concluded `success`, and `preview-note` prints "known-expected failure:
+BC 29 targets .NET 10 while the image ships .NET 8" — true here, but
+for the wrong reason, and it reads as nothing new.
+
+Fork PRs are the one exception: their `GITHUB_TOKEN` is read-only, so
+they fall back to building as a compile check and testing `:latest`.
+That path emits `::warning::` lines saying the image change is
+untested — don't make it silent.
 
 Trigger `test-versions` manually with a `versions: "27.0,28.1"`
 input to test specific versions — that input short-circuits discovery
