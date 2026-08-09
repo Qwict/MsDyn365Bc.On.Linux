@@ -41,30 +41,114 @@ SQL_SERVER="${SQL_SERVER:-sql}"
 ARTIFACTS="/bc/artifacts"
 SERVICE_DIR="/bc/service"
 
+# Same shape as the .bak restore above, for the one file BC's own boot rewrites
+# inside the volume. The Reporting Service .exe is swapped for a sleep stub
+# AFTER the dev endpoint answers, because NST's startup probes the real PE's
+# assembly metadata and has to find it there. `/bc/service` outlives the
+# container, so without this the next boot hands that probe a /bin/sh script
+# instead — it happens to survive, but a warm boot then differs from a cold one
+# in a way nothing reports. Restoring here makes the post-start swap re-run
+# every boot, which is what the swap's own `[ ! -f .win ]` guard assumes.
+REPORT_EXE_AT_BOOT="$SERVICE_DIR/SideServices/Microsoft.BusinessCentral.Reporting.Service.exe"
+if [ -f "${REPORT_EXE_AT_BOOT}.win" ]; then
+    mv -f "${REPORT_EXE_AT_BOOT}.win" "$REPORT_EXE_AT_BOOT"
+    echo "[entrypoint] Restored the real Reporting Service .exe (stub is re-applied once NST is up)"
+fi
+
 # =============================================================================
 # Step 1: Download artifacts if not already present
 # =============================================================================
 STEP1_START=$(date +%s)
-if [ ! -f "$ARTIFACTS/app/manifest.json" ]; then
-    if [ "$BC_ARTIFACT_URL" = "skip" ]; then
+
+# Is what's on disk the artifact set THIS container was asked for?
+#
+# `/bc/artifacts` outlives the container in both deployments that matter: the
+# `bc-artifacts` named volume locally, and a workspace bind mount that a
+# self-hosted runner reuses between jobs. Until this check existed the guard
+# was "does app/manifest.json exist" — so changing BC_VERSION without
+# `down -v` silently booted the PREVIOUS version's artifacts, and the only
+# symptom was BC reporting a version nobody asked for.
+#
+# Deliberately network-free. download-artifacts.sh re-resolves a short version
+# against Microsoft's index to pick up hotfixes, which is right on the host but
+# wrong here: in CI the host already resolved and downloaded, so a hotfix
+# published in the seconds since would make the container wipe the host's
+# artifacts and re-fetch ~2 GB in the middle of BC boot. The container's job is
+# to use what it was given, and only fetch when it was given nothing usable.
+ARTIFACT_STAMP="$ARTIFACTS/.bc-artifact-cache"
+if [ -n "$BC_ARTIFACT_URL" ] && [ "$BC_ARTIFACT_URL" != "skip" ]; then
+    WANT_ARTIFACTS="url|$BC_ARTIFACT_URL"
+else
+    WANT_ARTIFACTS="args|$BC_TYPE|$BC_VERSION|${BC_COUNTRY,,}"
+fi
+
+artifacts_intact() {
+    [ -f "$ARTIFACTS/app/manifest.json" ] && [ -d "$ARTIFACTS/platform/ServiceTier" ]
+}
+
+# "hit" | "stale" | "miss"
+artifact_cache_state() {
+    artifacts_intact || { echo miss; return; }
+    local have
+    have=$(sed -n 's|^request=||p' "$ARTIFACT_STAMP" 2>/dev/null | head -1)
+    if [ -n "$have" ]; then
+        [ "$have" = "$WANT_ARTIFACTS" ] && echo hit || echo "stale:downloaded for $have"
+        return
+    fi
+    # No stamp: either artifacts staged by hand (BC_ARTIFACT_URL=skip, the
+    # macOS overlay) or a volume that predates the stamp. Fall back to the
+    # manifest, which carries the version/country for the app half. Only
+    # contradiction counts as stale — a manifest without those fields is not
+    # evidence of anything, so trust the dir as this script always used to.
+    local mismatch
+    mismatch=$(BC_WANT_VERSION="$BC_VERSION" BC_WANT_COUNTRY="${BC_COUNTRY,,}" \
+        python3 - "$ARTIFACTS/app/manifest.json" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+ver, country = str(m.get('version', '')), str(m.get('country', '')).lower()
+want_ver, want_country = os.environ['BC_WANT_VERSION'], os.environ['BC_WANT_COUNTRY']
+# Requested version is a prefix of the full one ("28.3" vs "28.3.12345.67").
+if ver and want_ver and not (ver == want_ver or ver.startswith(want_ver + '.')):
+    print(f"version {ver} != requested {want_ver}")
+elif country and want_country and country != want_country:
+    print(f"country {country} != requested {want_country}")
+PYEOF
+)
+    [ -n "$mismatch" ] && echo "stale:$mismatch" || echo hit
+}
+
+if [ "$BC_ARTIFACT_URL" = "skip" ]; then
+    if ! artifacts_intact; then
         log_step "Waiting for artifacts to be provided externally..."
         # Wait for BOTH app manifest AND platform ServiceTier to be present
         for i in $(seq 1 120); do
-            [ -f "$ARTIFACTS/app/manifest.json" ] && \
-            [ -d "$ARTIFACTS/platform/ServiceTier" ] && break
+            artifacts_intact && break
             sleep 2
         done
         [ -f "$ARTIFACTS/app/manifest.json" ] || { log_step "ERROR: App artifacts not provided"; exit 1; }
         [ -d "$ARTIFACTS/platform/ServiceTier" ] || { log_step "ERROR: Platform artifacts not provided"; ls -la "$ARTIFACTS/platform/" 2>/dev/null; exit 1; }
-    elif [ -n "$BC_ARTIFACT_URL" ]; then
-        log_step "Downloading BC from $BC_ARTIFACT_URL..."
-        /bc/scripts/download-artifacts.sh "$BC_ARTIFACT_URL" "$ARTIFACTS"
-    else
-        log_step "Downloading BC $BC_TYPE $BC_VERSION ($BC_COUNTRY)..."
-        /bc/scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$ARTIFACTS"
     fi
 else
-    log_step "Artifacts already cached."
+    ARTIFACT_STATE=$(artifact_cache_state)
+    case "$ARTIFACT_STATE" in
+        hit)
+            log_step "Artifacts already cached ($WANT_ARTIFACTS) — skipping download."
+            ;;
+        *)
+            [ "$ARTIFACT_STATE" != "miss" ] && \
+                log_step "Cached artifacts do not match this container (${ARTIFACT_STATE#stale:}) — refetching"
+            if [ -n "$BC_ARTIFACT_URL" ]; then
+                log_step "Downloading BC from $BC_ARTIFACT_URL..."
+                /bc/scripts/download-artifacts.sh "$BC_ARTIFACT_URL" "$ARTIFACTS"
+            else
+                log_step "Downloading BC $BC_TYPE $BC_VERSION ($BC_COUNTRY)..."
+                /bc/scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$ARTIFACTS"
+            fi
+            ;;
+    esac
 fi
 log_step "Step 1 (artifacts): $(($(date +%s) - STEP1_START))s"
 
@@ -85,6 +169,44 @@ log_step "Platform: $PLATFORM_VERSION, NAV dir: $NAV_DIR, DB: $DB_FILE"
 # Step 2: Copy service tier to working directory (if not already set up)
 # =============================================================================
 STEP2_START=$(date +%s)
+
+# `/bc/service` is a volume, so a patched service tier survives the container.
+# Reusing it is the point — Step 2 + 2b are ~6s — but only when it was built
+# from THIS platform version by THIS image. The guard used to be "does
+# Nav.Server.dll exist", which is true for any previous version's leftovers,
+# so switching BC_VERSION or rebuilding the image with a changed StartupHook
+# silently kept the old, differently-patched tier. That's why CLAUDE.md tells
+# you to run `docker compose down -v` after editing the hook; with the stamp
+# the rebuild is automatic and that step is no longer a footgun.
+#
+# The image half of the key is StartupHook.dll's size+mtime: docker gives every
+# file in a rebuilt layer a fresh mtime, so it changes exactly when the image
+# does, and reading it costs one stat.
+# The third component is the config fingerprint. Step 2 seds SQL_SERVER,
+# BC_DB_USER and BC_DB_PASSWORD into CustomSettings.config, so a volume that
+# skips Step 2 keeps whatever credentials the FIRST boot was given — change
+# BC_DB_PASSWORD and the warm boot authenticates with the old one while Step 3
+# creates the login with the new one. Hashed, not stored plaintext: the config
+# in this volume already holds the password, but a stamp file is no place to
+# copy it to. Everything else Step 2 writes is a constant.
+SERVICE_STAMP_FILE="$SERVICE_DIR/.bc-service-stamp"
+SERVICE_CONFIG_FP=$(printf '%s|%s|%s' "$SQL_SERVER" "$BC_DB_USER" "$BC_DB_PASSWORD" | md5sum | cut -c1-12)
+SERVICE_STAMP="v1|platform=$PLATFORM_VERSION|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)|config=$SERVICE_CONFIG_FP"
+if [ -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ] && \
+   [ "$(cat "$SERVICE_STAMP_FILE" 2>/dev/null || true)" != "$SERVICE_STAMP" ]; then
+    log_step "Service tier in the volume was built by a different platform/image — rebuilding it"
+    log_step "  found:  $(cat "$SERVICE_STAMP_FILE" 2>/dev/null || echo '(no stamp)')"
+    log_step "  want:   $SERVICE_STAMP"
+    # Clear the CONTENTS, not the directory: $SERVICE_DIR is a volume mount
+    # point and removing it would break the mount.
+    find "$SERVICE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# Set BEFORE Step 2 runs, so it means "the volume was already fully prepared",
+# not "we just prepared it".
+SERVICE_STAMP_MATCH=0
+[ "$(cat "$SERVICE_STAMP_FILE" 2>/dev/null || true)" = "$SERVICE_STAMP" ] && SERVICE_STAMP_MATCH=1
+
 if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
     log_step "Setting up service tier..."
     # Auto-detect service tier path (differs between versions: PFiles64 vs "program files")
@@ -272,6 +394,15 @@ if [ ! -f "/bc/patched/netstandard-merged.dll" ] && [ -f /bc/tools/MergeNetstand
     log_step "Merged assemblies generated in $(($(date +%s) - STEP2B_START))s"
 fi
 
+# The rest of Step 2b writes patched assemblies INTO the service dir, so a
+# stamp hit means every one of them is already there — including the three
+# PatchNclTestPage passes, which are three `dotnet` process starts against
+# DLLs that are already patched. Skipping is what makes a warm volume cheap;
+# the wipe above is what makes it safe.
+if [ "$SERVICE_STAMP_MATCH" = "1" ]; then
+    log_step "Service tier already patched by this image ($SERVICE_STAMP) — skipping binary patch pass"
+else
+
 # Apply patched DLLs (Cecil-modified to fix Linux-specific bugs)
 # Patch #14: CodeAnalysis.dll — fix IsTypeForwardingCircular NullRef on Linux
 #   BC's Cecil type loader crashes following type-forwarding chains in netstandard.dll.
@@ -384,6 +515,14 @@ PYEOF
     fi
 fi
 
+# Stamp only after every patch above has been applied. A crash partway through
+# leaves the dir unstamped, so the next boot rebuilds it instead of trusting a
+# half-patched tier.
+printf '%s\n' "$SERVICE_STAMP" > "$SERVICE_STAMP_FILE"
+
+fi  # SERVICE_STAMP_MATCH
+log_step "Step 2b (patched assemblies): $(($(date +%s) - STEP2B_START))s"
+
 
 # =============================================================================
 # Step 3: Wait for SQL Server and set up database
@@ -391,10 +530,20 @@ fi
 export PATH="$PATH:/opt/mssql-tools18/bin"
 
 log_step "Waiting for SQL Server..."
+# Bounded. This loop is now the ONLY thing waiting for SQL — docker-compose.yml
+# gates bc on service_started so the two boot in parallel — and an unbounded
+# wait would turn "sql never came up" into "bc was unhealthy 30 minutes later",
+# pointing nowhere near the cause. Generous enough for a loaded runner.
+SQL_WAIT_DEADLINE=$(( $(date +%s) + ${BC_SQL_WAIT_TIMEOUT:-600} ))
 until sqlcmd -S "$SQL_SERVER" -U sa -P "$SA_PASSWORD" -C -No -Q "SELECT 1" &>/dev/null; do
+    if [ "$(date +%s)" -ge "$SQL_WAIT_DEADLINE" ]; then
+        log_step "ERROR: SQL Server at '$SQL_SERVER' did not accept connections within ${BC_SQL_WAIT_TIMEOUT:-600}s."
+        log_step "       Check the sql container: docker compose logs sql"
+        exit 1
+    fi
     sleep 2
 done
-log_step "SQL Server ready."
+log_step "SQL Server ready after $(( $(date +%s) - ENTRYPOINT_START ))s of container uptime."
 STEP3_START=$(date +%s)
 
 SQLCMD="sqlcmd -S $SQL_SERVER -U sa -P $SA_PASSWORD -C -No"
@@ -797,6 +946,33 @@ PLATFORM_VER=$(python3 -c "import json; print(json.load(open('$ARTIFACTS/app/man
 if [ -n "$PLATFORM_VER" ]; then
     INSTANCE=$(grep -oP 'ServerInstance" value="\K[^"]+' "$SERVICE_DIR/CustomSettings.config" 2>/dev/null || echo "BC")
     SERVER_BASE="/usr/share/Microsoft/Microsoft Dynamics NAV/$NAV_DIR/Server"
+
+    # Persist the compiled-assembly cache across containers when a volume is
+    # mounted at /bc/assembly-cache. It is 1.2 GB on BC 28.1 and lives in the
+    # container filesystem, so every boot rebuilds what the previous one
+    # compiled — the pre-seed below is the cheap approximation of keeping it.
+    #
+    # Symlinked at the `apps/assembly` level, NOT at $SERVER_BASE: that
+    # directory is also BC's temp dir, and persisting scratch state across runs
+    # is how a cache turns into a leak. Stamped like /bc/service, since a
+    # compiled assembly is only valid for the platform that compiled it.
+    if [ -d /bc/assembly-cache ]; then
+        AC_STAMP="/bc/assembly-cache/.bc-assembly-stamp"
+        AC_WANT="v1|platform=$PLATFORM_VER|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)"
+        if [ "$(cat "$AC_STAMP" 2>/dev/null || true)" != "$AC_WANT" ]; then
+            [ -e "$AC_STAMP" ] && log_step "Assembly cache was built by a different platform/image — clearing"
+            find /bc/assembly-cache -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            printf '%s\n' "$AC_WANT" > "$AC_STAMP"
+        fi
+        for _inst in "MicrosoftDynamicsNavServer" "$INSTANCE"; do
+            _link="$SERVER_BASE/MicrosoftDynamicsNavServer\$${_inst}/apps/assembly"
+            [ -L "$_link" ] && continue
+            mkdir -p "$(dirname "$_link")" "/bc/assembly-cache/$_inst"
+            rm -rf "$_link"
+            ln -s "/bc/assembly-cache/$_inst" "$_link"
+        done
+        log_step "Assembly cache persisted via /bc/assembly-cache ($(du -sh /bc/assembly-cache 2>/dev/null | cut -f1) present)"
+    fi
     # Primary = NST's actual path. Secondary = configured-instance path (in case a future
     # BC build starts honoring it). Dedupe if INSTANCE happens to be MicrosoftDynamicsNavServer.
     ASSEMBLY_CACHE_PRIMARY="$SERVER_BASE/MicrosoftDynamicsNavServer\$MicrosoftDynamicsNavServer/apps/assembly/release/${PLATFORM_VER}_1"
@@ -920,7 +1096,10 @@ mkfifo /tmp/bc-stdin 2>/dev/null || true
 # - Server GC: better throughput for multi-threaded workloads (extension compilation)
 # - Tiered compilation: DISABLED to prevent JMP hooks from being overwritten by Tier 1 recompilation.
 #   The Watson crash handler patch relies on JMP hooks staying in place.
-export DOTNET_gcServer=1
+# Overridable for the same reason TieredCompilation is: an unconditional export
+# makes the docker-compose passthrough silently dead. Server GC remains the
+# default and is what every non-experimental path gets.
+export DOTNET_gcServer="${DOTNET_gcServer:-1}"
 # Default 0 (JMP-hook safety), but honor a caller override so the
 # docker-compose passthrough is actually usable for A/B experiments —
 # the unconditional export made that knob silently dead.

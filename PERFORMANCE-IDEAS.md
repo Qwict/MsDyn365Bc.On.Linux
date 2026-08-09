@@ -1,3 +1,120 @@
+# NST STARTUP profile (2026-08-08) — read this first
+
+Everything below the next heading is about **test execution** throughput and
+predates the current configuration; several of its claims are stale (it says
+Server GC and `TieredCompilation=0` break the API endpoint — both are the
+shipping defaults today, see CLAUDE.md). This section is about **startup**,
+which is where CI wall-clock actually goes once the caches in CLAUDE.md are in
+place: 80s of a 90s boot.
+
+Collected with the entrypoint's own `BC_PROFILE_NST=1` hook (suspends NST on
+`/tmp/nst-diag.sock` until `dotnet-trace` attaches, so the trace starts at the
+first instruction), 120s window, Speedscope, BC 28.1, 4-vCPU box, DB snapshot
++ warm assembly cache. NST startup was 90s under the tracer vs 76s without.
+
+**Startup is blocked, not busy.** Main thread: **100s blocked, 20s CPU**.
+Across all 47 threads only ~33s is `CPU_TIME`. Chasing CPU here is chasing 20%.
+
+Main thread, blocked time by nearest managed caller:
+
+| | |
+|---|---|
+| `Console`→`Interop.Sys.Read` | 35.6s — **not a cost**, BC idling on stdin after readiness; the trace window outlives startup |
+| `SHA256`→`OneShotHashProvider` | **29.2s** |
+| `Monitor.Wait` | 13.1s |
+| `ModuleHandle.ResolveTypeHandle` | 5.0s |
+| `Inflater.Inflate` | 3.9s |
+
+## 1. Merkle validation of the assembly cache — the big one
+
+The hashing resolves to one call path, and it is 245.9s of *aggregate thread
+time* (it runs under `Parallel.For`, so wall time is far less — but it is the
+single largest consumer in the trace):
+
+```
+Parallel.ForWorker
+  SimpleMerkleTree.IsValidInput
+    SimpleMerkleTree.MerkleProof.IsValid
+      SimpleMerkleTree.CombineHash
+        SHA256.HashData
+```
+
+`Microsoft.Dynamics.Nav.Runtime.Apps.SimpleMerkleTree` is BC verifying the R2R
+assembly cache — the `{RuntimePackageId}_<N>_Merkle.json` files the entrypoint's
+pre-seed already writes. So **persisting the assembly cache buys compile time
+and pays it partly back in hash validation.**
+
+### Tried it. It is 10x WORSE. Do not retry.
+
+The obvious move is a JMP hook forcing `MerkleProof.IsValid` to return true.
+Implemented as an opt-in Patch #30, measured, and reverted (commit b99383d and
+its revert). Interleaved runs, same container, only the env var changing:
+
+| | total | NST | dev endpoint |
+|---|---|---|---|
+| validation ON (normal) | 96s | 85s | HTTP 401, healthy |
+| validation SKIPPED | **913s** | **903s** | **HTTP 000, never healthy** |
+
+**The validation result is not a checkbox — it selects BC's loading strategy.**
+With the hook on, BC accepts cache entries whose proofs would have failed, then
+fails to load them and falls back:
+
+```
+CLR type load failed -- Assembly: F2B3AE52321A9D8D...                        x10
+Switching from OneApplicationMultipleAssemblies to OneApplicationObjectOneAssembly  x8
+Loading assembly into the Neither context from path /usr/share/Microsoft/... x8
+```
+
+`OneApplicationMultipleAssemblies` is the fast bulk path; the fallback loads
+per application object. So the hashing is doing useful triage — it tells BC
+which cached assemblies it can bulk-load and which must be rebuilt, and paying
+29s to avoid that fallback is a bargain, not waste.
+
+The corollary matters for anything else in this file: **time spent in the
+assembly cache path is not automatically removable.** Measure the end state,
+not just the phase you shortened.
+
+## 2. XLIFF translation parsing — ~10s CPU, plus an ~11s serializer-generation stall
+
+Top CPU frame across all threads is
+`Microsoft.Xml.Serialization.GeneratedAssembly.XmlSerializationReaderxliff`
+(5.1s), with `Read*_xliffFileBodyGroupTransunit` paths summing ~10s. BC parses
+**XLIFF translation files** at startup.
+
+`GeneratedAssembly` means the serializer was built **at runtime**: no
+`*.XmlSerializers.dll` ships in the artifact (`find /bc/service /bc/artifacts
+-iname '*XmlSerializers*'` → 0 files), so .NET generates it. The timestamped
+boot log shows an 11.4s silence immediately after
+`AssemblyResolve attempt: Microsoft.Dynamics.Nav.AL.Common.XmlSerializers`,
+and a second burst for `Microsoft.Dynamics.BusinessCentral.Bcl.XmlSerializers`.
+
+Two independent angles, neither tried: pre-generate the serializer assemblies
+once (`Microsoft.XmlSerializer.Generator`) and drop them beside their owners so
+the resolve succeeds; and/or stop feeding BC translations it will never use —
+a pipeline runs one language.
+
+## 3. Event-publisher reflection warmup — ~5s
+
+`NavEventPublisherReflectionHelper.TryGetScopeTypeByExactMatchAndWarmupCache`
+→ `RuntimeType.GetNestedTypes` → `ModuleHandle.ResolveTypeHandle`, 4.8s. This
+is the "event subscriber resolution" item listed speculatively further down
+this file, now measured.
+
+## How to re-run this
+
+```bash
+BC_PROFILE_NST=1 docker compose up -d          # NST suspends until a client attaches
+docker compose exec bc /path/to/dotnet-trace collect \
+  --diagnostic-port /tmp/nst-diag.sock --duration 00:02:00 \
+  --format Speedscope -o /tmp/nst.nettrace
+```
+
+The Speedscope JSON is **evented** (open/close), not `sampled` — aggregating it
+means walking O/C events and attributing leaf time to the nearest managed
+ancestor, since the leaves are the `UNMANAGED_CODE_TIME` / `CPU_TIME` pseudo
+frames. A naive `profiles[*].samples` reader returns zero and looks like an
+empty trace.
+
 # Sequential Throughput Optimization Ideas
 
 Current state: ~0.33s/method average (Bucket 4, single runner, headless Linux).

@@ -59,6 +59,48 @@ BC 28.0):
 | **NST startup** | **31s** |
 | **post-NST publish** | **24s** |
 
+## Taken
+
+### Booting sql and bc in parallel (2026-08-08)
+
+`bc` gated on `sql`'s healthcheck (`condition: service_healthy`), so its
+container sat in `Created` until SQL answered `SELECT 1`. Measured **5.8s** of
+dead time on every boot, and most of that is polling rather than SQL: the
+healthcheck's `interval` is 5s, so the earliest observable "healthy" is ~5s even
+when SQL is ready at 2s.
+
+The gate was redundant. `entrypoint.sh` Step 3 has always blocked on
+`until sqlcmd … SELECT 1`, so BC already waits for SQL itself. Changed to
+`condition: service_started`, which keeps the dependency graph — `docker compose
+up bc` still brings sql up — without waiting on the health probe.
+
+**What this does NOT do is overlap NST with SQL's startup.** NST is not started
+until Step 3 has restored the demo database, created the login, imported the
+license and run the app filter. It is gated on a restored *database*, not on a
+reachable server. What overlaps is the entrypoint's pre-SQL work: the artifact
+copy and the service-tier patching. So the ceiling is the gate itself, ~5-6s,
+whatever else changes.
+
+**Do not expect to see this in the total boot time.** I claimed the snapshot
+test's cold boot was stable to ~1s, on the strength of four consecutive 137s
+readings. The next run came in at 143s. The real series is
+137/137/137/137/135/135/143 — an **8s spread**, mean 137.3, stdev 2.7 — so a 6s
+effect is not resolvable there, and the 132s reading immediately after the
+change is one sample inside the old band. It is not evidence.
+
+What is measurable is the gate itself, because it is deterministic: the boot
+step now records how long after `sql` started `bc` was allowed to start
+(`GATE:` in the log, and a row in the run summary). That was ~5.8s and should
+now be ~0. The saving is structural — bc's pre-SQL work now overlaps SQL's
+startup instead of following it — and that is the claim, not a wall-clock
+delta measured off one pair of runs.
+
+The entrypoint's SQL wait was unbounded and is now capped
+(`BC_SQL_WAIT_TIMEOUT`, default 600s). That is not optional with the gate gone:
+compose used to fail fast and clearly when SQL was unhealthy, and without a cap
+"sql never came up" would surface half an hour later as "bc never became
+healthy", pointing nowhere near the cause.
+
 ## Dead ends
 
 ### Starting SQL during the artifact download
@@ -103,6 +145,35 @@ sits below the noise floor.
 Tried 2026-04-08, documented at the call site in `scripts/entrypoint.sh`.
 The NST serializes publishes server-side; layered concurrency=4 took the
 same ~27s as serial POSTs.
+
+## Self-hosted runners
+
+The numbers above are all GitHub-hosted, i.e. a fresh VM per job where
+nothing survives. On a self-hosted runner the disk persists, and as of
+2026-08-08 the pipeline exploits that without any configuration: the fetch
+phase (29s at 4-vCPU, 58s at 2-vCPU — the largest single block in the smoke
+leg) drops to roughly zero whenever the resolved build is already extracted,
+and Step 2/2b's ~6s of service-tier patching is skipped when the volume's
+stamp matches. See CLAUDE.md, "Reusing a warm filesystem is NOT the
+artifact-cache ban", for the stamps and what invalidates each.
+
+What that leaves is BC's own boot, which is unchanged — so a warm
+self-hosted leg is bounded below by roughly `compose up` + NST startup +
+publish + tests. Do not expect the fetch-phase saving to compound with
+anything; it comes off the front of the job and the pole is still BC.
+
+Two things a self-hosted operator has to handle that a hosted runner gets
+for free:
+
+- **Leftover containers.** The workflows now run `docker compose down
+  --remove-orphans` before `up -d`. Without it, `up -d` adopts the previous
+  job's still-running containers and the healthcheck goes green in seconds
+  against the *previous* run's database — a pass that proves nothing.
+- **Concurrency.** Two jobs on one host collide on the published 7045-7089
+  ports. Give each runner its own compose project name and port offset (see
+  README, "Running Multiple Instances"). A shared `artifact_cache_dir` is
+  safe under concurrency — `download-artifacts.sh` locks it — but the ports
+  are not.
 
 ## What would actually move the needle
 
