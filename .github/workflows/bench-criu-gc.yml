@@ -1,0 +1,121 @@
+# Does cutting the NST's GC reservations make the criu restore faster?
+#
+# ANSWERED, and not the way the sweep was built to expect. The hypothesis was
+# that criu restore time tracks the NUMBER of memory mappings; it does not. Cut
+# the heaps and the mapping count barely moves (5,645 -> 5,138) while the
+# checkpoint halves (3.0G -> 1.5G) and criu halves with it (26s -> 12s). The
+# variable is BYTES. Kept because it is the harness that measures the trade —
+# fewer heaps is not free, Server GC is the default because it speeds up the
+# parallel Roslyn compile — and because it re-runs cheaply when either side
+# of that trade changes.
+#
+# Self-hosted only, for the same reasons as bench-selfhosted.yml: it needs a
+# prepared host and a store that survives. Read-only with respect to the host.
+name: Benchmark criu vs GC configuration (self-hosted)
+
+# DISPATCH ONLY — see bench-selfhosted.yml for why.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# SHARED with bench-selfhosted.yml on purpose: both bind BC's ports directly on
+# the host (snapshot mode needs host networking) and drive the same compose
+# project. Two at once would fight over both.
+#
+# CONSEQUENCE, learned the hard way: GitHub keeps at most ONE pending run per
+# group, and a newly queued run CANCELS the pending one. Both were push-
+# triggered during development, so an edit to scripts/snapshot.sh while this
+# sweep was waiting killed it — which is how this workflow's first run died.
+# Both are dispatch-only now, so the collision needs two humans, but it is
+# still there: do not dispatch the two benchmarks at the same time.
+concurrency:
+  group: bench-selfhosted
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ${{ vars.BENCH_RUNNER && (startsWith(vars.BENCH_RUNNER, '[') && fromJSON(vars.BENCH_RUNNER) || vars.BENCH_RUNNER) || 'self-hosted' }}
+    timeout-minutes: 180
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.snapshot.yml
+      BC_VERSION: ${{ vars.BENCH_BC_VERSION || '28.1' }}
+      BC_COUNTRY: w1
+      BC_TYPE: sandbox
+      BC_ARTIFACTS_DIR: /var/cache/bc-linux/artifacts
+      ITERATIONS: ${{ vars.BENCH_ITERATIONS || '3' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is this machine prepared
+        run: |
+          set -e
+          ./scripts/setup-snapshot-host.sh --check || true
+          ./scripts/snapshot.sh preflight || {
+            echo "::error::machine not prepared — run scripts/setup-snapshot-host.sh on it once"
+            exit 1
+          }
+
+      - name: Artifacts
+        run: |
+          set -e
+          [ -w "$BC_ARTIFACTS_DIR" ] || {
+            echo "::error::$BC_ARTIFACTS_DIR is not writable — run scripts/setup-snapshot-host.sh once"
+            exit 1
+          }
+          bash scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$BC_ARTIFACTS_DIR"
+
+      # Four configurations write a ~3.2 GB store each, and the sweep discards
+      # each one before the next. If it dies partway, that reclaim does not
+      # happen — so record what was there before, to tell a leak from a
+      # pre-existing pile.
+      - name: Disk before
+        run: |
+          df -Ph /var/cache/bc-linux /var/tmp 2>/dev/null || df -Ph
+          docker run --rm -v /tmp:/t:ro busybox sh -c \
+            'df -Ph /t; echo "ctrd staging: $(ls -d /t/ctrd-checkpoint* 2>/dev/null | wc -l) dirs"' \
+            2>/dev/null || true
+          ./scripts/snapshot.sh status || true
+
+      - name: Sweep
+        run: |
+          set -o pipefail
+          # Reap first: containerd leaks ~2.1 GB of checkpoint staging into the
+          # daemon's /tmp, which is a 16 GB tmpfs on this machine. Four
+          # configurations boot and checkpoint in sequence, so starting with a
+          # full ramdisk is the difference between a result and four ENOSPCs
+          # wearing other costumes.
+          ./scripts/snapshot.sh reap || true
+          ./scripts/bench-criu-gc.sh -n "$ITERATIONS" 2>&1 | tee gc.out
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## criu vs GC configuration on \`$(hostname)\`"
+            echo
+            echo '```'
+            sed -n '/^== machine/,/^$/p' gc.out 2>/dev/null || true
+            sed -n '/^== results/,$p'   gc.out 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criu-gc-sweep
+          path: gc.out
+          if-no-files-found: warn
+
+      - name: Leave the machine idle
+        if: always()
+        run: |
+          docker compose down --remove-orphans || true
+          ./scripts/snapshot.sh reap || true
+          # The sweep discards each store as it goes, but a run that died
+          # partway leaves one behind. This is a developer workstation; do not
+          # leave 3.2 GB of it consumed by a cancelled benchmark.
+          ./scripts/snapshot.sh discard || true
+          df -Ph /var/cache/bc-linux 2>/dev/null || true

@@ -1,0 +1,309 @@
+# End-to-end test of snapshot mode (scripts/snapshot.sh + docker-compose.snapshot.yml).
+#
+# WHAT IT PROVES
+# --------------
+# Boots BC cold, snapshots it, TEARS THE CONTAINERS DOWN, and brings BC back
+# from the snapshot alone — then compiles a novel app and publishes it into the
+# restored tenant. The teardown is the point: it is what makes this a test of
+# the feature rather than of a still-warm container. `docker compose down`
+# without -v is exactly the state a self-hosted runner starts its next job in.
+#
+# WHAT IT CANNOT PROVE
+# --------------------
+# The wall-clock win, because a GitHub-hosted runner is ephemeral and the store
+# does not survive the job. That is fine: snapshot mode is a self-hosted feature
+# (docs/SNAPSHOT.md, "Where this pays"). What has to be verified here is that
+# the restore is CORRECT, and correctness does not need a second job.
+#
+# This grew out of probe-criu.yml, which answered whether CRIU could do this at
+# all. Every barrier and every wrong theory — nineteen probe runs and eight of
+# these — are in PERFORMANCE-IDEAS.md. Read that before re-litigating a setting
+# here; most of them cost a six-minute run to learn.
+name: Test snapshot mode (CRIU)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/test-snapshot.yml'
+      - 'scripts/snapshot.sh'
+      - 'docker-compose.snapshot.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/test-snapshot.yml'
+      - 'scripts/snapshot.sh'
+      - 'docker-compose.snapshot.yml'
+  # docker-compose.yml and scripts/entrypoint.sh were on this filter while the
+  # feature was being developed, because they move the cold boot this test
+  # times. They are off it now: they change for reasons that have nothing to do
+  # with snapshot mode, and each push would add a ~15 minute job to master to
+  # re-prove a correctness property the snapshot files alone determine. Dispatch
+  # it by hand after a boot-path change that you think could invalidate a
+  # checkpoint.
+  workflow_dispatch:
+    inputs:
+      bc_version:
+        description: "BC version to boot"
+        required: false
+        type: string
+        default: "28.1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-snapshot
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    # Deliberately always hosted. This workflow's job is CORRECTNESS, which an
+    # ephemeral runner proves perfectly well; bench-selfhosted.yml is the one
+    # that goes to a real machine. It used to read the same BENCH_RUNNER
+    # variable, which meant setting that variable sent BOTH workflows to the
+    # same box, where they would fight over ports 7045-7089 and one compose
+    # project.
+    #
+    # NOT ubuntu-latest: its 6.17-azure kernel makes criu fail parsing its own
+    # vDSO before it touches any process, so that leg costs three minutes to
+    # learn nothing. 6.8-azure works.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      BC_VERSION: ${{ inputs.bc_version || '28.1' }}
+      BC_COUNTRY: w1
+      BC_TYPE: sandbox
+      # Must be a HOST directory: snapshot.sh keys on the resolved artifact urls
+      # in its stamp, which is not readable from inside a named volume.
+      BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache
+      # BC_SNAPSHOT_DIR is chosen in a STEP, not here: the `runner` context is
+      # not available in job-level env, and referencing it made the whole
+      # workflow unparseable — zero jobs, a run named after the file path, and
+      # no error attributable to any step.
+      BC_SNAPSHOT_SQLDIR: /var/tmp/bc-sqlstage
+      COMPOSE_FILE: docker-compose.yml:docker-compose.snapshot.yml
+      # 3.17 (what jammy packages) dumps BC perfectly and segfaults the restored
+      # task, with no diagnostic beyond "killed by signal 11". Three probe runs
+      # went into theories about BC for a failure that was entirely criu's age.
+      CRIU_REF: v4.2.1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Hosted runners are discarded, so the store may as well live in the
+      # workspace. On a real machine it is left unset so snapshot.sh resolves the
+      # machine-level store — which is what lets a snapshot outlive the job, and
+      # exercises the per-machine opt-in rather than bypassing it.
+      - name: Choose the snapshot store
+        run: |
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "BC_SNAPSHOT_DIR=${{ github.workspace }}/snapshot-store" >> "$GITHUB_ENV"
+            echo "hosted runner: store in the workspace"
+          else
+            echo "self-hosted: using this machine's own store"
+          fi
+
+      # The key must behave before anything expensive runs: it is the whole
+      # safety story, and it needs no docker daemon and no BC.
+      # Both cheap, both before anything that costs a BC boot. The shellcheck
+      # pass earns its place: run 7 burned a six-minute run on `sed` exiting 2
+      # for a missing file, which `set -e` turned into a bare exit-2 with no
+      # message before the checkpoint was even attempted.
+      - name: Key behaviour and shell lint
+        run: |
+          set -e
+          ./scripts/test-snapshot-key.sh
+          shellcheck -S warning -e SC2034 scripts/snapshot.sh
+
+      # On a hosted runner this VM is thrown away, so installing criu and
+      # flipping the docker daemon into experimental mode costs nothing.
+      # On YOUR machine both are intrusive, and the original version of this step
+      # was actively destructive: it overwrote /etc/docker/daemon.json wholesale
+      # (taking any registry mirrors, storage-driver or logging config with it)
+      # and restarted the daemon, killing every running container.
+      #
+      # So: if the host is already capable, do nothing at all. If it is not and
+      # this is a real machine, say what is missing and stop. Only ever modify an
+      # ephemeral hosted runner — and even there, MERGE into daemon.json rather
+      # than replacing it.
+      - name: Host capability
+        id: hostcap
+        run: |
+          if ./scripts/snapshot.sh preflight 2>&1; then
+            echo "host is already set up — changing nothing"
+            exit 0
+          fi
+          if [ "${{ runner.environment }}" != "github-hosted" ]; then
+            {
+              echo "### This machine is not set up for snapshot mode"
+              echo
+              echo "Nothing was modified. See docs/SNAPSHOT.md — you need criu >= 4.2.1,"
+              echo '`{"experimental": true}` in /etc/docker/daemon.json, and a snapshot'
+              echo "store directory, e.g.:"
+              echo
+              echo '```bash'
+              echo 'sudo install -d -o "$(id -u)" -m 755 /var/cache/bc-linux/snapshots'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::host not set up for snapshots and this is not an ephemeral runner — refusing to modify it"
+            exit 1
+          fi
+          echo "setup=needed" >> "$GITHUB_OUTPUT"
+
+      # setup-snapshot-host.sh rather than an inline copy of it: since the run
+      # path stopped applying sysctls and writing /etc/criu/runc.conf on every
+      # invocation, SOMETHING has to do it once, and duplicating that here is how
+      # the two drift apart. --yes because there is nobody to prompt, and it is
+      # only ever reached on a runner that gets discarded.
+      - name: Prepare this ephemeral runner
+        if: steps.hostcap.outputs.setup == 'needed'
+        run: |
+          set -e
+          ./scripts/setup-snapshot-host.sh --yes --store "${BC_SNAPSHOT_DIR:-$GITHUB_WORKSPACE/snapshot-store}"
+          ./scripts/snapshot.sh preflight
+
+      - name: Fetch BC artifacts and images
+        run: |
+          set -e
+          mkdir -p "$BC_ARTIFACTS_DIR"
+          bash scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$BC_ARTIFACTS_DIR" &
+          DL=$!
+          bash scripts/compose-pull.sh & PULL=$!
+          wait $DL   || { echo "::error::artifact download failed"; exit 1; }
+          wait $PULL || { echo "::error::image pull failed"; exit 1; }
+
+      - name: Preflight and key
+        run: |
+          ./scripts/snapshot.sh preflight
+          ./scripts/snapshot.sh key
+          ./scripts/snapshot.sh status || true   # a miss on a fresh runner is correct
+
+      - name: Boot BC cold
+        id: boot
+        run: |
+          set -e
+          T0=$(date +%s)
+          docker compose up -d --wait
+          echo "cold_boot=$(( $(date +%s) - T0 ))" >> "$GITHUB_OUTPUT"
+          echo "cold boot to healthy: $(( $(date +%s) - T0 ))s"
+
+          # Total boot cannot resolve a ~6s ordering change: it has an 8s spread
+          # across runs (135-143s before the change). So measure the thing that
+          # actually changed, which is deterministic — how long after sql started
+          # did bc's entrypoint get to run? That was the depends_on gate, and it
+          # should now be ~0 rather than ~6s.
+          sq=$(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q sql)")" +%s)
+          bs=$(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q bc)")" +%s)
+          echo "GATE: bc started $((bs - sq))s after sql"
+          echo "gate_s=$((bs - sq))" >> "$GITHUB_OUTPUT"
+          docker compose logs bc 2>&1 | grep -a "SQL Server ready" | head -1 || true
+
+      - name: Create the snapshot
+        id: create
+        run: |
+          set -e
+          T0=$(date +%s)
+          ./scripts/snapshot.sh create
+          echo "create_s=$(( $(date +%s) - T0 ))" >> "$GITHUB_OUTPUT"
+          ./scripts/snapshot.sh status
+          du -sh "$BC_SNAPSHOT_DIR"/*/ | tail -1
+
+      # The whole point. Without this the "restore" would be measuring a
+      # container that never went away — which is how an earlier run of the
+      # probe reported success in 0s against a BC that had never stopped.
+      - name: Tear the containers down (simulate the next job)
+        run: |
+          set -e
+          docker compose down --remove-orphans
+          # down (no -v) keeps the named volumes, which is the self-hosted
+          # runner's real state. /bc/service MUST survive: criu references
+          # mapped files by path and the restored NST re-opens those DLLs.
+          [ -z "$(docker compose ps -aq)" ] || { echo "::error::containers still present"; exit 1; }
+          docker volume ls --format '{{.Name}}' | grep -q bc-service \
+            || { echo "::error::bc-service volume gone — restore cannot work"; exit 1; }
+          echo "containers removed, volumes kept:"
+          docker volume ls --format '  {{.Name}}' | grep -E 'bc-|artifact' || true
+
+      - name: Restore from the snapshot
+        id: restore
+        run: |
+          set -e
+          T0=$(date +%s)
+          ./scripts/snapshot.sh restore
+          echo "restore_s=$(( $(date +%s) - T0 ))" >> "$GITHUB_OUTPUT"
+          echo "restore took $(( $(date +%s) - T0 ))s"
+
+      - name: Post-restore health
+        id: health
+        run: |
+          set +e
+          docker compose exec -T bc curl -s -o /dev/null -w 'OData  /Company : %{http_code}\n' \
+            --max-time 20 -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company
+          echo "--- did the SQL connection pool reconnect to the new container? ---"
+          docker compose exec -T bc /opt/mssql-tools18/bin/sqlcmd \
+            -S "localhost,${SQL_PORT:-11433}" -U sa -P 'Passw0rd123!' -C -No -d CRONUS \
+            -h -1 -W -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM [Company];" 2>&1 | head -3
+          docker compose logs bc --tail 15 2>&1 | cut -c1-160
+
+      # A boot check is NOT a pass. StartupHook's reverted Patch #30 served
+      # OData perfectly and was catastrophic. Compiling an app that did not
+      # exist when the snapshot was taken, and publishing it into the restored
+      # tenant, is the check that actually distinguishes the two.
+      - name: Compile and publish a NOVEL app into the restored tenant
+        id: publish
+        run: |
+          set -e
+          AL_VER=$(python3 scripts/resolve-al-tool-version.py "$BC_VERSION" --policy matching)
+          PKG=microsoft.dynamics.businesscentral.development.tools.linux
+          mkdir -p al && curl -fsSL \
+            "https://api.nuget.org/v3-flatcontainer/${PKG}/${AL_VER}/${PKG}.${AL_VER}.nupkg" -o al/pkg.zip
+          unzip -q -o al/pkg.zip -d al && rm al/pkg.zip
+          ALC=$(find al -type f -name alc | sort | tail -1); chmod +x "$ALC"
+          mkdir -p symbols
+          python3 scripts/stage-symbols.py --app-json extensions/smoke-test/app.json \
+            --artifact-dir "$BC_ARTIFACTS_DIR" --out-dir symbols
+          "$ALC" /project:"$PWD/extensions/smoke-test" /packagecachepath:"$PWD/symbols" \
+                 /out:"$PWD/smoke-test.app"
+          docker compose cp smoke-test.app bc:/tmp/smoke-test.app
+          docker compose exec -T bc sh -c '
+            code=$(curl -s -o /tmp/p.out -w "%{http_code}" --max-time 300 -u BCRUNNER:Admin123! \
+              -X POST -F "file=@/tmp/smoke-test.app;type=application/octet-stream" \
+              "http://localhost:7049/BC/dev/apps?SchemaUpdateMode=forcesync")
+            echo "publish HTTP $code"; head -c 400 /tmp/p.out; echo
+            [ "$code" = "200" ]'
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Snapshot mode"
+            echo
+            echo "Runner: $(nproc) vCPU / $(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo) GB, kernel $(uname -r), criu $(criu --version 2>/dev/null | head -1)"
+            echo
+            echo "| step | result |"
+            echo "|---|---|"
+            echo "| cold boot to healthy | ${{ steps.boot.outputs.cold_boot }}s |"
+            echo "| bc start delayed behind sql | ${{ steps.boot.outputs.gate_s }}s |"
+            echo "| create snapshot | ${{ steps.create.outcome }} (${{ steps.create.outputs.create_s }}s) |"
+            echo "| **restore after teardown** | **${{ steps.restore.outcome }} (${{ steps.restore.outputs.restore_s }}s)** |"
+            echo "| novel app publish | ${{ steps.publish.outcome }} |"
+            echo
+            echo "Containers were removed between create and restore, so the restore ran"
+            echo "against nothing but the snapshot and the persisted volumes."
+            echo
+            if [ "${{ runner.environment }}" = "github-hosted" ]; then
+              echo "This runner is ephemeral, so the numbers do not show the win — that only"
+              echo "exists where the store survives between jobs. See docs/SNAPSHOT.md."
+            else
+              echo "Self-hosted: the store survives this job, so the NEXT run should report a"
+              echo "cold boot it never pays. Run scripts/bench-snapshot.sh for medians."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps -a || true
+          docker compose logs bc --tail 80 2>&1 | cut -c1-200 || true
+          sudo grep -E 'Error \(|killed by signal' /var/tmp/criu-work/criu.log 2>/dev/null | tail -20 || true

@@ -74,6 +74,265 @@ The corollary matters for anything else in this file: **time spent in the
 assembly cache path is not automatically removable.** Measure the end state,
 not just the phase you shortened.
 
+## 4. Process snapshot (CRIU) — measured constraints, NOT yet attempted
+
+With the caches in CLAUDE.md in place a boot is ~90s, of which ~80s is NST
+startup, and the two direct attacks on that failed (tiering: noise; Merkle
+skip: 10x worse, above). The remaining lever is to not run startup at all.
+
+Measured on a healthy BC 28.1 instance at readiness, so nobody has to
+re-derive them:
+
+| | |
+|---|---|
+| RSS | 2.24 GB |
+| **private dirty — the checkpoint payload** | **1.80 GB** |
+| threads | 40 |
+| open fds | 838 |
+| **established sockets to SQL** | **17** |
+
+What those numbers imply:
+
+- **Self-hosted only.** Restoring 1.8 GB from local disk is single-digit
+  seconds against 80s of startup. On a GitHub-hosted runner you would
+  *download* it every job, which is the same transfer constraint that makes
+  caching artifacts a losing trade (see CLAUDE.md).
+- **The 17 SQL sockets are the hard part.** CRIU's `--tcp-established` needs
+  the peer alive with matching sequence numbers; restoring against a fresh
+  SQL container leaves all 17 dead. Either checkpoint SQL too (multi-GB, and
+  its data is on a 4 GB tmpfs) or rely on SqlClient invalidating and
+  reopening pooled connections — which will appear to work and then fail
+  under load, looking like a flaky test rather than a broken restore.
+- **The DB snapshot is a prerequisite, not an alternative.** A restored
+  process image is only coherent against the exact database state it was
+  checkpointed with. The post-publish snapshot provides that deterministically.
+
+Not attempted here: this session ran on a Firecracker microVM whose kernel has
+`# CONFIG_CHECKPOINT_RESTORE is not set`, so CRIU cannot run at any privilege
+level and `docker checkpoint` (which sits on CRIU) is unavailable with it.
+Stock Ubuntu hosts have the option enabled and `criu` in universe.
+
+### Probed on GitHub-hosted runners, 2026-08-08 — IT WORKS; skip to "RESULT (run 18)"
+
+Everything between here and that section is the path, kept because each dead
+end costs a five-minute run to rediscover. The headline is that a booted BC
+service tier checkpoints and restores intact — 137s of boot replaced by a 25s
+restore, with the tenant still able to publish a newly compiled app — **and it
+does so against a brand-new SQL Server container**, which was the case the whole
+design hinged on.
+
+The economics, up front, because they decide where this is worth building:
+the checkpoint is 2.1 GB and the database backup 539 MB. On a self-hosted
+runner they sit on disk and cost nothing. On a GitHub-hosted runner they would
+have to go through the Actions cache — the artifact-caching ban in CLAUDE.md,
+verbatim — and the 46s checkpoint plus that transfer is worse than the 137s
+boot it replaces. **This is a self-hosted-runner feature.**
+
+### The path — the wall was NOT the SQL socket pool
+
+`.github/workflows/probe-criu.yml` ran this end to end. Results, so nobody
+repeats the dead ends:
+
+| runner | kernel | criu | outcome |
+|---|---|---|---|
+| ubuntu-latest | 6.17.0-azure | 4.0 and newest tag, from source | **unusable** — criu cannot parse its own vDSO (`kerndat_vdso_fill_symtable`), fails before touching any process |
+| ubuntu-22.04 | 6.8.0-azure | from apt (in universe) | criu initialises, BC boots in 109s, dump reaches BC and **fails on established TCP** |
+
+The 22.04 dump log names it exactly:
+
+```
+Error (criu/sk-inet.c:189): inet: Connected TCP socket, consider using --tcp-established option.
+Error (criu/cr-dump.c:1361): Dump files (pid: 5383) failed with -1
+Error (criu/cr-dump.c:1781): Dumping FAILED.
+```
+
+So **BC was never the problem** — the blocker is the ~17 pooled connections to
+SQL, precisely as predicted from the socket count above. Checkpoint payload
+measured 2.16 GB on the runner, matching the 1.80 GB measured locally.
+
+`docker checkpoint create` has no flag for `--tcp-established`, but runc reads
+`/etc/criu/runc.conf` (the dump log says so: "Would overwrite RPC settings with
+values from /etc/criu/runc.conf"), so the option is reachable by writing
+`tcp-established` into that file before checkpointing. That is the next thing
+to try, and the probe now does.
+
+Two cautions if you pick this up. `--tcp-established` makes the DUMP succeed;
+RESTORE still needs a peer whose sequence numbers match, so restoring against a
+fresh SQL container remains the hard, untested case. And a hosted runner is
+ephemeral, so none of this measures the win — that only exists where the
+checkpoint survives between jobs.
+
+### SHIPPED (2026-08-08): snapshot mode. 135s cold boot -> 47s restore.
+
+`scripts/snapshot.sh` + `docker-compose.snapshot.yml`, opt-in per MACHINE (the
+operator creates a store directory; no pipeline changes). Full description in
+**docs/SNAPSHOT.md** — read that first; this section is the road to it.
+
+Verified end to end by `.github/workflows/test-snapshot.yml`, which removes the
+containers between create and restore, so the restore runs against nothing but
+the store and the persisted volumes:
+
+| | |
+|---|---|
+| cold boot to healthy | 135s |
+| create (checkpoint 43s + commit + backup + copy + resume) | ~110s, once |
+| **restore, containers gone** | **47s** |
+| novel app compiled after restore and published | HTTP 200 |
+
+Four things the probe never had to solve, each of which cost a run:
+
+| | |
+|---|---|
+| `docker start --checkpoint-dir` | **unimplemented in the daemon** — "custom checkpointdir is not supported". `create` accepts the flag, so a checkpoint written into the store can never be restored from there. It is taken in docker's own directory and copied in and out. |
+| checkpoint file ownership | the daemon writes it root:700, so sizing, copying and deleting it all need sudo. A `du` that silently undercounted looked exactly like a checkpoint that was never written. |
+| the container read-write layer | criu re-opens files by PATH, and `/tmp/bc-stdin` — the FIFO the entrypoint gives NST as stdin — is not in any volume. A recreated container fails with "Can't open fake fifo". `docker commit` of the stopped container carries it, and does preserve the FIFO. |
+| `set -e` + `$(...)` | `sed` exits 2 on a missing file and that status leaves the script. One run died at exit 2 with no message. `shellcheck` now runs before anything that costs a boot. |
+
+The 25-30s figure below is the process resume ALONE, with SQL already up and the
+database already restored. 47s is what a real run pays.
+
+### RESULT (run 18): it survives a FRESH SQL container too. 137s boot -> 25s restore.
+
+The case that decides the design, not the easy one. sql is a different container
+(id checked), its tmpfs verified empty of CRONUS before the database is reloaded
+from a backup taken after the checkpoint, and the BC login recreated because it
+went down with `master`:
+
+```
+cold boot to healthy: 137s
+checkpoint took 46s              container status after checkpoint: exited
+/tmp/sqlsnap/cronus.bak          539M
+sql container: 8546dffa4b51 -> 6750dafdccdc
+confirmed: fresh sql has no CRONUS database
+logical names: data='Navision_NAV_Data' log='Navision_NAV_Log'
+restore to OData 200: 25s
+OData /Company : 200             publish HTTP 200   <- novel app, compiled after restore
+```
+
+So a restored NST reconnects to a SQL Server it has never spoken to, holding a
+connection pool whose peer no longer exists, and the tenant still works well
+enough to publish a freshly compiled extension.
+
+Run 19 repeated it independently, because one observation of the case the whole
+design rests on is not enough:
+
+| | run 18 | run 19 |
+|---|---|---|
+| cold boot to healthy | 137s | 140s |
+| checkpoint | 46s | 42s |
+| **restore to OData 200** | **25s** | **29s** |
+| novel app publish | 200 | 200 |
+
+**Feasibility is settled**, and the restore is a ~110s saving against a cold
+boot on this runner class.
+
+What is left is engineering, not risk:
+
+- carry the checkpoint (2.1 GB) and the backup (539 MB) across a job boundary —
+  on a self-hosted runner that is "leave them on disk", which is the only place
+  the economics work anyway (see point 2 below)
+- decide what invalidates the pair: BC version, image, and the published app set
+  at minimum — same shape as the three stamps in CLAUDE.md
+- the two halves are **not independently restorable**. A BC checkpoint is only
+  usable with a snapshot of the database it was booted against.
+
+### RESULT (run 16): it works. A booted BC restores in 30s and still publishes.
+
+ubuntu-22.04, kernel 6.8.0-azure, **criu v4.2.1 built from source**, host
+networking, `/etc/criu/runc.conf` = `tcp-established`, `tcp-close`,
+`file-locks`, `ext-unix-sk`, `link-remap`, `ghost-limit 512M`, plus
+`vm.overcommit_memory=1` and `vm.max_map_count=1048576`:
+
+```
+cold boot to healthy: 127s
+NST RSS: 2.39 GB   private dirty (checkpoint payload): 2.07 GB
+checkpoint took 51s
+container status after checkpoint: exited      <- it really stopped
+restore to OData 200: 30s
+OData /Company : 200
+publish HTTP 200                               <- a NOVEL app, compiled after restore
+checkpoint on disk: 2.1 GB
+```
+
+**127s of boot becomes 30s of restore**, and the tenant survives — a freshly
+compiled app publishes through the dev endpoint afterwards, which is the check
+that distinguishes this from Patch #30 (looked fine on a boot check, was
+catastrophic). Every prerequisite is now known-good, so the design is viable
+in principle and the remaining questions are about plumbing, not feasibility.
+
+Sixteen runs to get here. Each barrier and its fix, so none is re-derived:
+
+| barrier | run | fix |
+|---|---|---|
+| kernel cannot run criu at all (vDSO symtable) | 5-6 | `ubuntu-22.04`, **not** `ubuntu-latest`. NOT a "new kernel" problem — see below |
+| `Connected TCP socket` (the SQL pool) | 7 | `tcp-established` in `/etc/criu/runc.conf` |
+| `Some file locks are hold by dumping tasks` | 8 | `file-locks` |
+| restore: `bind-mount /proc/0/ns/net … no such file` | 9 | `network_mode: host` — docker cannot rebuild a bridge netns whose init pid does not exist yet |
+| restore: ENOMEM remapping | 13 | `vm.overcommit_memory=1`, `vm.max_map_count=1048576`. RAM was 4/15 GB used — a policy refusal, not exhaustion. .NET's GC gives NST a **263 GB** VmSize and criu must recreate every reservation |
+| restore: `killed by signal 11`, no diagnostic | 14-16 | **criu 4.2.1 from source.** jammy packages 3.17 (2022), which dumps BC fine and segfaults the restored task |
+
+That last row is the one worth remembering: three runs went into theories about
+BC (W^X double mapping, glibc rseq, our JMP hooks) for a failure that was
+entirely criu's age. `DOTNET_EnableWriteXorExecute=0` was tested and made no
+difference; rseq was never the cause — 4.2.1 restores BC with it left on.
+**Check the criu version before theorising about the process.**
+
+What is still open, in the order it matters:
+
+1. **A fresh SQL container.** Run 16 restored against the same live SQL
+   container throughout. `tcp-close` means criu closes the pooled connections
+   rather than repairing them, so what actually has to hold is that ADO.NET
+   reconnects on first use — never put under stress.
+
+   **Run 17 tried `docker compose restart sql` and the result is void.**
+   `/var/opt/mssql/data` is a **tmpfs**, and a tmpfs is re-created every time a
+   container starts — so the restart wiped the whole instance, `master`
+   included. BC restored and then reported *"Cannot establish a connection to
+   the SQL Server/Database … The database does not exist"*, OData 400, publish
+   422. That is a measurement of deleting the database, not of replacing the
+   peer. **Do not restart the sql container expecting its data to survive.**
+
+   The probe now does the honest version (`FRESH_SQL_BEFORE_RESTORE`): back the
+   database up *after* the checkpoint, when BC is frozen and the two are
+   consistent; `docker compose rm -sf sql` and bring up a new container; assert
+   the new instance really has no CRONUS; recreate the BC login (it lived in the
+   wiped `master`) and restore the backup; then restore BC. The backup goes to a
+   host bind mount, because `RESTORE FROM DISK` reads SQL Server's filesystem —
+   the same constraint as the OPENROWSET license import in CLAUDE.md.
+
+   That shape is also the answer to "what would production look like": a BC
+   checkpoint is only usable together with a snapshot of the database it was
+   booted against. Neither half is independently restorable.
+
+   **Run 18 ran exactly that and passed** — see the RESULT section above. This
+   item is closed; what remains of it is the job boundary, in point 2.
+2. **Moving the payload.** 2.1 GB per checkpoint. On a self-hosted runner it
+   sits on disk and costs nothing. Through GitHub's cache it is the artifact
+   caching ban all over again (CLAUDE.md) — 10 GB repo cap, upload every run —
+   so **this is a self-hosted-runner feature, and on hosted runners the 51s
+   checkpoint plus the transfer is worse than the 127s boot it replaces.**
+3. **What invalidates a checkpoint.** BC version, image, and the published app
+   set at minimum. Same shape as the three stamps in CLAUDE.md.
+4. **podman** — `podman container checkpoint/restore` is first-class rather
+   than experimental and takes these options as flags. Not needed now that the
+   docker route works, but it is the fallback if the daemon's netns handling
+   becomes a problem again.
+
+Reproducing it, on any host with `CONFIG_CHECKPOINT_RESTORE=y`:
+
+1. Build criu **≥ 4.2.1** from source. Distro packages are too old.
+2. `dockerd` with `{"experimental": true}` in `/etc/docker/daemon.json`.
+3. Write the six options above into `/etc/criu/runc.conf`; set the two sysctls.
+4. Run bc with `network_mode: host`.
+5. `docker checkpoint create --leave-running=false <bc> cp1`, then
+   `docker start --checkpoint cp1 <bc>`.
+6. Pass/fail: `GET /BC/ODataV4/Company` returns 200 **and** a *novel* app still
+   publishes through the dev endpoint. Anything less is not a pass.
+
+If you resume this, do it where `criu dump` runs interactively in seconds
+rather than five-minute CI round trips — a third of the runs here were spent on
+defects in the probe rather than on the question.
+
 ## 2. XLIFF translation parsing — ~10s CPU, plus an ~11s serializer-generation stall
 
 Top CPU frame across all threads is

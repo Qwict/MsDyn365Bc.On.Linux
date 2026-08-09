@@ -27,10 +27,11 @@ on:
           Runner label(s) for the test job. Defaults to ubuntu-latest.
 
           Point this at a self-hosted runner to get the warm-filesystem paths:
-          the artifact cache and the patched service-tier volume, which between
-          them remove the ~2 GB download and the service-tier patching from
-          every job after the first. Neither needs any other input; they are
-          properties of the machine, not of the pipeline.
+          the artifact cache, the patched service-tier volume, and — where the
+          machine has been set up for it — snapshot mode, which restores a
+          checkpointed BC in ~16-30s instead of booting one in ~70-140s. None
+          of those need any other input; they are properties of the machine,
+          not of the pipeline (docs/SNAPSHOT.md).
 
           GitHub has no built-in "prefer self-hosted, fall back to hosted": a
           label naming an OFFLINE runner queues rather than falling back, so a

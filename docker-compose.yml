@@ -139,10 +139,15 @@ services:
       DOTNET_GCRetainVM: ${DOTNET_GCRetainVM:-}
       DOTNET_GCConserveMemory: ${DOTNET_GCConserveMemory:-}
       # Server GC's per-heap reservations dominate the NST's ~263 GB VmSize, so
-      # this pair is the lever on how much memory the process actually commits.
-      # Server GC stays the default — it is what makes the parallel Roslyn
-      # compile during startup and extension publish fast — and these exist for
-      # A/B experiments, not to be set in normal use.
+      # this pair is the lever on how much memory the process actually commits
+      # — and therefore on how big a CRIU checkpoint is, which is what a
+      # snapshot restore's duration tracks. DOTNET_GCHeapCount=2 halves the
+      # checkpoint (3.0G -> 1.5G) and halves criu with it (26s -> 12s).
+      #
+      # Both stay UNSET by default. Server GC is the default because it speeds
+      # up the parallel Roslyn compile during startup and extension publish, and
+      # the cost of capping the heaps has been measured on the restore but NOT
+      # on test-execution throughput. Adopt only after measuring that.
       DOTNET_gcServer: ${DOTNET_gcServer:-}
       DOTNET_GCHeapCount: ${DOTNET_GCHeapCount:-}
       DOTNET_GCNoAffinitize: ${DOTNET_GCNoAffinitize:-}
