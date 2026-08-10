@@ -91,7 +91,24 @@ artifact_cache_state() {
     artifacts_intact || { echo miss; return; }
     local have
     have=$(sed -n 's|^request=||p' "$ARTIFACT_STAMP" 2>/dev/null | head -1)
-    if [ -n "$have" ]; then
+    # Only compare stamps of the SAME KIND. download-artifacts.sh records the
+    # request as `url|<app url>` or `args|<type>|<version>|<country>`, and the
+    # two are not comparable as strings: a host that downloaded by URL and a
+    # container told the version/country describe the same artifacts and would
+    # never match. Every insider/preview leg is exactly that shape — the
+    # workflow passes bc_artifact_url to the download step, the container gets
+    # BC_VERSION/BC_COUNTRY — so a string compare declared the host's freshly
+    # downloaded artifacts stale, wiped them, and re-fetched from the RELEASED
+    # storage account, where an insider build does not exist. What came back
+    # was a 4 KB error page, reported as `BadZipFile`. Worse, the wipe happens
+    # in a directory the host shares, so it also destroyed the artifacts the
+    # workflow's own symbol-staging step reads, and the leg died much later on
+    # an unrelated-looking AL1022.
+    #
+    # Different kinds therefore fall through to the manifest comparison below,
+    # which asks the only question that can be answered from what is on disk:
+    # is this the version and country we were asked for?
+    if [ -n "$have" ] && [ "${have%%|*}" = "${WANT_ARTIFACTS%%|*}" ]; then
         [ "$have" = "$WANT_ARTIFACTS" ] && echo hit || echo "stale:downloaded for $have"
         return
     fi

@@ -364,6 +364,12 @@ jobs:
       # what makes a warm cache visible to the container instead of being
       # re-downloaded into it.
       BC_ARTIFACTS_DIR: ${{ inputs.artifact_cache_dir != '' && inputs.artifact_cache_dir || format('{0}/artifact-cache', github.workspace) }}/${{ inputs.bc_version }}
+      # Job-level for the same reason as BC_ARTIFACTS_DIR: the host downloads
+      # from this URL and stamps the directory with it, and the container reads
+      # that stamp. Step-scoped, only the download step saw it, so the container
+      # asked for BC_TYPE/BC_VERSION/BC_COUNTRY instead and could not recognise
+      # its own cache. Blank on every non-insider leg, which is the normal path.
+      BC_ARTIFACT_URL: ${{ inputs.bc_artifact_url }}
 
     steps:
       # ─── Phase 1: cheap parallel-friendly checkouts ──────────────────
@@ -391,7 +397,6 @@ jobs:
       - name: Download BC artifacts + pull docker images (parallel)
         env:
           BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
-          BC_ARTIFACT_URL: ${{ inputs.bc_artifact_url }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
