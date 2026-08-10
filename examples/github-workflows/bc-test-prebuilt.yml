@@ -67,8 +67,29 @@ env:
   # bc-linux runtime image (publicly available on GHCR).
   BC_RUNNER_IMAGE: "ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest"
 
+  # Where the extracted BC artifacts are kept. Empty = <workspace>/artifact-cache,
+  # which is correct for a GitHub-hosted runner: the VM is fresh every job, so
+  # the directory is always empty and the download happens exactly as it always
+  # did.
+  #
+  # On a SELF-HOSTED runner, point this at a path OUTSIDE the workspace
+  # (e.g. /var/cache/bc-artifacts) and the ~2 GB download is skipped entirely
+  # whenever that directory already holds the same resolved build. Concurrent
+  # jobs are safe — download-artifacts.sh locks the directory, so the second
+  # job waits and then hits the cache the first one wrote. Budget ~3.1 GB per
+  # BC version kept.
+  #
+  # This is NOT actions/cache: nothing is uploaded or downloaded through
+  # GitHub's cache service, it is just a directory that happens to survive.
+  ARTIFACT_CACHE_DIR: ""
+
 jobs:
   test:
+    # Change this to your self-hosted label to get the warm-filesystem paths:
+    # the artifact cache above, plus the patched service-tier and compiled-
+    # assembly volumes, which the entrypoint stamps and reuses on its own with
+    # nothing to configure here. Note that a label naming an offline runner
+    # QUEUES rather than falling back to hosted.
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -92,11 +113,19 @@ jobs:
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
-          mkdir -p "artifact-cache/$BC_VERSION"
+          # Resolved once, here, and exported for every later step AND for
+          # docker-compose's bind mount. They must not disagree: if the
+          # container mounts a different path than the one that was downloaded
+          # into, it sees an empty directory and re-downloads 2 GB inside the
+          # container instead of using the warm cache.
+          : "${ARTIFACT_CACHE_DIR:=$GITHUB_WORKSPACE/artifact-cache}"
+          BC_ARTIFACTS_DIR="$ARTIFACT_CACHE_DIR/$BC_VERSION"
+          echo "BC_ARTIFACTS_DIR=$BC_ARTIFACTS_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$BC_ARTIFACTS_DIR"
           (
             bc-linux/scripts/download-artifacts.sh \
               "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" \
-              "$PWD/artifact-cache/$BC_VERSION"
+              "$BC_ARTIFACTS_DIR"
           ) &
           ARTIFACT_PID=$!
           (
@@ -134,7 +163,7 @@ jobs:
           done
           KEEP_IDS=$(python3 bc-linux/scripts/resolve-keep-app-ids.py \
             $ARGS \
-            --artifact-dir "artifact-cache/$BC_VERSION")
+            --artifact-dir "$BC_ARTIFACTS_DIR")
           echo "Resolved keep set: $KEEP_IDS"
           echo "BC_CLEAR_ALL_APPS=selective" >> "$GITHUB_ENV"
           echo "BC_KEEP_APP_IDS=$KEEP_IDS" >> "$GITHUB_ENV"
@@ -167,11 +196,19 @@ jobs:
           echo "BC_LICENSE_FILE=/bc/custom-license.bclicense" >> "$GITHUB_ENV"
 
       - name: Start BC on Linux (background)
-        env:
-          BC_ARTIFACTS_DIR: ${{ github.workspace }}/artifact-cache/${{ env.BC_VERSION }}
         working-directory: bc-linux
         run: |
           bash scripts/workflow-summary.sh begin BC_BOOT "BC startup (background → wait for healthy)"
+          # Clear any leftover compose state before starting. On a GitHub-hosted
+          # runner this is a no-op (fresh VM, nothing to remove). On a self-hosted
+          # one the previous job's bc/sql containers may still be running, and
+          # `docker compose up -d` adopts a running container instead of recreating
+          # it — the healthcheck then goes green in seconds against the PREVIOUS
+          # run's database and published apps, which looks like a very fast pass.
+          # Named volumes are kept on purpose: the entrypoint stamps /bc/service
+          # and reuses it only when it matches this platform + image, so the warm
+          # path stays warm without going stale.
+          docker compose down --remove-orphans 2>/dev/null || true
           docker compose up -d
           echo "BC container started in background — continuing with other work."
 
