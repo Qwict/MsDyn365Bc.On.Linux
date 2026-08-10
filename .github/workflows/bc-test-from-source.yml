@@ -229,16 +229,22 @@ on:
       test_runner:
         description: >-
           Test execution engine. "auto" (default) = probe the live server
-          after BC is healthy and use the altool runner when the dev
-          endpoint advertises Dev API 7.0 (BC 28.0+), otherwise fall back
-          to the websocket runner — leaner where supported, works
-          everywhere. "websocket" = force the OData suite + WebSocket
-          client-session flow (scripts/run-tests.sh), which works on every
-          supported BC version. "altool" = force the AL dotnet tool's
-          native `al runtests` command driving the NST's built-in
-          /dev/TestRunnerHub SignalR hub (scripts/run-tests-altool.py);
-          fails hard when the server doesn't support it — useful to catch
-          "hub stopped working" regressions that auto would silently
+          after BC is healthy; when the dev endpoint advertises Dev API 7.0
+          (BC 28.0+), runs each test codeunit through
+          scripts/run-tests-hybrid.py, which statically scans the test
+          app's AL source (only [HandlerFunctions] usage right now — see
+          scripts/classify-handler-codeunits.py) and routes each codeunit
+          to the fast altool/TestRunnerHub path or the classic websocket
+          path per-codeunit, never both — see issue #27 for why some
+          codeunits aren't safe on the hub. Falls back to the websocket
+          runner outright on BC < 28. "websocket" = force the OData suite +
+          WebSocket client-session flow (scripts/run-tests.sh) for
+          everything, which works on every supported BC version. "altool"
+          = force the AL dotnet tool's native `al runtests` command driving
+          the NST's built-in /dev/TestRunnerHub SignalR hub
+          (scripts/run-tests-altool.py) for EVERY codeunit, no split; fails
+          hard when the server doesn't support it — useful to catch "hub
+          stopped working" regressions that auto's split would silently
           paper over. Note: the altool path runs tests WITHOUT an AL test
           runner codeunit — AI tests are unsupported and isolation comes
           from the RequiredTestIsolation property (default Codeunit).
@@ -1110,8 +1116,9 @@ jobs:
           if [ "$EFFECTIVE_RUNNER" = "auto" ]; then
             if [ -x "$HOME/.dotnet/tools/al" ] \
                && python3 scripts/run-tests-altool.py --probe --port "$BC_DEV_PORT"; then
-              EFFECTIVE_RUNNER="altool"
-              echo "auto: server supports the TestRunnerHub — using the altool runner"
+              EFFECTIVE_RUNNER="hybrid"
+              echo "auto: server supports the TestRunnerHub — splitting codeunits"
+              echo "      between the altool and websocket runners (see issue #27)"
             else
               EFFECTIVE_RUNNER="websocket"
               echo "auto: TestRunnerHub not available — using the websocket runner"
@@ -1135,20 +1142,40 @@ jobs:
             echo "=== Running tests in $base ==="
             # Capture output so we can parse the totals for telemetry.
             tmplog=$(mktemp)
-            if [ "$EFFECTIVE_RUNNER" = "altool" ]; then
-              # BC 28+: native `al runtests` against the NST's
-              # /dev/TestRunnerHub. The script prints the same
-              # "N total, P passed, F failed" and "Test codeunits:" lines
-              # as run-tests.sh, so the parsing below works for both.
-              # --transport auto: one persistent TestRunnerHub connection for
-              # all codeunits (~0.4s saved per codeunit vs spawning `al
-              # runtests` each time), falling back to the per-codeunit CLI
-              # path if the hub connection can't be established.
+            if [ "$EFFECTIVE_RUNNER" = "hybrid" ]; then
+              # BC 28+, test_runner=auto: split this app's codeunits between
+              # the fast altool path and the classic websocket path per
+              # scripts/classify-handler-codeunits.py's static scan of $d
+              # (this test app's AL source dir) — see issue #27. Nothing
+              # runs twice; each codeunit goes to exactly one runner.
               #
               # python3 -u: without it Python block-buffers stdout through
               # the `| tee`, so results land in ~8KB batches and every
               # timestamp in the log is the flush time, not the event time.
               # That made a 3s startup look like 33s when reading the log.
+              python3 -u scripts/run-tests-hybrid.py \
+                --app "$app" \
+                --al-source-dir "../project/$d" \
+                --codeunit-range "${{ inputs.codeunit_range }}" \
+                --junit-output "$junit_file" \
+                --altool-cmd "$HOME/.dotnet/tools/al" \
+                --port "$BC_DEV_PORT" \
+                --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
+                --dev-url "http://localhost:${BC_DEV_PORT}/BC/dev" \
+                --api-port "$BC_API_PORT" \
+                "${COMPANY_ARGS[@]}" \
+                --timeout 30 2>&1 | tee "$tmplog"
+            elif [ "$EFFECTIVE_RUNNER" = "altool" ]; then
+              # test_runner=altool (explicit force): EVERY codeunit through
+              # the hub, no split — this is the "catch hub regressions"
+              # mode, so it must not silently reroute anything. The script
+              # prints the same "N total, P passed, F failed" and "Test
+              # codeunits:" lines as run-tests.sh, so the parsing below
+              # works for both.
+              # --transport auto: one persistent TestRunnerHub connection for
+              # all codeunits (~0.4s saved per codeunit vs spawning `al
+              # runtests` each time), falling back to the per-codeunit CLI
+              # path if the hub connection can't be established.
               python3 -u scripts/run-tests-altool.py \
                 --app "$app" \
                 --codeunit-range "${{ inputs.codeunit_range }}" \
@@ -1172,7 +1199,7 @@ jobs:
             fi
             RUN_TESTS_RC=${PIPESTATUS[0]}
             if [ "$RUN_TESTS_RC" -ne 0 ]; then
-              echo "ERROR: run-tests.sh exited with code $RUN_TESTS_RC for $base"
+              echo "ERROR: test runner ($EFFECTIVE_RUNNER) exited with code $RUN_TESTS_RC for $base"
               ANY_TEST_FAILED=1
             fi
             # Parse "N total, P passed, F failed, ..." from run-tests.sh output.
@@ -1201,7 +1228,7 @@ jobs:
           # above), AND any test failures parsed from the per-app output.
           # Either condition fails the workflow.
           if [ "$ANY_TEST_FAILED" -ne 0 ]; then
-            echo "ERROR: at least one run-tests.sh invocation exited non-zero"
+            echo "ERROR: at least one test runner invocation exited non-zero"
             exit 1
           fi
           if [ "$TESTS_FAILED" -gt 0 ]; then

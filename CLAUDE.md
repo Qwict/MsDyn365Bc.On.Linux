@@ -627,6 +627,63 @@ AL call stack in the body. Skipped tests use `<skipped/>`.
   because the destination path is consumer-controlled and may not exist
   at container start time.
 
+## `test_runner=auto` splits codeunits between altool and websocket per-codeunit
+
+Added responding to [issue #27](https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues/27).
+The altool/TestRunnerHub runner (`run-tests-altool.py`) doesn't run tests
+under an AL Test Runner codeunit (see its own docstring), and two distinct
+correctness gaps trace back to that:
+
+1. **`[HandlerFunctions]` dispatch, including "unhandled modal → refuse
+   with Unhandled UI".** A test that expects BC to refuse an unhandled
+   modal page call (`asserterror ... .Invoke(); Assert.ExpectedError
+   ('Unhandled UI')`) doesn't get that error under the hub — the call
+   just silently returns.
+2. **Cross-codeunit `SingleInstance` state leakage under `--transport
+   hub`/`auto`.** Tests asserting that a `SingleInstance` codeunit's state
+   resets at the per-test-codeunit isolation boundary
+   (`RequiredTestIsolation = Codeunit`, the AL default) fail under one
+   persistent hub connection for a whole run and pass under websocket —
+   the hub apparently doesn't tear down and recreate the isolation scope
+   per codeunit the way a fresh session does. This is unrelated to
+   `[HandlerFunctions]` and isn't visible from any one codeunit's own
+   source.
+
+`scripts/classify-handler-codeunits.py` statically scans a test app's AL
+source for `[HandlerFunctions(...)]` usage (and the specific unhandled-
+modal-plus-`asserterror` shape) and routes each codeunit to either the fast
+path or the classic websocket path — decided ONCE, before either runner
+starts, so nothing runs twice even when many codeunits fail. It's a
+heuristic tied to the *known* failure shape, not a proof of full
+equivalence — see its docstring for the reasoning and its stated limits.
+It only works when AL source is available (`bc-test-from-source.yml`); it
+cannot recover attribute usage from a compiled `.app` — checked empirically,
+`SymbolReference.json` only serializes method signatures, not attributes.
+
+`scripts/run-tests-hybrid.py` is the orchestrator: discovers the full test
+codeunit set from the `.app` (same `SymbolReference.json` discovery
+`run-tests-altool.py` already does), classifies via the AL source dir,
+runs both legs **concurrently** (different BC endpoints, no shared-resource
+conflict), and merges JUnit + summary counts into one report. Codeunits
+with no matching AL source are conservatively routed to websocket —
+unproven safety is treated as unsafe.
+
+**The fast leg defaults to `--altool-transport cli`, not `hub`/`auto`**,
+even though hub is ~40x faster per codeunit. `cli` spawns a fresh
+`al runtests` process — a fresh connection — per codeunit, which is the
+same per-codeunit isolation shape `run-tests.sh` already gets from its own
+reconnect-before-every-codeunit design, and is the plausible reason `cli`
+doesn't show the `SingleInstance` leak that `hub` does (per the issue's
+diagnosis; not independently re-verified here). Don't change this default
+back to `hub`/`auto` without first confirming `cli` is actually clean of
+gap #2 above — the whole point of this design is that a wrong assumption
+here fails silently, the same way the original bug did.
+
+`test_runner=altool` (explicit force, BC 27/28's "catch hub regressions"
+mode) is untouched by any of this — it still runs every codeunit through
+the hub with no split, on purpose, so a real hub regression can't be
+silently rerouted around.
+
 ## Custom license override (ISV / developer license)
 
 Added in the 2026-04-08 session. Anyone touching the license import path
