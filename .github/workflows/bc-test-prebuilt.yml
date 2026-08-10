@@ -33,9 +33,11 @@ on:
           properties of the machine, not of the pipeline.
 
           GitHub has no built-in "prefer self-hosted, fall back to hosted": a
-          label naming an offline runner QUEUES rather than falling back. To get
-          fallback, compute this value in the calling workflow —
-          .github/workflows/pick-runner.yml exists for exactly that.
+          label naming an OFFLINE runner queues rather than falling back, so a
+          machine that is down stalls the pipeline instead of degrading it. If
+          you need fallback, compute this value in a prior job in the calling
+          workflow (query /actions/runners for the label, emit an output) and
+          pass the result here.
 
           Accepts a plain label ("self-hosted") or a JSON array
           ('["self-hosted","linux","bc"]') for multi-label matching.
