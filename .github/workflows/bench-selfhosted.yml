@@ -1,0 +1,194 @@
+# Benchmark snapshot mode on a SELF-HOSTED runner — the only place the win is real.
+#
+# test-snapshot.yml proves the restore is CORRECT, but it runs on an ephemeral
+# GitHub runner where the store is thrown away with the VM, so it can never show
+# the saving. This one runs where the store survives.
+#
+# It is deliberately READ-ONLY with respect to the host: it checks that the
+# machine is prepared and stops if it is not, rather than installing criu or
+# touching /etc/docker/daemon.json. Preparing the machine is a human action —
+# scripts/setup-snapshot-host.sh — because it restarts docker.
+#
+# WHAT IT WILL DO TO THE MACHINE WHILE IT RUNS
+#   - bind BC's ports directly on the host (7045-7089, 8080) because snapshot
+#     mode needs host networking, plus 11433 for SQL
+#   - repeatedly `docker compose down` THIS project's containers
+#   - write ~3 GB per snapshot into the machine-level store
+# Other compose projects and containers are untouched.
+name: Benchmark snapshot mode (self-hosted)
+
+# DISPATCH ONLY. It was push-triggered on a development branch while the
+# feature was being built; on master a push trigger would be wrong in both
+# directions. There is exactly one runner carrying the label, so any push that
+# touched scripts/snapshot.sh would queue a ~20 minute benchmark on the
+# maintainer's workstation, and anyone else's push would queue forever.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let two of these overlap: they fight over the same ports, the same
+# compose project and the same store.
+concurrency:
+  group: bench-selfhosted
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    runs-on: ${{ vars.BENCH_RUNNER && (startsWith(vars.BENCH_RUNNER, '[') && fromJSON(vars.BENCH_RUNNER) || vars.BENCH_RUNNER) || 'self-hosted' }}
+    timeout-minutes: 120
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.snapshot.yml
+      BC_VERSION: ${{ vars.BENCH_BC_VERSION || '28.1' }}
+      BC_COUNTRY: w1
+      BC_TYPE: sandbox
+      # Machine-level, not in the workspace: the whole point is that these
+      # outlive the job. BC_SNAPSHOT_DIR is left UNSET so snapshot.sh resolves
+      # the machine's own store, which is also the per-machine opt-in.
+      BC_ARTIFACTS_DIR: /var/cache/bc-linux/artifacts
+      ITERATIONS: ${{ vars.BENCH_ITERATIONS || '3' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is this machine prepared
+        run: |
+          set -e
+          # --check changes nothing. If it fails, the fix is a human running
+          # setup-snapshot-host.sh; a CI job has no business restarting docker
+          # on somebody's workstation.
+          # preflight + the host-config check are what the run path actually
+          # needs, and neither uses sudo. setup-snapshot-host.sh --check is run
+          # only for its report; it is allowed to grumble about sudo, because
+          # sudo is this script's concern and not the benchmark's.
+          ./scripts/setup-snapshot-host.sh --check || true
+          ./scripts/snapshot.sh preflight || {
+            echo "::error::machine not prepared — run scripts/setup-snapshot-host.sh on it once"
+            exit 1
+          }
+
+      - name: Artifacts
+        run: |
+          set -e
+          # No sudo anywhere in this job: setup-snapshot-host.sh creates this
+          # directory once, as part of machine setup.
+          [ -w "$BC_ARTIFACTS_DIR" ] || {
+            echo "::error::$BC_ARTIFACTS_DIR is not writable — run scripts/setup-snapshot-host.sh once"
+            exit 1
+          }
+          # Stamped and flock'd: a hit is nearly free, and re-downloading 2 GB
+          # would measure Microsoft's CDN rather than anything in this repo.
+          bash scripts/download-artifacts.sh "$BC_TYPE" "$BC_VERSION" "$BC_COUNTRY" "$BC_ARTIFACTS_DIR"
+          ./scripts/snapshot.sh key
+
+      # Four failures in this series were ENOSPC wearing other costumes. Record
+      # the space before and after so a repeat is obvious at a glance, and show
+      # what the store and docker are holding.
+      - name: Disk before
+        run: |
+          # `df` alone did not explain run 12: it showed 1.1 TB free on the
+          # filesystem holding /tmp while writes there returned ENOSPC. On btrfs
+          # that is usually METADATA exhaustion, which `df` cannot see, so check
+          # it directly. Inodes too, for the non-btrfs case.
+          df -Ph / /tmp /var/tmp /var/cache/bc-linux 2>/dev/null || df -Ph
+          echo "--- filesystem type of each path we write to ---"
+          for d in /tmp /var/tmp /var/tmp/bc-sqlstage /var/cache/bc-linux; do
+            [ -e "$d" ] && echo "  $d: $(stat -f -c %T "$d" 2>/dev/null)"
+          done
+          echo "--- btrfs allocation (metadata full = ENOSPC despite free space) ---"
+          command -v btrfs >/dev/null && sudo -n btrfs filesystem df / 2>/dev/null \
+            || btrfs filesystem df / 2>/dev/null || echo "  (needs root or not btrfs)"
+          df -Phi / 2>/dev/null | sed 's/^/  /'
+          # THE HOST'S /tmp, not this job's. runc and containerd run as the host
+          # daemon, so the ENOSPC and the ctrd-checkpoint dirs are on the host's
+          # filesystem -- which is not necessarily the one this job sees. Every
+          # -v source path is resolved by the daemon, so a container gives the
+          # host's view. Run 12's df compared the wrong /tmp and I wrongly
+          # concluded the ramdisk theory was dead.
+          echo "--- host /tmp as the docker daemon sees it ---"
+          docker run --rm -v /tmp:/t:ro busybox sh -c \
+            'df -Ph /t; echo "ctrd staging: $(ls -d /t/ctrd-checkpoint* 2>/dev/null | wc -l) dirs"; du -sh /t 2>/dev/null' \
+            2>/dev/null || echo "  (could not inspect host /tmp)"
+          echo "--- host /var/tmp as the docker daemon sees it ---"
+          docker run --rm -v /var/tmp:/t:ro busybox df -Ph /t 2>/dev/null || true
+          echo "--- this job's own view, for comparison ---"
+          df -Ph /tmp /var/tmp 2>/dev/null || true
+          echo "dangling images: $(docker images -f dangling=true -q | wc -l)"
+          docker system df 2>/dev/null | head -5
+
+      - name: Benchmark
+        id: bench
+        run: |
+          set -o pipefail
+          ./scripts/bench-snapshot.sh -n "$ITERATIONS" 2>&1 | tee bench.out
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      # Did --reflink actually engage? On btrfs/XFS a cloned checkpoint costs
+      # almost no space, so apparent size >> real usage. If the two match, the
+      # copies are real and ~2.1 GB of the restore time is disk, not CRIU.
+      - name: Disk after
+        if: always()
+        run: |
+          df -Ph / /tmp /var/tmp /var/cache/bc-linux 2>/dev/null || df -Ph
+          echo "ctrd staging dirs left: $(ls -d /tmp/ctrd-checkpoint* 2>/dev/null | wc -l)"
+          echo "dangling images: $(docker images -f dangling=true -q | wc -l)"
+          docker system df 2>/dev/null | head -5
+
+      - name: Reflink check
+        if: always()
+        run: |
+          S=$(./scripts/snapshot.sh status 2>/dev/null | awk '{print $2}')
+          [ -d "${S:-}" ] || { echo "no store to inspect"; exit 0; }
+          # `du` CANNOT see reflinks on btrfs: a shared extent is still counted
+          # in full against every file referencing it, so apparent == actual
+          # whether or not the copy was cloned. The first version of this check
+          # compared those two numbers and confidently reported "not engaged",
+          # which was measuring sparseness and compression, not sharing.
+          # `btrfs filesystem du` reports exclusive vs shared and is the tool
+          # that actually answers the question.
+          if command -v btrfs >/dev/null && btrfs filesystem du -s "$S" 2>/dev/null; then
+            echo "(Exclusive far below Total means extents are shared, i.e. reflink worked)"
+          else
+            echo "cannot determine sharing: btrfs-progs not available, or the store is not btrfs"
+            du -sh "$S" 2>/dev/null || true
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Snapshot mode on \`$(hostname)\`"
+            echo
+            echo '```'
+            # The machine block and the results table; the per-iteration lines in
+            # between are in the log and only add noise here.
+            sed -n '/^== machine/,/^$/p' bench.out 2>/dev/null || true
+            sed -n '/^== results/,$p'   bench.out 2>/dev/null || true
+            echo '```'
+            echo
+            echo "Ephemeral GitHub runners measured 130s cold vs 47s restore (n=4)."
+            echo "These numbers are the ones that matter: the store survives here, and"
+            echo "on a reflink filesystem the two 2.1 GB checkpoint copies are nearly free."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-output
+          path: bench.out
+          if-no-files-found: warn
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps -a || true
+          docker compose logs bc --tail 60 2>&1 | cut -c1-200 || true
+          ./scripts/snapshot.sh status || true
+          grep -E 'Error \(|killed by signal' /var/tmp/criu-work/criu.log 2>/dev/null | tail -20 || true
+
+      # Leave the machine idle. A benchmark that parks a BC on the developer's
+      # ports until they notice is a bad guest.
+      - name: Stop containers
+        if: always()
+        run: docker compose down --remove-orphans || true
