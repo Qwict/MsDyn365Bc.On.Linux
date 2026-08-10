@@ -391,7 +391,9 @@ itself, measured from inside `snapshot.sh`, is **37s** of that 61s.
 
 #### `DOTNET_GCHeapCount` is the lever on the restore
 
-Sweep of four GC configurations, all in one job (`scripts/bench-criu-gc.sh`):
+Sweep of four GC configurations, all in one job. The sweep harness has been
+removed now that it has answered; the numbers it produced are below and the
+knob itself stays unset by default.
 
 | configuration | vmas | checkpoint | boot | criu | restore total |
 |---|---|---|---|---|---|
@@ -563,17 +565,27 @@ and there is no syntax that asks it to.
 
 The only thing that works is to decide the label *before* the job starts, in a
 cheap job that always runs somewhere available, and feed the answer through
-`needs`. `.github/workflows/pick-runner.yml` is that job:
+`needs`:
 
 ```yaml
 jobs:
   pick:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/pick-runner.yml@master
-    with:
-      preferred: "self-hosted"      # or '["self-hosted","linux","bc"]'
-      fallback:  "ubuntu-latest"
-    secrets:
-      runner_token: ${{ secrets.RUNNER_READ_PAT }}   # optional — see below
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.p.outputs.label }}
+    steps:
+      - id: p
+        run: |
+          # Needs a PAT: listing runners requires administration:read (repo) or
+          # organization_self_hosted_runners:read (org), and GITHUB_TOKEN cannot
+          # be granted either at any permission level. Without a token you can
+          # only assert availability, not detect it — which is not fallback.
+          ONLINE=$(gh api "repos/$GITHUB_REPOSITORY/actions/runners" \
+            --jq '[.runners[] | select(.status=="online" and (.labels[].name=="self-hosted"))] | length')
+          [ "${ONLINE:-0}" -gt 0 ] && echo "label=self-hosted" >> "$GITHUB_OUTPUT" \
+                                   || echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_READ_PAT }}
 
   test:
     needs: pick
@@ -583,25 +595,10 @@ jobs:
       app_dirs: "app"
 ```
 
-**Real fallback needs a token.** The whole point is to send the job to a hosted
-runner when a self-hosted one is *configured but not available*, and only the
-API can tell you that:
-
-| | how it knows | gives you fallback? |
-|---|---|---|
-| `runner_token` given | asks the API which runners are online, and optionally which are idle | **yes** |
-| no token | reads the repository variable `BC_SELF_HOSTED` | **no** — it asserts availability rather than detecting it |
-
-Listing runners needs `administration: read` (repo) or
-`organization_self_hosted_runners: read` (org). **`GITHUB_TOKEN` cannot be
-granted either at any permission level**, so it has to be a PAT or a GitHub App
-token. That is the price of fallback; there is no way around it.
-
-Without a token, `BC_SELF_HOSTED=true` sends the job to the self-hosted label
-whether or not anything is listening, so an offline fleet means the job queues —
-for up to 24 hours — which is exactly what you were trying to avoid. The picker
-emits a `::warning::` on every such run saying so. Use it only if you cannot
-issue a token, and treat it as a manual switch rather than as fallback.
+bc-linux shipped a reusable `pick-runner.yml` for this briefly and then removed
+it: nothing in this repo called it, and the fifteen lines above are the whole
+idea. The PAT requirement is the part worth remembering — it is not a detail
+you can engineer around.
 
 With a token, the decisions are:
 

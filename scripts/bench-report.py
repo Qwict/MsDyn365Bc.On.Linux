@@ -3,7 +3,7 @@
 
 Reads a file of "rung<TAB>space separated seconds (or FAIL)" lines and prints a
 table with medians and spreads. Separate from the shell script for the same
-reason as pick-runner.py: multi-line Python inside a `run:`/heredoc block is a
+reason multi-line Python inside a `run:`/heredoc block is avoided in this repo: it is a
 recurring source of breakage in this repo.
 
 Medians rather than means, because a single slow iteration — a background
