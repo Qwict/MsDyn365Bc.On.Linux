@@ -1522,11 +1522,61 @@ internal class StartupHook
     /// calls that actually produce report output; faking success there would mean
     /// Report.SaveAs() returns true against an empty or wrong blob with nothing to notice —
     /// unacceptable for business-critical software. Out-of-scope operations must fail loud, not
-    /// silently misbehave, so those two throw PlatformNotSupportedException instead.
+    /// silently misbehave, so those two throw NavReportException (BC's own report-error type)
+    /// instead. A plain CLR exception like PlatformNotSupportedException doesn't work here — it's
+    /// not a NavBaseException, so NavApplicationObjectBase.TryInvokeAsync (the machinery behind
+    /// TryFunction/asserterror) can't treat it as a normal AL error, and it also isn't a type
+    /// NavReport.SaveAsAsync itself knows to catch, so it comes out the other side as an
+    /// "Unexpected CLR exception" that neither TryFunction nor asserterror can trap. With
+    /// NavReportException, NavReport.SaveAsAsync catches it internally (the same as any other
+    /// genuine report-rendering failure on real BC) and Report.SaveAs() returns false with
+    /// GetLastErrorText() populated — no throw at all, so AL callers use the ordinary
+    /// "if not Report.SaveAs(...) then Error(GetLastErrorText())" pattern, not asserterror.
     /// </summary>
     public class NoOpReportingProxy : System.Reflection.DispatchProxy
     {
         private static readonly HashSet<string> OutOfScopeMethods = new() { "RenderAsync", "PrintReportAsync" };
+        private static ConstructorInfo? _navReportExceptionCtor;
+        private static bool _navReportExceptionCtorLookedUp;
+
+        private static Exception CreateOutOfScopeException(string methodName)
+        {
+            string message =
+                "RDLC report rendering is not implemented on Linux BC: the Windows Reporting " +
+                "Service is stubbed out (bc-linux StartupHook.cs Patch #19). " +
+                $"IReportingServiceClient.{methodName}() cannot produce report output on this platform.";
+
+            if (!_navReportExceptionCtorLookedUp)
+            {
+                _navReportExceptionCtorLookedUp = true;
+                try
+                {
+                    // Must resolve BC's own already-loaded Nav.Types.dll, not a freshly loaded
+                    // duplicate — TryInvokeAsync's "is NavBaseException" check is a type-identity
+                    // check, and a second copy loaded via LoadFrom would have a distinct Type.
+                    Assembly? typesAsm = AppDomain.CurrentDomain.GetAssemblies()
+                        .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Types");
+                    Type? reportExType = typesAsm?.GetType("Microsoft.Dynamics.Nav.Types.Exceptions.NavReportException");
+                    _navReportExceptionCtor = reportExType?.GetConstructor(new[] { typeof(string) });
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[StartupHook] NavReportException lookup failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            if (_navReportExceptionCtor != null)
+            {
+                try { return (Exception)_navReportExceptionCtor.Invoke(new object[] { message })!; }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[StartupHook] NavReportException construction failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            // Fallback: still fails loud, just not AL-catchable.
+            return new PlatformNotSupportedException(message);
+        }
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
@@ -1536,11 +1586,8 @@ internal class StartupHook
 
             if (OutOfScopeMethods.Contains(targetMethod.Name))
             {
-                Console.WriteLine($"[StartupHook] IReportingServiceClient.{targetMethod.Name}() is out of scope on Linux — throwing PlatformNotSupportedException");
-                var ex = new PlatformNotSupportedException(
-                    "RDLC report rendering is not implemented on Linux BC: the Windows Reporting " +
-                    "Service is stubbed out (bc-linux StartupHook.cs Patch #19). " +
-                    $"IReportingServiceClient.{targetMethod.Name}() cannot produce report output on this platform.");
+                Console.WriteLine($"[StartupHook] IReportingServiceClient.{targetMethod.Name}() is out of scope on Linux — throwing NavReportException");
+                var ex = CreateOutOfScopeException(targetMethod.Name);
 
                 if (rt.IsGenericType && rt.GetGenericTypeDefinition() == typeof(ValueTask<>))
                 {
