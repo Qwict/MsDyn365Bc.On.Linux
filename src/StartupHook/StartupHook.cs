@@ -1516,18 +1516,50 @@ internal class StartupHook
     }
 
     /// <summary>
-    /// DispatchProxy that implements IReportingServiceClient by returning empty/default values.
-    /// RenderAsync returns an empty MemoryStream. Other methods complete immediately.
+    /// DispatchProxy that implements IReportingServiceClient. Lifecycle/negotiation calls
+    /// (ConfigureServiceAsync, GetServiceConfigurationAsync, DisposeAsync) are silently no-op'd —
+    /// that's what stops the gRPC-timeout crash. RenderAsync and PrintReportAsync are the only
+    /// calls that actually produce report output; faking success there would mean
+    /// Report.SaveAs() returns true against an empty or wrong blob with nothing to notice —
+    /// unacceptable for business-critical software. Out-of-scope operations must fail loud, not
+    /// silently misbehave, so those two throw PlatformNotSupportedException instead.
     /// </summary>
     public class NoOpReportingProxy : System.Reflection.DispatchProxy
     {
+        private static readonly HashSet<string> OutOfScopeMethods = new() { "RenderAsync", "PrintReportAsync" };
+
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
             if (targetMethod == null) return null;
 
+            var rt = targetMethod.ReturnType;
+
+            if (OutOfScopeMethods.Contains(targetMethod.Name))
+            {
+                Console.WriteLine($"[StartupHook] IReportingServiceClient.{targetMethod.Name}() is out of scope on Linux — throwing PlatformNotSupportedException");
+                var ex = new PlatformNotSupportedException(
+                    "RDLC report rendering is not implemented on Linux BC: the Windows Reporting " +
+                    "Service is stubbed out (bc-linux StartupHook.cs Patch #19). " +
+                    $"IReportingServiceClient.{targetMethod.Name}() cannot produce report output on this platform.");
+
+                if (rt.IsGenericType && rt.GetGenericTypeDefinition() == typeof(ValueTask<>))
+                {
+                    // ValueTask<T> has no static FromException factory (unlike Task<T>) — build a
+                    // faulted Task<T> via Task.FromException<T>, then wrap it in a ValueTask<T> via
+                    // the ValueTask<T>(Task<T>) constructor.
+                    Type inner = rt.GetGenericArguments()[0];
+                    var taskFromException = typeof(Task)
+                        .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .First(m => m.Name == "FromException" && m.IsGenericMethodDefinition && m.GetParameters().Length == 1)
+                        .MakeGenericMethod(inner);
+                    object faultedTask = taskFromException.Invoke(null, new object[] { ex })!;
+                    return Activator.CreateInstance(rt, faultedTask);
+                }
+                return ValueTask.FromException(ex);
+            }
+
             Console.WriteLine($"[StartupHook] NoOp IReportingServiceClient.{targetMethod.Name}()");
 
-            var rt = targetMethod.ReturnType;
             if (rt == typeof(ValueTask)) return ValueTask.CompletedTask;
             if (rt == typeof(Task)) return Task.CompletedTask;
 
@@ -1535,9 +1567,7 @@ internal class StartupHook
             if (rt.IsGenericType && rt.GetGenericTypeDefinition() == typeof(ValueTask<>))
             {
                 Type inner = rt.GetGenericArguments()[0];
-                object? val = inner == typeof(Stream)
-                    ? (object)new MemoryStream()
-                    : (inner.IsValueType ? Activator.CreateInstance(inner) : null);
+                object? val = inner.IsValueType ? Activator.CreateInstance(inner) : null;
                 // Construct ValueTask<T>(T result)
                 return Activator.CreateInstance(rt, val);
             }
