@@ -412,13 +412,6 @@ jobs:
       # `docker compose exec` all have to agree about which project they are
       # talking to, and they run in different steps.
       COMPOSE_PROJECT_NAME: ${{ inputs.instance_slot == 0 && 'bc-linux' || format('bc-linux-{0}', inputs.instance_slot) }}
-      SQL_PORT: ${{ 11433 + inputs.instance_slot * 100 }}
-      BC_DEV_PORT: ${{ 7049 + inputs.instance_slot * 100 }}
-      BC_ODATA_PORT: ${{ 7048 + inputs.instance_slot * 100 }}
-      BC_API_PORT: ${{ 7052 + inputs.instance_slot * 100 }}
-      BC_MGMT_PORT: ${{ 7045 + inputs.instance_slot * 100 }}
-      BC_CLIENT_PORT: ${{ 7085 + inputs.instance_slot * 100 }}
-      BC_WEBCLIENT_PORT: ${{ 8080 + inputs.instance_slot * 100 }}
 
     steps:
       # ─── Phase 1: cheap parallel-friendly checkouts ──────────────────
@@ -572,6 +565,35 @@ jobs:
       # The wait budget stops short of the job timeout so the failure is OUR
       # message ("the stack is in use by <job>") rather than GitHub's generic
       # cancellation, which is the exact confusion issue #24 was reported for.
+      # ─── Resolve this job's port block (issue #24) ───────────────────
+      # Shell, not a `${{ }}` expression, because the GitHub Actions expression
+      # language has NO arithmetic operators — only grouping, index, deref,
+      # comparison and boolean. `${{ 11433 + inputs.instance_slot * 100 }}` is
+      # not a value that evaluates to 11433 at slot 0; it is a syntax error that
+      # makes the whole workflow unloadable, so every caller fails instantly
+      # with a zero-duration run named after the file. COMPOSE_PROJECT_NAME
+      # stays a job-level expression because selecting between two strings
+      # needs no arithmetic.
+      #
+      # Written to $GITHUB_ENV rather than job env so later steps still all
+      # agree: docker compose, wait-for-bc-healthy.sh and run-tests.sh's
+      # `docker compose exec` each run in their own step.
+      - name: Resolve the container stack ports
+        run: |
+          set -e
+          SLOT=${{ inputs.instance_slot }}
+          OFF=$(( SLOT * 100 ))
+          {
+            echo "SQL_PORT=$(( 11433 + OFF ))"
+            echo "BC_DEV_PORT=$(( 7049 + OFF ))"
+            echo "BC_ODATA_PORT=$(( 7048 + OFF ))"
+            echo "BC_API_PORT=$(( 7052 + OFF ))"
+            echo "BC_MGMT_PORT=$(( 7045 + OFF ))"
+            echo "BC_CLIENT_PORT=$(( 7085 + OFF ))"
+            echo "BC_WEBCLIENT_PORT=$(( 8080 + OFF ))"
+          } >> "$GITHUB_ENV"
+          echo "slot $SLOT → project ${COMPOSE_PROJECT_NAME}, dev endpoint $(( 7049 + OFF ))"
+
       - name: Reserve the BC container stack on this machine
         run: |
           set -e
