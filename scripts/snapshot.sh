@@ -418,8 +418,14 @@ _create_db_snapshot() {
     IF DB_ID('$DB_SNAP') IS NOT NULL DROP DATABASE [$DB_SNAP];
     -- sys.master_files, NOT sys.database_files: this connection is on master,
     -- where sys.database_files describes MASTER's files. Enumerating those
-    -- produced 'All files must be specified for database snapshot creation.
-    -- Missing the file "Navision..."' and silently disabled the fast path.
+    -- made SQL Server reject the CREATE with 'All files must be specified for
+    -- database snapshot creation. Missing the file Navision...', which
+    -- silently disabled the fast path.
+    --
+    -- Keep this whole block free of double quotes. The SQL is a double-quoted
+    -- shell string, so a nested one closes it early -- harmless here by
+    -- accident, since bash re-concatenates the pieces, but shellcheck flags it
+    -- (SC2140) and the next edit inside such a region would not be harmless.
     DECLARE @f nvarchar(max) = STUFF((
       SELECT ', (NAME = [' + name + '], FILENAME = ''/var/opt/mssql/data/' + name + '_bcsnap.ss'')'
       FROM sys.master_files WHERE database_id = DB_ID('CRONUS') AND type_desc = 'ROWS'

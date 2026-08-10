@@ -114,7 +114,15 @@ jobs:
         run: |
           set -e
           ./scripts/test-snapshot-key.sh
-          shellcheck -S warning -e SC2034 scripts/snapshot.sh
+          # Every shell script snapshot mode ships, not just snapshot.sh. The
+          # one-file version caught a real quoting hazard in snapshot.sh and
+          # would have missed the identical class of bug in any of the others —
+          # it was pointed at the right file by luck, not by design.
+          shellcheck -S warning -e SC2034 \
+            scripts/snapshot.sh \
+            scripts/setup-snapshot-host.sh \
+            scripts/test-snapshot-key.sh \
+            scripts/bench-snapshot.sh
 
       # On a hosted runner this VM is thrown away, so installing criu and
       # flipping the docker daemon into experimental mode costs nothing.

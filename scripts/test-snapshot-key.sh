@@ -10,7 +10,12 @@
 # Needs neither docker daemon nor BC: it only exercises key computation, so it
 # runs in about a second. Requires the `docker` CLI (for `compose config`).
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# `|| exit` matters more here than it looks: `set -e` is deliberately off (the
+# checks below read exit codes themselves), so a failed cd would carry on and
+# compare keys computed against whatever directory the caller happened to be
+# in — which is exactly the kind of quietly-wrong pass this script exists to
+# catch elsewhere.
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 TMP=$(mktemp -d); TMP2=$(mktemp -d); trap 'rm -rf "$TMP" "$TMP2"' EXIT
 printf 'key=v1|https://x/sandbox/28.1.49838.53507/w1|https://x/sandbox/28.1.49838.53507/platform\n' \
