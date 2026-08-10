@@ -35,6 +35,10 @@ pr:
   branches:
     include: [main, master]
 
+# Point this at a self-hosted pool to get the warm-filesystem paths: the
+# artifact cache (ARTIFACT_CACHE_DIR below), plus the patched service-tier and
+# compiled-assembly volumes, which the entrypoint stamps and reuses on its own
+# with nothing to configure here.
 pool:
   vmImage: 'ubuntu-latest'
 
@@ -107,6 +111,19 @@ variables:
   # bc-linux runtime image (publicly available on GHCR — no auth needed).
   BC_RUNNER_IMAGE: 'ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest'
 
+  # Where the extracted BC artifacts are kept. The default is inside the
+  # pipeline workspace, which is correct for a Microsoft-hosted agent: the VM
+  # is fresh every run, so the directory is always empty and the download
+  # happens exactly as it always did.
+  #
+  # On a SELF-HOSTED agent, point this at a path OUTSIDE the workspace
+  # (e.g. /var/cache/bc-artifacts) and the ~2 GB download is skipped entirely
+  # whenever that directory already holds the same resolved build. Concurrent
+  # jobs are safe - download-artifacts.sh locks the directory, so the second
+  # job waits and then hits the cache the first one wrote. Budget ~3.1 GB per
+  # BC version kept.
+  ARTIFACT_CACHE_DIR: '$(Pipeline.Workspace)/artifact-cache'
+
   # Git ref of MsDyn365Bc.On.Linux to use for scripts (master, tag, or SHA).
   BC_LINUX_REF: 'master'
 
@@ -128,11 +145,11 @@ steps:
   - bash: |
       set -e
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" begin DOWNLOAD "Download BC artifacts + pull docker images"
-      mkdir -p "$(Pipeline.Workspace)/artifact-cache/$(BC_VERSION)"
+      mkdir -p "$(ARTIFACT_CACHE_DIR)/$(BC_VERSION)"
       (
         "$(Agent.BuildDirectory)/bc-linux/scripts/download-artifacts.sh" \
           "$(BC_TYPE)" "$(BC_VERSION)" "$(BC_COUNTRY)" \
-          "$(Pipeline.Workspace)/artifact-cache/$(BC_VERSION)"
+          "$(ARTIFACT_CACHE_DIR)/$(BC_VERSION)"
       ) &
       ARTIFACT_PID=$!
       (
@@ -169,7 +186,7 @@ steps:
       done
       KEEP_IDS=$(python3 "$(Agent.BuildDirectory)/bc-linux/scripts/resolve-keep-app-ids.py" \
         $ARGS \
-        --artifact-dir "$(Pipeline.Workspace)/artifact-cache/$(BC_VERSION)")
+        --artifact-dir "$(ARTIFACT_CACHE_DIR)/$(BC_VERSION)")
       echo "Resolved keep set: $KEEP_IDS"
       echo "##vso[task.setvariable variable=BC_CLEAR_ALL_APPS]selective"
       echo "##vso[task.setvariable variable=BC_KEEP_APP_IDS]$KEEP_IDS"
@@ -213,7 +230,7 @@ steps:
       set -e
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" begin BC_BOOT "BC startup (background → wait for healthy)"
       cd "$(Agent.BuildDirectory)/bc-linux"
-      export BC_ARTIFACTS_DIR="$(Pipeline.Workspace)/artifact-cache/$(BC_VERSION)"
+      export BC_ARTIFACTS_DIR="$(ARTIFACT_CACHE_DIR)/$(BC_VERSION)"
       export BC_VERSION="$(BC_VERSION)"
       export BC_COUNTRY="$(BC_COUNTRY)"
       export BC_TYPE="$(BC_TYPE)"
@@ -360,7 +377,7 @@ steps:
       done
       python3 "$(Agent.BuildDirectory)/bc-linux/scripts/stage-symbols.py" \
         $ARGS \
-        --artifact-dir "$(Pipeline.Workspace)/artifact-cache/$(BC_VERSION)" \
+        --artifact-dir "$(ARTIFACT_CACHE_DIR)/$(BC_VERSION)" \
         --out-dir "$(Pipeline.Workspace)/symbols" \
         || true   # warnings about unresolved deps are non-fatal; AL compile gives the precise error if any
       echo "Staged $(ls "$(Pipeline.Workspace)"/symbols/*.app 2>/dev/null | wc -l) symbol files"

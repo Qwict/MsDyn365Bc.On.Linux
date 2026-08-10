@@ -33,6 +33,26 @@ jobs:
       #   "50000,50001,50002"             explicit ids
       codeunit_range: "50000..99999"
 
+      # ─── Optional: run on your own hardware ─────────────────────────
+      # Both default to today's behaviour on a GitHub-hosted runner and
+      # need no configuration there.
+      #
+      # runs_on points the test job at a self-hosted runner. Accepts a
+      # plain label or a JSON array for multi-label matching. Note that a
+      # label naming an OFFLINE runner queues rather than falling back to
+      # hosted — .github/workflows/pick-runner.yml in the bc-linux repo
+      # computes a label with fallback if you need it.
+      #
+      # artifact_cache_dir keeps the extracted BC artifacts somewhere that
+      # survives between jobs. Point it OUTSIDE the workspace and the
+      # ~2 GB download is skipped whenever that directory already holds
+      # the same resolved build. The patched service tier and the
+      # compiled-assembly cache are reused automatically on a machine that
+      # keeps its docker volumes — those need no input at all.
+      #
+      # runs_on:           "self-hosted"
+      # artifact_cache_dir: "/var/cache/bc-artifacts"
+
       # ─── Optional: analyzers + rulesets ─────────────────────────────
       # All off by default. Uncomment to enable. The reusable workflow
       # fails the job if any analyzer DLL fails to load (AD0001,
