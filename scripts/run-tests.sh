@@ -292,11 +292,16 @@ raw = sys.stdin.read()
 if not raw.strip(): sys.exit(0)
 data = json.loads(raw.lstrip('\ufeff'))
 
-# Parse the optional range filter into a set/range list of allowed IDs.
+# Parse the optional range filter into (lo, hi) spans and check membership
+# by interval containment — NOT by materializing a set of every ID in the
+# range. A literal range like the AL-Go 'run everything' sentinel
+# ('1-2147483647') would otherwise mean building a ~2 billion-element
+# Python set, which OOMs the host in seconds. Spans keep membership checks
+# O(1) per codeunit regardless of how wide the range is.
 filt = os.environ.get('RANGE', '').strip()
-allowed = None  # None = no filter
+spans = None  # None = no filter
 if filt:
-    allowed = set()
+    spans = []
     for part in filt.split(','):
         part = part.strip()
         if not part:
@@ -304,14 +309,18 @@ if filt:
         if '-' in part:
             lo, hi = part.split('-', 1)
             try:
-                allowed.update(range(int(lo), int(hi) + 1))
+                spans.append((int(lo), int(hi)))
             except ValueError:
                 pass
         else:
             try:
-                allowed.add(int(part))
+                v = int(part)
+                spans.append((v, v))
             except ValueError:
                 pass
+
+def in_spans(cuid):
+    return any(lo <= cuid <= hi for lo, hi in spans)
 
 ids = []
 def collect(node):
@@ -320,7 +329,7 @@ def collect(node):
         if props.get('Subtype') != 'Test':
             continue
         cuid = cu.get('Id')
-        if allowed is not None and cuid not in allowed:
+        if spans is not None and not in_spans(cuid):
             continue
         ids.append(str(cuid))
     for ns in node.get('Namespaces', []):
