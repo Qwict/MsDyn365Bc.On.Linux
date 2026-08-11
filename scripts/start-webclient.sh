@@ -35,6 +35,18 @@ if [ -n "$PATHBASE" ]; then
     PATHBASE="${PATHBASE%/}"
 fi
 
+# Optional: tell the web client it is reached over HTTPS even though it speaks
+# plain HTTP itself. Needed when TLS is terminated by a reverse proxy in front
+# of the container: without it the client builds its redirects from its own
+# scheme and emits "Location: http://<public-host>/SignIn", which the browser
+# then follows in cleartext against a TLS-only port. Also makes BC mark its
+# session cookies Secure. Off by default (direct http://localhost access).
+REQUIRE_SSL="${BC_WEBCLIENT_REQUIRE_SSL:-false}"
+case "$REQUIRE_SSL" in
+    1|true|True|TRUE|yes) REQUIRE_SSL="true" ;;
+    *) REQUIRE_SSL="false" ;;
+esac
+
 # Locate the WebPublish layout in the platform artifact
 WEBPUBLISH=$(find "$ARTIFACTS/platform/WebClient" -maxdepth 5 -type d -name WebPublish 2>/dev/null | head -1)
 if [ -z "$WEBPUBLISH" ]; then
@@ -70,11 +82,12 @@ done)
 [ -e "$WEBCLIENT_DIR/wwwroot/Resources/Fonts" ] || ln -s fonts "$WEBCLIENT_DIR/wwwroot/Resources/Fonts"
 
 # Point the web client at the local NST (NavUserPassword over ws://localhost:7085)
-python3 - "$WEBCLIENT_DIR" "$PORT" "$PATHBASE" <<'PYEOF'
+python3 - "$WEBCLIENT_DIR" "$PORT" "$PATHBASE" "$REQUIRE_SSL" <<'PYEOF'
 import json, sys
 base = sys.argv[1]
 port = sys.argv[2]
 pathbase = sys.argv[3]
+require_ssl = sys.argv[4]
 
 # hosting.json wins over ASPNETCORE_URLS (the app calls UseUrls with it).
 # The path component (if any) is stripped back off by HttpSysStub's
@@ -88,7 +101,7 @@ n["Server"] = "localhost"
 n["ServerInstance"] = "BC"
 n["ClientServicesPort"] = "7085"
 n["ClientServicesCredentialType"] = "NavUserPassword"
-n["RequireSsl"] = "false"
+n["RequireSsl"] = require_ssl
 n["ServerHttps"] = False
 n["AuthenticateServer"] = "false"
 json.dump(d, open(p, "w"), indent=2)
