@@ -365,6 +365,27 @@ on:
         type: boolean
         default: false
 
+      artifact_name_suffix:
+        description: >-
+          Opt-in. When set, uploads the compiled production and test .app
+          files as a workflow-run artifact named
+          "bc-linux-build-<artifact_name_suffix>", staged under Apps/ and
+          TestApps/ subfolders (mirrors AL-Go's own .buildartifacts/<Kind>/
+          layout, so a downstream job can re-upload each subfolder directly
+          under its own naming convention with no reshuffling). Blank
+          (default): the upload step is skipped entirely — zero behavior
+          change for existing consumers.
+
+          actions/upload-artifact@v4 requires unique names within a
+          workflow run, so if you call this workflow more than once in the
+          same run (e.g. a matrix over projects or build modes), pass a
+          value that is unique per call. bc-linux does not invent one for
+          you — it uses whatever string you pass verbatim, so make sure
+          it's artifact-name-safe.
+        required: false
+        type: string
+        default: ""
+
     secrets:
       bc_license:
         description: >-
@@ -1010,6 +1031,37 @@ jobs:
           done
 
           bash bc-linux/scripts/workflow-summary.sh end COMPILE
+
+      # Staged right after compile (before publish/test) so the compiled
+      # apps are available for upload even if a later step fails. Skipped
+      # entirely when artifact_name_suffix is blank — see that input's
+      # description for the uniqueness contract callers must uphold.
+      - name: Stage compiled apps for upload
+        if: ${{ inputs.artifact_name_suffix != '' }}
+        env:
+          APP_DIRS: ${{ inputs.app_dirs }}
+          TEST_APP_DIRS: ${{ inputs.test_app_dirs }}
+        run: |
+          set -e
+          mkdir -p .artifact-staging/Apps .artifact-staging/TestApps
+          for d in $APP_DIRS; do
+            [ -z "$d" ] && continue
+            f="build/$(basename "$d").app"
+            [ -f "$f" ] && cp "$f" .artifact-staging/Apps/
+          done
+          for d in $TEST_APP_DIRS; do
+            [ -z "$d" ] && continue
+            f="build/$(basename "$d").app"
+            [ -f "$f" ] && cp "$f" .artifact-staging/TestApps/
+          done
+
+      - name: Upload compiled apps artifact
+        if: ${{ inputs.artifact_name_suffix != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bc-linux-build-${{ inputs.artifact_name_suffix }}
+          path: .artifact-staging/
+          if-no-files-found: warn
 
       # ─── Phase 6: synchronization point — wait for BC to be healthy ──
       - name: Wait for BC healthy

@@ -98,6 +98,18 @@ jobs:
       # this to true to enforce cops on test apps too.
       # enable_code_analyzers_on_test_apps: false
 
+      # ─── Optional: retrieve the compiled .app files ──────────────────
+      # Uncomment to upload the compiled production + test apps as a
+      # workflow-run artifact ("bc-linux-build-<suffix>"), staged under
+      # Apps/ and TestApps/ subfolders. Useful for a later job in the same
+      # run that wants to publish, sign, or re-package them without
+      # recompiling.
+      #
+      # Must be unique within the workflow run if this reusable workflow
+      # is called more than once (e.g. a matrix over projects):
+      #
+      # artifact_name_suffix: "my-app"
+
     # Optional: ISV / developer license. Without this, BC boots with the
     # public Cronus license (which is fine for most test scenarios). If
     # you need your own license, base64-encode it and store as a repo

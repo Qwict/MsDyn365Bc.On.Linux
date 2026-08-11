@@ -312,6 +312,11 @@ jobs:
       # The smoke test has no #if guards so the symbol is a no-op at the AL
       # level, but it exercises the flag wiring through the workflow and alc.
       preprocessor_symbols: "SMOKE"
+      # Exercise the compiled-apps artifact upload end-to-end on every
+      # matrix leg. Suffix must be unique per upload within the run (same
+      # constraint as the junit artifact name above) — bc_version already
+      # varies per leg, so reuse it.
+      artifact_name_suffix: "${{ matrix.bc_version }}-required"
 
   # ─── Preview matrix: NON-BLOCKING insider legs ──────────────────────────
   #     The next BC major and the next minor, discovered from Microsoft's
