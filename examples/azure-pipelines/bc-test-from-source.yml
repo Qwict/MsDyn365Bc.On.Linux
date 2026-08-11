@@ -589,6 +589,12 @@ steps:
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" end PUBLISH
     displayName: 'Publish AL apps to BC'
 
+  # Always the websocket runner (scripts/run-tests.sh), not the reusable
+  # workflow's test_runner=auto hybrid split — that split depends on the
+  # altool/TestRunnerHub runner (BC 28+, opt-in), and this example is meant
+  # to work unmodified on every supported BC version. Copy from
+  # .github/workflows/bc-test-from-source.yml in bc-linux directly if you
+  # need the faster hybrid path and are pinned to BC 28+.
   - bash: |
       set -e
       bash "$(Agent.BuildDirectory)/bc-linux/scripts/workflow-summary.sh" begin TESTS "Run AL tests"

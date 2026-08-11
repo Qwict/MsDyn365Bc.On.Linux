@@ -588,6 +588,12 @@ jobs:
           bash bc-linux/scripts/workflow-summary.sh count apps_compiled "$COMPILED_COUNT"
           bash bc-linux/scripts/workflow-summary.sh end PUBLISH
 
+      # Always the websocket runner (scripts/run-tests.sh), not the reusable
+      # workflow's test_runner=auto hybrid split — that split depends on the
+      # altool/TestRunnerHub runner (BC 28+, opt-in), and this example is
+      # meant to work unmodified on every supported BC version. Copy from
+      # .github/workflows/bc-test-from-source.yml in bc-linux directly if you
+      # need the faster hybrid path and are pinned to BC 28+.
       - name: Run AL tests
         working-directory: bc-linux
         run: |
