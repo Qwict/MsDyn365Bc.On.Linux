@@ -52,7 +52,7 @@ wait_odata() {
   local deadline=$(( $(date +%s) + 900 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-         -u BCRUNNER:Admin123! "$ODATA_URL" 2>/dev/null)" = "200" ] && return 0
+         -u "${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}" "$ODATA_URL" 2>/dev/null)" = "200" ] && return 0
     sleep 1
   done
   return 1

@@ -67,6 +67,15 @@ EXEMPT = {
     "scripts/run-tests-altool.py":
         "the altool runner is opt-in and BC 28+ only; the examples "
         "deliberately show the websocket runner, which works everywhere",
+    "scripts/run-tests-hybrid.py":
+        "test_runner=auto's hybrid split installs and probes the altool "
+        "runner (see the run-tests-altool.py exemption above) before "
+        "falling back; same reason, one level up — the examples "
+        "deliberately show only the universal websocket runner",
+    "scripts/classify-handler-codeunits.py":
+        "only used internally by run-tests-hybrid.py's static AL-source "
+        "scan (see that exemption above); not called directly by the "
+        "reusable workflow either",
     "scripts/discover-bc-versions.py":
         "version discovery drives bc-linux's own matrix; a consumer "
         "pipeline targets one version it chooses itself",

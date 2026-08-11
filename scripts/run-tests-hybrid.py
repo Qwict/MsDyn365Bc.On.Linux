@@ -198,7 +198,10 @@ def main() -> int:
     ap.add_argument("--codeunit-range", default="", help="range filter, same syntax as run-tests.sh")
     ap.add_argument("--junit-output", default="", help="write merged JUnit XML to this path")
     ap.add_argument("--company", default="")
-    ap.add_argument("--auth", default="BCRUNNER:Admin123!")
+    ap.add_argument(
+        "--auth",
+        default=f"{os.environ.get('BC_SERVER_USERNAME', 'BCRUNNER')}:{os.environ.get('BC_SERVER_PASSWORD', 'Admin123!')}",
+    )
     ap.add_argument("--base-url", default="http://localhost:7048/BC")
     ap.add_argument("--dev-url", default="http://localhost:7049/BC/dev", help="passed to run-tests.sh (websocket)")
     ap.add_argument("--server", default="http://localhost", help="passed to run-tests-altool.py")

@@ -48,6 +48,27 @@ F5 keeps opening a port-less `http://localhost/?page=...` URL after enabling
 the web client on an existing setup, delete that file (or restart VS Code's
 AL services) to force a re-read.
 
+### Path-prefix reverse proxying
+
+Set `BC_WEBCLIENT_PATHBASE` (e.g. `/my-tier`) when a reverse proxy in front
+of the container routes by path on a single shared hostname/port instead of
+by hostname or port — the case where adding a hostname or a port per tier
+isn't an option:
+
+```bash
+BC_WEBCLIENT=1 BC_WEBCLIENT_PATHBASE=/my-tier docker compose up -d --wait
+```
+
+`start-webclient.sh` appends the prefix to the URL it writes into
+`hosting.json`. `HttpSysStub`'s `UrlStrippingStartupFilter` (shared with the
+NST) already strips path components off server addresses that Kestrel can't
+bind directly and calls `UsePathBase()` with the stripped path, so BC's own
+middleware — redirects (`Location: /SignIn?...`), asset URLs, `ReturnUrl` —
+routes correctly under the prefix without any further configuration. The
+entrypoint reuses the same prefix for `PublicWebBaseUrl` so the AL debugger's
+F5 launch URL matches. Leave it unset for the default root-path setup; it
+has no effect on the NST or on `BC_WEBCLIENT=0`.
+
 ## Architecture
 
 ```

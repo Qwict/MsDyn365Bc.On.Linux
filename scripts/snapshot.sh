@@ -542,7 +542,7 @@ _du_store() { du -sh "$1" 2>/dev/null | cut -f1 || echo "?"; }
 _bc_odata() {
   local code
   code=$(docker compose exec -T bc curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-    -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company 2>/tmp/snapshot-odata.err) || true
+    -u "${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}" http://localhost:7048/BC/ODataV4/Company 2>/tmp/snapshot-odata.err) || true
   printf '%s' "${code:-000}"
 }
 
@@ -552,7 +552,7 @@ _odata_diagnosis() {
   log "  docker compose exec stderr: $(head -c 300 /tmp/snapshot-odata.err 2>/dev/null | tr '\n' ' ')"
   log "  bc container: $(docker compose ps --format '{{.Name}} {{.State}} {{.Health}}' bc 2>/dev/null | head -1)"
   log "  host port 7048: $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-        -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company 2>/dev/null || echo unreachable)"
+        -u "${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}" http://localhost:7048/BC/ODataV4/Company 2>/dev/null || echo unreachable)"
   # BC writes multi-line diagnostic blocks -- a stack trace, then ProcessId,
   # Tag, ThreadId, CounterInformation and so on. A plain `--tail 12` therefore
   # lands in the MIDDLE of one and shows nothing but frame lines and empty

@@ -108,9 +108,27 @@ After `docker compose up`, these are available:
 | Client (WS)  | `ws://localhost:7085/BC`                  | WebSocket client services (TestPage) |
 | Web client   | `http://localhost:8080`                   | Browser UI (opt-in, `BC_WEBCLIENT=1`) |
 
-**Authentication:** `BCRUNNER` / `Admin123!` (NavUserPassword).
+**Authentication:** `BCRUNNER` / `Admin123!` (NavUserPassword) by default.
 Note the username is *not* `admin` — `BCRUNNER` is used so test code that
 needs to delete a user named "ADMIN" doesn't nuke the runner's own session.
+
+Override with `BC_SERVER_USERNAME` / `BC_SERVER_PASSWORD`:
+
+```bash
+BC_SERVER_USERNAME=MYUSER BC_SERVER_PASSWORD='MyP@ss1!' docker compose up -d --wait
+curl -sf -u MYUSER:MyP@ss1! http://localhost:7048/BC/ODataV4/Company
+```
+
+The scripts in `scripts/` (`run-tests.sh`, `run-tests-altool.py`,
+`run-tests-hybrid.py`, `publish-app.sh`, etc.) pick the same two env vars up
+automatically, so no `--auth` flag is needed once the container was booted
+with them. Password verification is not actually enforced on Linux —
+`NavUser.TryAuthenticate`'s hash check doesn't port from Windows, so
+StartupHook Patch #16b bypasses it and any password authenticates as an
+existing, enabled user. `BC_SERVER_PASSWORD` still works end-to-end (that
+exact value is what you type/pass), it just isn't a real access control —
+this is a local dev/CI sandbox account, not something to expose to an
+untrusted network.
 
 ### Web client (browser UI)
 
