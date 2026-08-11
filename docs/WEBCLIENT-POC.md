@@ -69,6 +69,24 @@ entrypoint reuses the same prefix for `PublicWebBaseUrl` so the AL debugger's
 F5 launch URL matches. Leave it unset for the default root-path setup; it
 has no effect on the NST or on `BC_WEBCLIENT=0`.
 
+### TLS terminated by the proxy
+
+Set `BC_WEBCLIENT_REQUIRE_SSL=1` when that reverse proxy also terminates TLS.
+The web client speaks plain HTTP and builds its redirects from its own scheme,
+so without it the sign-in redirect comes back as
+`Location: http://<public-host>:<port>/SignIn?...`. The browser then follows
+that in cleartext against a TLS-only port and the request is reset
+(`ERR_CONNECTION_RESET`). The flag flips `RequireSsl` in `navsettings.json`, so
+BC emits `https://` and marks its session cookies `Secure`. It does not change
+how the client reaches the NST - that hop stays plain `ws://localhost:7085`
+(`ServerHttps` is unaffected). Leave it unset for direct `http://localhost`
+access.
+
+```bash
+BC_WEBCLIENT=1 BC_WEBCLIENT_PATHBASE=/my-tier BC_WEBCLIENT_REQUIRE_SSL=1 \
+  docker compose up -d --wait
+```
+
 ## Architecture
 
 ```
