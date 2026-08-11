@@ -18,6 +18,23 @@ ARTIFACTS="${ARTIFACTS:-/bc/artifacts}"
 WEBCLIENT_DIR="${WEBCLIENT_DIR:-/bc/webclient}"
 HOOK_DLL="/bc/webclient-hook/WebClientHook.dll"
 
+# Optional path-prefix support for reverse proxies that route by path
+# (single hostname/port, e.g. https://host:port/my-tier) rather than by
+# hostname or port. HttpSysStub's UrlStrippingStartupFilter already strips
+# a path component off the server address and calls UsePathBase() with it
+# (see src/stubs/HttpSysStub/HttpSysStub.cs) — this just gives that a
+# documented, first-class way in from docker compose. Normalize to a
+# leading slash / no trailing slash; HttpSysStub trims a trailing slash
+# itself, but the leading slash is required for Uri.AbsolutePath parsing.
+PATHBASE="${BC_WEBCLIENT_PATHBASE:-}"
+if [ -n "$PATHBASE" ]; then
+    case "$PATHBASE" in
+        /*) ;;
+        *) PATHBASE="/$PATHBASE" ;;
+    esac
+    PATHBASE="${PATHBASE%/}"
+fi
+
 # Locate the WebPublish layout in the platform artifact
 WEBPUBLISH=$(find "$ARTIFACTS/platform/WebClient" -maxdepth 5 -type d -name WebPublish 2>/dev/null | head -1)
 if [ -z "$WEBPUBLISH" ]; then
@@ -53,13 +70,16 @@ done)
 [ -e "$WEBCLIENT_DIR/wwwroot/Resources/Fonts" ] || ln -s fonts "$WEBCLIENT_DIR/wwwroot/Resources/Fonts"
 
 # Point the web client at the local NST (NavUserPassword over ws://localhost:7085)
-python3 - "$WEBCLIENT_DIR" "$PORT" <<'PYEOF'
+python3 - "$WEBCLIENT_DIR" "$PORT" "$PATHBASE" <<'PYEOF'
 import json, sys
 base = sys.argv[1]
 port = sys.argv[2]
+pathbase = sys.argv[3]
 
-# hosting.json wins over ASPNETCORE_URLS (the app calls UseUrls with it)
-json.dump({"urls": f"http://*:{port}"}, open(f"{base}/hosting.json", "w"), indent=2)
+# hosting.json wins over ASPNETCORE_URLS (the app calls UseUrls with it).
+# The path component (if any) is stripped back off by HttpSysStub's
+# UrlStrippingStartupFilter, which calls UsePathBase() with it.
+json.dump({"urls": f"http://*:{port}{pathbase}"}, open(f"{base}/hosting.json", "w"), indent=2)
 
 p = f"{base}/navsettings.json"
 d = json.load(open(p, encoding="utf-8-sig"))
@@ -81,7 +101,7 @@ json.dump(d, open(p, "w"), indent=2)
 print("[webclient] navsettings.json + runtimeconfig.json patched")
 PYEOF
 
-echo "[webclient] Starting Prod.Client.WebCoreApp on http://0.0.0.0:$PORT (NST: localhost:7085, auth: NavUserPassword)"
+echo "[webclient] Starting Prod.Client.WebCoreApp on http://0.0.0.0:$PORT${PATHBASE} (NST: localhost:7085, auth: NavUserPassword)"
 cd "$WEBCLIENT_DIR"
 # DOTNET_STARTUP_HOOKS: replace the NST hook with the web-client-specific one.
 # The NST hook contains patches that assume the NST process and must not run here.

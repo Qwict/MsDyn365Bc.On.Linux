@@ -45,7 +45,7 @@
 bc_publish_app() {
     local app="$1"
     local dev_url="${2:-http://localhost:7049/BC/dev}"
-    local auth="${3:-BCRUNNER:Admin123!}"
+    local auth="${3:-${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}}"
 
     if [ -z "$app" ]; then
         echo "bc_publish_app: missing required argument: <app-path>" >&2

@@ -101,6 +101,17 @@ services:
       BC_COUNTRY: ${BC_COUNTRY:-w1}
       BC_TYPE: ${BC_TYPE:-sandbox}
       SA_PASSWORD: ${SA_PASSWORD:-Passw0rd123!}
+      # The NavUserPassword login the entrypoint creates for OData/SOAP/dev-endpoint/
+      # web-client sign-in (SUPER access). Defaults preserve the long-documented
+      # BCRUNNER/Admin123! pair; override both to change the account name, e.g. when
+      # a consumer's own tooling expects a specific username. Note the *password*
+      # here is cosmetic, not enforced: NavUser.TryAuthenticate's hash check doesn't
+      # verify on Linux (StartupHook Patch #16b bypasses it and always succeeds), so
+      # ANY password authenticates as this user — see scripts/entrypoint.sh. This is
+      # a local dev/CI sandbox account, not a security boundary; don't expose these
+      # ports to an untrusted network.
+      BC_SERVER_USERNAME: ${BC_SERVER_USERNAME:-BCRUNNER}
+      BC_SERVER_PASSWORD: ${BC_SERVER_PASSWORD:-Admin123!}
       BC_CLEAR_ALL_APPS: ${BC_CLEAR_ALL_APPS:-false}
       BC_SKIP_APP_PUBLISH: ${BC_SKIP_APP_PUBLISH:-false}
       BC_KEEP_APP_IDS: ${BC_KEEP_APP_IDS:-}
@@ -129,6 +140,11 @@ services:
       # Opt-in: self-host Microsoft's real BC web client on Kestrel (port 8080).
       # EXPERIMENTAL PoC — see docs/WEBCLIENT-POC.md.
       BC_WEBCLIENT: ${BC_WEBCLIENT:-0}
+      # Optional path prefix for a reverse proxy that routes by path on a single
+      # shared hostname/port (e.g. "/my-tier"), instead of by hostname or port.
+      # Reused for both Kestrel's bound URL and PublicWebBaseUrl. See
+      # docs/WEBCLIENT-POC.md.
+      BC_WEBCLIENT_PATHBASE: ${BC_WEBCLIENT_PATHBASE:-}
       SQL_SERVER: sql
       # .NET runtime tuning. Defaults are inherited from the entrypoint
       # (gcServer=1, TieredCompilation=0). These pass-throughs let us A/B
@@ -169,7 +185,7 @@ services:
       # Cronus license is used. No effect when unset.
       - ${BC_LICENSE_HOST_PATH:-/dev/null}:/bc/custom-license.bclicense:ro
     healthcheck:
-      test: test -f /tmp/bc-ready && curl -sf -o /dev/null -u BCRUNNER:Admin123! http://localhost:7048/BC/ODataV4/Company || exit 1
+      test: test -f /tmp/bc-ready && curl -sf -o /dev/null -u '${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}' http://localhost:7048/BC/ODataV4/Company || exit 1
       # 2s interval (was 15s, then 5s) so the healthy transition is seen within
       # ~2s of the entrypoint touching /tmp/bc-ready. With cold boots down to
       # ~30-80s (R2R Merkle seeding + fast downloads), a 5s interval was

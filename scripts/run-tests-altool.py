@@ -37,7 +37,10 @@ Usage:
 
 Authentication: the AL tool reads BC_SERVER_USERNAME / BC_SERVER_PASSWORD
 from the environment for --authentication UserPassword. This script sets
-them from --auth (default BCRUNNER:Admin123!, same as run-tests.sh).
+them from --auth, which itself defaults from those same two env vars
+(falling back to BCRUNNER:Admin123!, same as run-tests.sh) — so a container
+booted with a non-default BC_SERVER_USERNAME/BC_SERVER_PASSWORD (see
+docker-compose.yml) needs no extra flag here.
 
 --transport {cli,hub,auto}: 'cli' (default) shells out to `al runtests <id>`
 once per codeunit — this is the path validated above. 'auto' tries hub and
@@ -952,7 +955,11 @@ def main() -> int:
     ap.add_argument("--codeunit-range", default="", help="range filter, same syntax as run-tests.sh")
     ap.add_argument("--junit-output", default="", help="write JUnit XML to this path")
     ap.add_argument("--company", default="", help="company name (default: auto-detect via OData)")
-    ap.add_argument("--auth", default="BCRUNNER:Admin123!", help="user:pass (default matches run-tests.sh)")
+    ap.add_argument(
+        "--auth",
+        default=f"{os.environ.get('BC_SERVER_USERNAME', 'BCRUNNER')}:{os.environ.get('BC_SERVER_PASSWORD', 'Admin123!')}",
+        help="user:pass (default: BC_SERVER_USERNAME/BC_SERVER_PASSWORD env vars, falling back to BCRUNNER:Admin123!, matching run-tests.sh)",
+    )
     ap.add_argument("--server", default="http://localhost", help="BC server URL, no port (default http://localhost)")
     ap.add_argument("--server-instance", default="BC", help="NST instance name (default BC)")
     ap.add_argument("--port", type=int, default=7049, help="dev endpoint port (default 7049)")

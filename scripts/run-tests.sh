@@ -36,7 +36,10 @@ unset CDPATH
 # === Configuration & CLI Parsing ===
 BASE_URL="http://localhost:7048/BC"
 DEV_URL="http://localhost:7049/BC/dev"
-AUTH="BCRUNNER:Admin123!"
+# Matches the container's login (BC_SERVER_USERNAME/BC_SERVER_PASSWORD in
+# docker-compose.yml — see scripts/entrypoint.sh); override with --auth if
+# the container was booted with a non-default login.
+AUTH="${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}"
 COMPANY=""
 CODEUNIT_RANGE=""
 APP_FILE=""

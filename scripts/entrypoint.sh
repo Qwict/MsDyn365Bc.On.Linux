@@ -855,18 +855,32 @@ else
     log_step "Cleared test framework global entries (will re-publish via dev endpoint)"
 fi
 
-# Service user for scripting/OData/dev endpoint (password hash for Admin123! with GUID 00000000-0000-0000-0000-000000000001)
-# Named BCRUNNER (not ADMIN) so tests can freely create/delete/disable an "ADMIN" user.
+# Service user for scripting/OData/dev endpoint/web client sign-in (SUPER access).
+# Username defaults to BCRUNNER (not ADMIN) so tests can freely create/delete/disable
+# an "ADMIN" user; override via BC_SERVER_USERNAME/BC_SERVER_PASSWORD (docker-compose.yml
+# passes these through — see the comment there). GUID 00000000-0000-0000-0000-000000000001.
+#
+# The stored password hash is a fixed placeholder, NOT a hash of BC_SERVER_PASSWORD —
+# NavUser.TryAuthenticate's hash check doesn't verify on Linux (the Windows hash format
+# doesn't port; StartupHook Patch #16b bypasses verification and always returns true),
+# so whatever the DB row holds is never compared against what the client sends. Any
+# password authenticates as this user once it exists with SUPER access; the [Password]
+# column only needs to be non-empty for the platform to treat the account as
+# NavUserPassword-eligible. That means BC_SERVER_PASSWORD is honored end-to-end (that
+# value really does work at every login surface) without needing to reproduce BC's
+# hash algorithm, which isn't documented anywhere outside the platform binaries.
 USER_GUID='00000000-0000-0000-0000-000000000001'
+BC_SERVER_USERNAME="${BC_SERVER_USERNAME:-BCRUNNER}"
+BC_SERVER_PASSWORD="${BC_SERVER_PASSWORD:-Admin123!}"
 PASSWORD_HASH='aXD91GRctWiXaqXeWbXhxQ==-V3'
 $SQLCMD_DB -Q "
-IF NOT EXISTS (SELECT 1 FROM [User] WHERE [User Name] = 'BCRUNNER')
+IF NOT EXISTS (SELECT 1 FROM [User] WHERE [User Name] = N'$BC_SERVER_USERNAME')
 BEGIN
     INSERT INTO [User] ([User Security ID], [User Name], [Full Name], [State], [Expiry Date],
         [Windows Security ID], [Change Password], [License Type], [Authentication Email],
         [Contact Email], [Exchange Identifier], [Application ID],
         [\$systemId], [\$systemCreatedAt], [\$systemCreatedBy], [\$systemModifiedAt], [\$systemModifiedBy])
-    VALUES ('$USER_GUID', N'BCRUNNER', N'BC Runner', 0, '2099-12-31', N'S-1-5-21-2074085148-119339936-2019613796-1001', 0, 0, N'', N'', N'',
+    VALUES ('$USER_GUID', N'$BC_SERVER_USERNAME', N'BC Runner', 0, '2099-12-31', N'S-1-5-21-2074085148-119339936-2019613796-1001', 0, 0, N'', N'', N'',
         '00000000-0000-0000-0000-000000000000',
         NEWID(), GETUTCDATE(), '$USER_GUID', GETUTCDATE(), '$USER_GUID');
     INSERT INTO [User Property] ([User Security ID], [Password], [Name Identifier],
@@ -909,7 +923,7 @@ BEGIN
         NEWID(), GETUTCDATE(), '$SVC_GUID', GETUTCDATE(), '$SVC_GUID');
 END
 " 2>/dev/null
-log_step "Database ready (BCRUNNER / Admin123!). Step 3 (DB setup): $(($(date +%s) - STEP3_START))s"
+log_step "Database ready ($BC_SERVER_USERNAME / $BC_SERVER_PASSWORD). Step 3 (DB setup): $(($(date +%s) - STEP3_START))s"
 
 # =============================================================================
 # Step 4: Start BC server in background, publish test runner, then wait
@@ -935,8 +949,21 @@ fi
 # empty the generated URL is the port-less http://localhost/?page=N, which lands on
 # port 80 and the debugger never binds a session. Override the default with
 # BC_WEBCLIENT_PUBLIC_URL when the host port differs (parallel instances).
+#
+# BC_WEBCLIENT_PATHBASE (e.g. "/my-prefix") mirrors the same prefix start-webclient.sh
+# gave Kestrel, so a reverse proxy that routes by path (one hostname/port shared by
+# several tiers) sees a matching PublicWebBaseUrl instead of one that points back
+# outside the prefix. See docs/WEBCLIENT-POC.md.
 if [ "${BC_WEBCLIENT:-0}" = "1" ]; then
-    PUBLIC_WEB_URL="${BC_WEBCLIENT_PUBLIC_URL:-http://localhost:${BC_WEBCLIENT_PORT:-8080}/}"
+    WEBCLIENT_PATHBASE="${BC_WEBCLIENT_PATHBASE:-}"
+    if [ -n "$WEBCLIENT_PATHBASE" ]; then
+        case "$WEBCLIENT_PATHBASE" in
+            /*) ;;
+            *) WEBCLIENT_PATHBASE="/$WEBCLIENT_PATHBASE" ;;
+        esac
+        WEBCLIENT_PATHBASE="${WEBCLIENT_PATHBASE%/}"
+    fi
+    PUBLIC_WEB_URL="${BC_WEBCLIENT_PUBLIC_URL:-http://localhost:${BC_WEBCLIENT_PORT:-8080}${WEBCLIENT_PATHBASE}/}"
     sed -i "s|PublicWebBaseUrl\" value=\"[^\"]*\"|PublicWebBaseUrl\" value=\"$PUBLIC_WEB_URL\"|" "$SERVICE_DIR/CustomSettings.config"
     log_step "PublicWebBaseUrl set to $PUBLIC_WEB_URL (AL debugger F5 / launch-mode browser URL)"
 fi
@@ -1329,7 +1356,7 @@ PYEOF
                 fi
 
                 HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 300 \
-                    -u "BCRUNNER:Admin123!" -X POST \
+                    -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_FILE;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=forcesync" 2>/dev/null)
                 echo "[entrypoint]   $APP_NAME $APP_VER: HTTP $HTTP"
@@ -1433,7 +1460,7 @@ PYEOF
                 # tenant deps), so we have to wipe stuck-published apps in
                 # SQL beforehand instead.
                 HTTP=$(curl -s -o /tmp/install-tenant.out -w "%{http_code}" --max-time 120 \
-                    -u "BCRUNNER:Admin123!" -X POST \
+                    -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_PATH;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=synchronize" 2>/dev/null)
                 # Treat "already deployed as Global" 422s as benign — they
@@ -1498,7 +1525,7 @@ PYEOF
                 [ -z "$APP_PATH" ] && continue
                 NAME=$(basename "$APP_PATH")
                 HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 \
-                    -u "BCRUNNER:Admin123!" -X POST \
+                    -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_PATH;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=synchronize" 2>/dev/null)
                 echo "[entrypoint]   $NAME: HTTP $HTTP"
@@ -1520,7 +1547,7 @@ PYEOF
                 fi
                 NAME=$(basename "$app")
                 HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 600 \
-                    -u "BCRUNNER:Admin123!" -X POST \
+                    -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$app;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=forcesync" 2>/dev/null)
                 echo "[entrypoint]   $NAME: HTTP $HTTP"
@@ -1531,7 +1558,7 @@ PYEOF
         if [ -f /bc/testrunner/TestRunner.app ]; then
             echo "[entrypoint] Publishing Test Runner Extension..."
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
-                -u "BCRUNNER:Admin123!" -X POST \
+                -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                 -F "file=@/bc/testrunner/TestRunner.app;type=application/octet-stream" \
                 "$DEV_URL/apps?SchemaUpdateMode=synchronize" 2>&1)
             echo "[entrypoint] Test Runner Extension: HTTP $HTTP_CODE"
