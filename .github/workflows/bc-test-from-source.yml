@@ -1012,6 +1012,8 @@ jobs:
           # Production apps always get the analyzer flags (when configured).
           for d in $APP_DIRS; do
             [ -z "$d" ] && continue
+            mkdir -p "project/$d/.alpackages"
+            cp build/*.app "project/$d/.alpackages/" 2>/dev/null || true
             compile_dir "project/$d" "${ANALYZER_FLAGS[@]}"
           done
 
