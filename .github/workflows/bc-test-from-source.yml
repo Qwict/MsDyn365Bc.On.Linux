@@ -191,6 +191,39 @@ on:
         required: false
         type: string
         default: ""
+      app_version_major_minor:
+        description: >-
+          Opt-in rewrite of app.json "version"'s major.minor segments before
+          compile. Blank (default): every app keeps its own committed
+          major.minor untouched. Matches the shape of AL-Go's own
+          Update-AppJsonProperties helper (Actions/.Modules/CompileFromWorkspace.psm1),
+          so a caller can pass its already-computed MajorMinorVersion through
+          unchanged. Has no effect unless app_version_build or
+          app_version_revision is also set — a version patch with both build
+          and revision left at 0 would be a no-op anyway, so the step doesn't
+          bother writing app.json for nothing.
+        required: false
+        type: string
+        default: ""
+      app_version_build:
+        description: >-
+          Opt-in rewrite of app.json "version"'s build (3rd) segment before
+          compile. Blank/0 (default): the committed build segment is left
+          untouched. Set this (together with app_version_revision as needed)
+          on every CI run so each compiled app's version keeps climbing —
+          otherwise BC's Deploy step sees a same-or-lower version than what's
+          already installed and skips the app. See issue #38.
+        required: false
+        type: number
+        default: 0
+      app_version_revision:
+        description: >-
+          Opt-in rewrite of app.json "version"'s revision (4th) segment
+          before compile. Blank/0 (default): the committed revision segment
+          is left untouched.
+        required: false
+        type: number
+        default: 0
       al_tool_version:
         description: >-
           Which Linux AL compiler to use
@@ -895,6 +928,53 @@ jobs:
               print(f"  patched {p}: runtime → {sys.argv[2]}")
           else:
               print(f"  {p}: runtime already {sys.argv[2]}, skip")
+          PYEOF
+          done
+
+      # Opt-in only. Mirrors AL-Go's own Update-AppJsonProperties (called
+      # from Compile.ps1 before every Windows build) — a caller like AL-Go
+      # can pass its already-computed major.minor/build/revision straight
+      # through so a Linux compile produces a version that keeps climbing
+      # run over run, the same way the Windows path already does. Without
+      # this, every compile reuses whatever version is committed in
+      # app.json, BC's Deploy step sees it as no higher than what's already
+      # installed, and skips the app. See issue #38.
+      - name: Patch app.json version
+        if: ${{ inputs.app_version_major_minor != '' || inputs.app_version_build != 0 || inputs.app_version_revision != 0 }}
+        env:
+          APP_DIRS: ${{ inputs.app_dirs }}
+          TEST_APP_DIRS: ${{ inputs.test_app_dirs }}
+          MAJOR_MINOR: ${{ inputs.app_version_major_minor }}
+          BUILD_NUMBER: ${{ inputs.app_version_build }}
+          REVISION_NUMBER: ${{ inputs.app_version_revision }}
+        run: |
+          echo "Patching app.json version: major.minor=${MAJOR_MINOR:-<unchanged>} build=${BUILD_NUMBER:-<unchanged>} revision=${REVISION_NUMBER:-<unchanged>}"
+          for d in $APP_DIRS $TEST_APP_DIRS; do
+            [ -z "$d" ] && continue
+            F="project/$d/app.json"
+            [ -f "$F" ] || continue
+            python3 - "$F" "$MAJOR_MINOR" "$BUILD_NUMBER" "$REVISION_NUMBER" <<'PYEOF'
+          import sys, json, pathlib
+          p = pathlib.Path(sys.argv[1])
+          major_minor, build, revision = sys.argv[2], sys.argv[3], sys.argv[4]
+          d = json.loads(p.read_text())
+          parts = d.get("version", "1.0.0.0").split(".")
+          while len(parts) < 4:
+              parts.append("0")
+          if major_minor:
+              mm = major_minor.split(".")
+              parts[0], parts[1] = mm[0], mm[1]
+          if build and build != "0":
+              parts[2] = build
+          if revision and revision != "0":
+              parts[3] = revision
+          new_version = ".".join(parts)
+          if d.get("version") != new_version:
+              d["version"] = new_version
+              p.write_text(json.dumps(d, indent=2) + "\n")
+              print(f"  patched {p}: version → {new_version}")
+          else:
+              print(f"  {p}: version already {new_version}, skip")
           PYEOF
           done
 
