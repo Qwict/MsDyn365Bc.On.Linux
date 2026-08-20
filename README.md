@@ -122,12 +122,7 @@ curl -sf -u MYUSER:MyP@ss1! http://localhost:7048/BC/ODataV4/Company
 The scripts in `scripts/` (`run-tests.sh`, `run-tests-altool.py`,
 `run-tests-hybrid.py`, `publish-app.sh`, etc.) pick the same two env vars up
 automatically, so no `--auth` flag is needed once the container was booted
-with them. Native `NavUser.TryAuthenticate` password verification is used by
-default. BC 28.1 BE has been verified to reject both incorrect passwords and
-unknown users. `BC_SERVER_PASSWORD` is the password required for the created
-user. An older compatibility bypass remains available only as
-`BC_ALLOW_INSECURE_PASSWORD_AUTH=1`; it accepts any password for an existing,
-enabled user and must never be used for a network-reachable tenant.
+with them. BC validates the configured user credentials.
 
 ### Web client (browser UI)
 
@@ -342,7 +337,6 @@ BC_DEV_PORT=17049 docker compose up -d
 | `BC_API_PORT`     | `7052`           | API v2.0 port                                                                |
 | `BC_MGMT_PORT`    | `7045`           | Management endpoint port                                                     |
 | `BC_CLIENT_PORT`  | `7085`           | WebSocket client services port (used by `run-tests.sh`)                      |
-| `BC_ALLOW_INSECURE_PASSWORD_AUTH` | unset | Emergency compatibility switch for older artifacts. `1` bypasses password verification and must not be used for network-reachable tenants. |
 | `BC_LICENSE_HOST_PATH` | unset       | Optional host path to a `.bclicense` file. Mounted into bc + sql containers and imported INSTEAD of the default Cronus license. See "Custom license" below. |
 | `BC_LICENSE_FILE` | unset            | Path INSIDE the container of the license file to import. Set to `/bc/custom-license.bclicense` together with `BC_LICENSE_HOST_PATH`. |
 | `BC_SQL_IMAGE`    | GHCR mirror      | SQL Server image. See "SQL Server image" below.                              |
