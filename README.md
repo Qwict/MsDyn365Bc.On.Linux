@@ -122,13 +122,7 @@ curl -sf -u MYUSER:MyP@ss1! http://localhost:7048/BC/ODataV4/Company
 The scripts in `scripts/` (`run-tests.sh`, `run-tests-altool.py`,
 `run-tests-hybrid.py`, `publish-app.sh`, etc.) pick the same two env vars up
 automatically, so no `--auth` flag is needed once the container was booted
-with them. Password verification is not actually enforced on Linux —
-`NavUser.TryAuthenticate`'s hash check doesn't port from Windows, so
-StartupHook Patch #16b bypasses it and any password authenticates as an
-existing, enabled user. `BC_SERVER_PASSWORD` still works end-to-end (that
-exact value is what you type/pass), it just isn't a real access control —
-this is a local dev/CI sandbox account, not something to expose to an
-untrusted network.
+with them. BC validates the configured user credentials.
 
 ### Web client (browser UI)
 
