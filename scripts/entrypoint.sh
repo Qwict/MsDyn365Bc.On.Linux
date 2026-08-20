@@ -642,11 +642,24 @@ if [ -z "$LICENSE_TO_IMPORT" ] && [ -n "$LICENSE_FILE" ] && [ -f "$ARTIFACTS/app
     LICENSE_TO_IMPORT="$ARTIFACTS/app/$LICENSE_FILE"
 fi
 if [ -n "$LICENSE_TO_IMPORT" ]; then
-    $SQLCMD_DB -Q "
+    if ! $SQLCMD_DB -Q "
     UPDATE [\$ndo\$dbproperty]
     SET [license] = (SELECT BulkColumn FROM OPENROWSET(BULK '$LICENSE_TO_IMPORT', SINGLE_BLOB) AS f);
-    " 2>/dev/null
-    log_step "License imported: $(basename "$LICENSE_TO_IMPORT")"
+    "; then
+        log_step "ERROR: could not import the configured license."
+        exit 1
+    fi
+    SOURCE_LICENSE_HASH=$(sha256sum "$LICENSE_TO_IMPORT" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
+    STORED_LICENSE_HASH=$($SQLCMD_DB -h -1 -W -Q "
+    SET NOCOUNT ON;
+    SELECT CONVERT(varchar(64), HASHBYTES('SHA2_256', CONVERT(varbinary(max), [license])), 2)
+    FROM [\$ndo\$dbproperty];
+    " | tr -d '[:space:]')
+    if [ "$STORED_LICENSE_HASH" != "$SOURCE_LICENSE_HASH" ]; then
+        log_step "ERROR: imported license hash does not match the configured license file."
+        exit 1
+    fi
+    log_step "License imported and verified: $(basename "$LICENSE_TO_IMPORT")"
 fi
 
 # Sandbox tenant type
