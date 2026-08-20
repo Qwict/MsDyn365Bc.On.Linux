@@ -357,10 +357,14 @@ internal class StartupHook
             PatchReportingServiceClient(args.LoadedAssembly);
         }
 
-        // Patch #16b: NavUser.TryAuthenticate bypass (password hash doesn't verify on Linux)
+        // Native NavUserPassword verification works on current BC artifacts. Keep the
+        // historical bypass available only for diagnosing an older incompatible artifact.
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
-            PatchNavUserTryAuthenticate(args.LoadedAssembly);
+            if (Environment.GetEnvironmentVariable("BC_ALLOW_INSECURE_PASSWORD_AUTH") == "1")
+                PatchNavUserTryAuthenticate(args.LoadedAssembly);
+            else
+                Console.WriteLine("[StartupHook] Native NavUserPassword verification enabled");
         }
 
         // Patch #22: AzureADGraphQuery constructor bypass.
@@ -496,9 +500,8 @@ internal class StartupHook
             PatchNavFileExpandFileName(args.LoadedAssembly);
         }
 
-        // Patch #16 is now only 16b (NavUser.TryAuthenticate bypass in Nav.Ncl).
-        // The full ValidateAsync chain runs normally to populate the auth cache,
-        // but password hash verification is bypassed via TryAuthenticate.
+        // Native NavUserPassword verification remains enabled by default. The historical
+        // TryAuthenticate bypass is available only with BC_ALLOW_INSECURE_PASSWORD_AUTH=1.
 
         // Patch #21: NavOpenTaskPageAction.ShowForm crashes on Linux when a test opens a
         // task page — the headless client has no UI renderer and a null reference occurs,
@@ -2617,12 +2620,13 @@ internal class StartupHook
     }
 
     /// <summary>
-    /// Patch NavUser.TryAuthenticate to always return true.
-    /// Called from Nav.Ncl.dll when it's loaded.
-    /// The password hash format from Windows doesn't verify correctly on Linux.
+    /// Emergency compatibility escape hatch for artifacts whose password verifier does
+    /// not run on Linux. Never enable this for a network-reachable tenant.
     /// </summary>
     internal static void PatchNavUserTryAuthenticate(Assembly nclAssembly)
     {
+        if (IsPatchDisabled("16b")) return;
+
         try
         {
             var navUserType = nclAssembly.GetType("Microsoft.Dynamics.Nav.Runtime.NavUser");
