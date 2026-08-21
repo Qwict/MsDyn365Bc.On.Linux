@@ -22,7 +22,8 @@ COPY src/ src/
 COPY tools/ tools/
 RUN cd src/StartupHook && dotnet publish -c Release -o /build/output/hook
 # Web client startup hook (separate from the NST hook — see docs/WEBCLIENT-POC.md)
-RUN cd src/WebClientHook && dotnet publish -c Release -o /build/output/webclient-hook
+RUN cd src/WebClientHook && dotnet publish -c Release -f net8.0 -o /build/output/webclient-hook
+RUN cd src/WebClientHook && dotnet publish -c Release -f net10.0 -o /build/output/webclient-hook-net10
 
 RUN cp /build/src/stubs/DrawingStub/bin/Release/net8.0/System.Drawing.Common.dll /build/output/DrawingStub.dll
 RUN cp /build/src/stubs/DrawingStub/bin/Release/net10.0/System.Drawing.Common.dll /build/output/DrawingStub-net10.dll
@@ -121,11 +122,12 @@ RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh &&
     rm /tmp/dotnet-install.sh && \
     dotnet --list-runtimes
 
-RUN mkdir -p /bc/hook /bc/hook-net10 /bc/patched /bc/refasm /bc/refasm-net10 /bc/addins-overlay /bc/testrunner /bc/service /bc/artifacts /bc/scripts /bc/tools
+RUN mkdir -p /bc/hook /bc/hook-net10 /bc/webclient-hook /bc/webclient-hook-net10 /bc/patched /bc/refasm /bc/refasm-net10 /bc/addins-overlay /bc/testrunner /bc/service /bc/artifacts /bc/scripts /bc/tools
 
 # Copy built artifacts from builder
 COPY --from=builder /build/output/hook/ /bc/hook/
 COPY --from=builder /build/output/webclient-hook/ /bc/webclient-hook/
+COPY --from=builder /build/output/webclient-hook-net10/ /bc/webclient-hook-net10/
 COPY --from=builder /build/output/hook-net10/ /bc/hook-net10/
 COPY --from=builder /build/output/refasm/ /bc/refasm/
 COPY --from=builder /build/output/refasm-net10/ /bc/refasm-net10/

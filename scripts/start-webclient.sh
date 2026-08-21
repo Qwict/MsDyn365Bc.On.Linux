@@ -16,7 +16,6 @@ set -e
 PORT="${1:-${BC_WEBCLIENT_PORT:-8080}}"
 ARTIFACTS="${ARTIFACTS:-/bc/artifacts}"
 WEBCLIENT_DIR="${WEBCLIENT_DIR:-/bc/webclient}"
-HOOK_DLL="/bc/webclient-hook/WebClientHook.dll"
 
 # Optional path-prefix support for reverse proxies that route by path
 # (single hostname/port, e.g. https://host:port/my-tier) rather than by
@@ -111,10 +110,23 @@ p = f"{base}/Prod.Client.WebCoreApp.runtimeconfig.json"
 d = json.load(open(p, encoding="utf-8-sig"))
 d["runtimeOptions"]["configProperties"]["System.Globalization.UseNls"] = False
 json.dump(d, open(p, "w"), indent=2)
-print("[webclient] navsettings.json + runtimeconfig.json patched")
 PYEOF
 
-echo "[webclient] Starting Prod.Client.WebCoreApp on http://0.0.0.0:$PORT${PATHBASE} (NST: localhost:7085, auth: NavUserPassword)"
+WEBCLIENT_RUNTIME=$(python3 - "$WEBCLIENT_DIR/Prod.Client.WebCoreApp.runtimeconfig.json" <<'PYEOF'
+import json, sys
+print(json.load(open(sys.argv[1]))["runtimeOptions"]["framework"]["version"])
+PYEOF
+)
+case "$WEBCLIENT_RUNTIME" in
+    10.*) HOOK_DLL="/bc/webclient-hook-net10/WebClientHook.dll" ;;
+    *) HOOK_DLL="/bc/webclient-hook/WebClientHook.dll" ;;
+esac
+if [ ! -f "$HOOK_DLL" ]; then
+    echo "[webclient] ERROR: matching startup hook is missing: $HOOK_DLL" >&2
+    exit 1
+fi
+
+echo "[webclient] Starting Prod.Client.WebCoreApp on http://0.0.0.0:$PORT${PATHBASE} (runtime: $WEBCLIENT_RUNTIME, NST: localhost:7085)"
 cd "$WEBCLIENT_DIR"
 # DOTNET_STARTUP_HOOKS: replace the NST hook with the web-client-specific one.
 # The NST hook contains patches that assume the NST process and must not run here.

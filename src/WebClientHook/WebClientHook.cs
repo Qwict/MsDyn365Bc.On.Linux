@@ -523,6 +523,8 @@ internal class StartupHook
 
     private static void ApplyJmpHook(MethodBase original, MethodInfo replacement, string name)
     {
+        if (IsAlreadyJmpHooked(original, name)) return;
+
         RuntimeHelpers.PrepareMethod(original.MethodHandle);
         RuntimeHelpers.PrepareMethod(replacement.MethodHandle);
 
@@ -560,6 +562,25 @@ internal class StartupHook
         {
             try { WriteJmp(compiledCode, replFp, name + " (code)"); }
             catch (Exception ex) { Console.Error.WriteLine($"[WebClientHook]   compiled code patch failed: {ex.Message}"); }
+        }
+    }
+
+    private static bool IsAlreadyJmpHooked(MethodBase original, string name)
+    {
+        try
+        {
+            IntPtr fp = original.MethodHandle.GetFunctionPointer();
+            byte[] head = new byte[6];
+            Marshal.Copy(fp, head, 0, 6);
+            bool hooked = head[0] == 0xFF && head[1] == 0x25
+                && head[2] == 0 && head[3] == 0 && head[4] == 0 && head[5] == 0;
+            if (hooked)
+                Console.Error.WriteLine($"[WebClientHook] {name} already hooked");
+            return hooked;
+        }
+        catch
+        {
+            return false;
         }
     }
 
