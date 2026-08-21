@@ -145,6 +145,7 @@ services:
       # Reused for both Kestrel's bound URL and PublicWebBaseUrl. See
       # docs/WEBCLIENT-POC.md.
       BC_WEBCLIENT_PATHBASE: ${BC_WEBCLIENT_PATHBASE:-}
+      BC_WEBCLIENT_PUBLIC_URL: ${BC_WEBCLIENT_PUBLIC_URL:-}
       # Set to 1 when a reverse proxy in front of the container terminates TLS,
       # so the web client emits https:// in its redirects instead of http://.
       # See docs/WEBCLIENT-POC.md.
