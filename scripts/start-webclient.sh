@@ -114,7 +114,11 @@ PYEOF
 
 WEBCLIENT_RUNTIME=$(python3 - "$WEBCLIENT_DIR/Prod.Client.WebCoreApp.runtimeconfig.json" <<'PYEOF'
 import json, sys
-print(json.load(open(sys.argv[1]))["runtimeOptions"]["framework"]["version"])
+options = json.load(open(sys.argv[1]))["runtimeOptions"]
+framework = options.get("framework") or options.get("frameworks", [None])[0]
+if framework is None:
+    raise RuntimeError("runtimeconfig has no framework")
+print(framework["version"])
 PYEOF
 )
 case "$WEBCLIENT_RUNTIME" in
