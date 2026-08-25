@@ -136,6 +136,9 @@ services:
       # client (dotnet-trace) on /tmp/nst-diag.sock. Used to profile cold boot.
       BC_PROFILE_NST: ${BC_PROFILE_NST:-0}
       BC_ARTIFACT_URL: ${BC_ARTIFACT_URL:-}
+      # Ordered replacement application family provided by the control plane.
+      # These are installed by the runner during startup, before it becomes healthy.
+      BC_EMBEDDED_APPS: ${BC_EMBEDDED_APPS:-}
       BC_TEST_APPS: ${BC_TEST_APPS:-}
       # Opt-in: self-host Microsoft's real BC web client on Kestrel (port 8080).
       # EXPERIMENTAL PoC — see docs/WEBCLIENT-POC.md.

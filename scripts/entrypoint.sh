@@ -1228,6 +1228,37 @@ exec 3>/tmp/bc-stdin
     # TODO: Selectively rename only the DLLs that cause Cecil type-forwarding issues.
     echo "[entrypoint] Patch #15: Skipped (merged assemblies handle type-forwarding)"
 
+    # Install the ordered replacement application family before test tooling.
+    # The control plane stages these immutable packages under /bc/artifacts and
+    # the runner must not become healthy until every package is installed.
+    if [ -n "${BC_EMBEDDED_APPS:-}" ]; then
+        echo "[entrypoint] Installing embedded release application family..."
+        IFS=';' read -ra EMBEDDED_APPS <<< "$BC_EMBEDDED_APPS"
+        for app in "${EMBEDDED_APPS[@]}"; do
+            app=$(echo "$app" | xargs)
+            if [ -z "$app" ]; then
+                continue
+            fi
+            if [ ! -f "$app" ]; then
+                echo "[entrypoint] ERROR: embedded app is missing: $app"
+                exit 1
+            fi
+            NAME=$(basename "$app")
+            HTTP=$(curl -s -o /tmp/embedded-app.out -w "%{http_code}" --max-time 600 \
+                -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
+                -F "file=@$app;type=application/octet-stream" \
+                "$DEV_URL/apps?SchemaUpdateMode=forcesync" 2>/dev/null)
+            if [ "$HTTP" != "200" ] && [ "$HTTP" != "201" ] && [ "$HTTP" != "204" ]; then
+                echo "[entrypoint] ERROR: embedded app $NAME failed with HTTP $HTTP"
+                sed 's/^/[entrypoint]     /' /tmp/embedded-app.out
+                rm -f /tmp/embedded-app.out
+                exit 1
+            fi
+            echo "[entrypoint]   $NAME: HTTP $HTTP"
+            rm -f /tmp/embedded-app.out
+        done
+    fi
+
     # Publish test framework apps unless caller will handle all publishing.
     # BC_SKIP_APP_PUBLISH=true: skip all publishing (caller manages extensions)
     if [ "${BC_SKIP_APP_PUBLISH:-false}" = "true" ]; then
