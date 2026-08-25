@@ -176,6 +176,7 @@ services:
       DOTNET_GCNoAffinitize: ${DOTNET_GCNoAffinitize:-}
     volumes:
       - ${BC_ARTIFACTS_DIR:-bc-artifacts}:/bc/artifacts
+      - ${BC_EMBEDDED_APPS_DIR:-/dev/null}:/bc/embedded-apps:ro
       - bc-service:/bc/service
       # Compiled-assembly (R2R) cache. 1.2 GB on BC 28.1 and rebuilt from
       # scratch every boot when it lives in the container filesystem. The
