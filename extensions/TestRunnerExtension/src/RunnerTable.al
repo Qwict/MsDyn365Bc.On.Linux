@@ -72,6 +72,12 @@ table 99903 "Codeunit Run Request"
             DataClassification = SystemMetadata;
         }
 
+        field(7; PackageId; Guid)
+        {
+            Caption = 'Package Id';
+            DataClassification = SystemMetadata;
+        }
+
         /// <summary>
         /// Current execution status of the request.
         /// </summary>
@@ -179,6 +185,7 @@ page 99902 "Codeunit Run Requests"
                 field(Id; Rec.Id) { Editable = false; }
                 field(CodeunitId; Rec.CodeunitId) { }
                 field(CodeunitIds; Rec.CodeunitIds) { }
+                field(PackageId; Rec.PackageId) { }
                 field(Status; Rec.Status) { Editable = false; }
                 field(LastResult; Rec.LastResult) { Editable = false; }
                 field(LastExecutionUTC; Rec.LastExecutionUTC) { Editable = false; }
@@ -433,5 +440,38 @@ page 99902 "Codeunit Run Requests"
         Rec.LastExecutionUTC := CurrentDateTime();
         Rec.Modify(true);
         exit(AllSuccess);
+    end;
+
+    [ServiceEnabled]
+    procedure CleanupExtension(): Boolean
+    var
+        ExtensionManagement: Codeunit System.Apps."Extension Management";
+    begin
+        Rec.TestField(PackageId);
+        if ExtensionManagement.IsInstalledByPackageId(Rec.PackageId) then
+            if not ExtensionManagement.UninstallExtensionAndDeleteExtensionData(Rec.PackageId, false) then
+                Error('Extension data cleanup failed for package %1.', Rec.PackageId);
+        Commit();
+        ExtensionManagement.UnpublishExtension(Rec.PackageId);
+        Rec.LastResult := 'Extension removed';
+        Rec.LastExecutionUTC := CurrentDateTime();
+        Rec.Modify(true);
+        exit(true);
+    end;
+
+    [ServiceEnabled]
+    procedure InstallExtension(): Boolean
+    var
+        ExtensionManagement: Codeunit System.Apps."Extension Management";
+    begin
+        Rec.TestField(PackageId);
+        if ExtensionManagement.IsInstalledByPackageId(Rec.PackageId) then
+            exit(true);
+        if not ExtensionManagement.InstallExtension(Rec.PackageId, GlobalLanguage, false) then
+            Error('Extension installation failed for package %1.', Rec.PackageId);
+        Rec.LastResult := 'Extension installed';
+        Rec.LastExecutionUTC := CurrentDateTime();
+        Rec.Modify(true);
+        exit(true);
     end;
 }

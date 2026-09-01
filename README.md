@@ -232,7 +232,16 @@ curl -u BCRUNNER:Admin123! -X POST \
 The test framework (Test Runner, Library Assert, Library Variable Storage,
 Permissions Mock, Any) is published automatically on first boot of the BC
 container, so a fresh `docker compose up -d --wait` is enough — no extra
-setup.
+setup. Control-plane embedded baselines intentionally skip that boot-time
+mutation; their agent provisions Microsoft Test Runner with `Recreate` and the
+custom runner extension when the first test run is requested.
+
+The custom TestRunnerExtension also exposes `installExtension` and
+`cleanupExtension` actions on `codeunitRunRequests`. They invoke Business
+Central's `InstallExtension`, `UninstallExtensionAndDeleteExtensionData`, and
+`UnpublishExtension` methods for an exact package ID. The control-plane uses
+these actions when an embedded application family does not include the
+standard Automation `extensions` endpoint.
 
 ```bash
 # Auto-discover test codeunits from the .app's symbols

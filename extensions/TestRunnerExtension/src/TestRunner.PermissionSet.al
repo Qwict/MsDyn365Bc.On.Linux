@@ -4,5 +4,6 @@ permissionset 99905 "Test Runner Exec"
     Caption = 'Test Runner Exec';
     Permissions =
         tabledata "Log Table" = RIMD,
-        tabledata "Codeunit Run Request" = RIMD;
+        tabledata "Codeunit Run Request" = RIMD,
+        codeunit System.Apps."Extension Management" = X;
 }
