@@ -273,6 +273,11 @@ an un-batched run's. Set `BC_CODEUNIT_IDS_MAX_CHARS` to change the per-batch
 budget (default 1000). `python3 scripts/test-run-tests-batching.py` exercises
 the whole loop against a fake BC — no container needed.
 
+For a split-endpoint deployment, use `--api-url <url>` to override the API
+port fallback derived from `--base-url` (normally `:7052` on the same host and
+instance path). The script still tries `--base-url` first for company and
+runner API requests; `--dev-url` continues to be used for app publishing.
+
 **Which company tests run in:** by default both runners read the OData
 `Company` page and pick the evaluation (demo) company. That works on any
 localization without knowing the name in advance — the CRONUS company is

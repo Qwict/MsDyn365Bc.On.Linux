@@ -24,6 +24,7 @@
 #   --company <name>           Company name (default: auto-detect)
 #   --base-url <url>           BC base URL (default: http://localhost:7048/BC)
 #   --dev-url <url>            BC Dev endpoint (default: http://localhost:7049/BC/dev)
+#   --api-url <url>            BC API endpoint (default: derived from --base-url)
 #   --auth <user:pass>         Authentication (default: BCRUNNER:Admin123!)
 #   --timeout <minutes>        Overall timeout (default: 30)
 #   --test-runner-app <path>   TestRunnerExtension .app (auto-detected)
@@ -36,6 +37,7 @@ unset CDPATH
 # === Configuration & CLI Parsing ===
 BASE_URL="http://localhost:7048/BC"
 DEV_URL="http://localhost:7049/BC/dev"
+API_URL=""
 # Matches the container's login (BC_SERVER_USERNAME/BC_SERVER_PASSWORD in
 # docker-compose.yml — see scripts/entrypoint.sh); override with --auth if
 # the container was booted with a non-default login.
@@ -67,6 +69,7 @@ Options:
   --company <name>           Company name (default: auto-detect)
   --base-url <url>           BC OData base URL (default: http://localhost:7048/BC)
   --dev-url <url>            BC Dev endpoint (default: http://localhost:7049/BC/dev)
+  --api-url <url>            BC API endpoint (default: derived from --base-url)
   --auth <user:pass>         Authentication (default: BCRUNNER:Admin123!)
   --timeout <minutes>        Overall timeout (default: 30)
   --test-runner-app <path>   TestRunnerExtension .app (auto-detected)
@@ -97,6 +100,7 @@ while [[ $# -gt 0 ]]; do
         --company) COMPANY="$2"; shift 2;;
         --base-url) BASE_URL="$2"; shift 2;;
         --dev-url) DEV_URL="$2"; shift 2;;
+        --api-url) API_URL="$2"; shift 2;;
         --auth) AUTH="$2"; shift 2;;
         --timeout) TIMEOUT_MIN="$2"; shift 2;;
         --test-runner-app) TEST_RUNNER_APP="$2"; shift 2;;
@@ -120,6 +124,7 @@ _BC_PATH=$(echo "$BASE_URL" | sed -E 's|https?://[^/]+(/.*)$|\1|')
 [ -z "$_URL_ORIGIN" ] && _URL_ORIGIN="http://localhost"
 [ -z "$_BC_PATH" ] && _BC_PATH="/BC"
 _API_FALLBACK="${_URL_ORIGIN}:7052${_BC_PATH}"
+[ -n "$API_URL" ] && _API_FALLBACK="$API_URL"
 
 # --- Find TestRunnerExtension .app ---
 if [ -z "$TEST_RUNNER_APP" ]; then
