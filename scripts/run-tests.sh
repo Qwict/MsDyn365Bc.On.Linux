@@ -766,11 +766,13 @@ execute_chunk() {
         # or anything else. Verbose stderr is cheap and the right default.
         #
         # JUnit output: TestRunner writes to a path inside the container,
-        # which we then docker cp back to the host path. Avoids needing to
+        # which we then read back to the host path. Avoids needing to
         # bind-mount the destination. A run that failed to write its report
-        # fails the copy, and the completeness step turns that into a loud
-        # error rather than a stale or duplicated result set.
+        # fails the read, and the completeness step turns that into a loud
+        # error rather than a stale or duplicated result set — so a report
+        # left behind by an earlier run in the same container is removed first.
         local in_container_junit="/tmp/$(basename "$junit_path")"
+        ( cd "$REPO_DIR" && docker compose exec -T bc rm -f "$in_container_junit" </dev/null )
         local renew_flag=(); if [ "$RENEW_CLIENT_CONTEXT" = "1" ]; then renew_flag=(--renew-client-context); fi
         ( cd "$REPO_DIR" && printf '%s' "$AUTH_PASS" | docker compose exec -T bc \
             env DOTNET_STARTUP_HOOKS= dotnet /bc/tools/TestRunner/TestRunner.dll \
@@ -788,13 +790,19 @@ execute_chunk() {
             "${renew_flag[@]}" \
             --junit-output "$in_container_junit" )
         rc=$?
-        # </dev/null: `docker compose cp` inherits this script's stdin, and
+        # Read the report with `exec cat`, not `docker compose cp`: on a
+        # rootless daemon `cp` fails outright for any container with a
+        # read-only bind mount (the license mount is one, even as /dev/null),
+        # because the daemon cannot remount it read-only in its own namespace.
+        #
+        # </dev/null: `docker compose exec` inherits this script's stdin, and
         # run-tests.sh is itself called from a `while read ... done <<<` loop
         # in bc-test-from-source.yml. A child that reads stdin eats the rest
         # of that here-string and the caller's loop silently runs once.
-        if ( cd "$REPO_DIR" && docker compose cp "bc:$in_container_junit" "$junit_path" </dev/null 2>/dev/null ); then
+        if ( cd "$REPO_DIR" && docker compose exec -T bc cat "$in_container_junit" </dev/null >"$junit_path" 2>/dev/null ); then
             echo "[run-tests] JUnit XML copied to $junit_path"
         else
+            rm -f "$junit_path"
             echo "[run-tests] WARN: TestRunner did not produce $in_container_junit inside the container"
         fi
     elif [ -n "$HOST_PREBUILT" ]; then
