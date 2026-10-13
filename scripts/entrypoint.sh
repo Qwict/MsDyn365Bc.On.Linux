@@ -1486,8 +1486,19 @@ exec 3>/tmp/bc-stdin
     DEV_URL="http://localhost:7049"
     NST_WAIT_START=$(date +%s)
 
-    echo "[entrypoint] [$(( $(date +%s) - ENTRYPOINT_START ))s] Waiting for BC to start..."
-    for i in $(seq 1 180); do
+    # How long NST may take to answer on the dev endpoint. Not a constant: the same
+    # compile takes proportionally longer in a tenant whose CPU is capped, and the
+    # 900s default was sized for a tenant that had a whole host to itself. One cold
+    # create measured 8048 CPU-seconds, so an 8-CPU tenant needs over 1000s of CPU
+    # time alone and cannot possibly answer inside the old fixed window.
+    BC_STARTUP_TIMEOUT_SECONDS="${BC_STARTUP_TIMEOUT_SECONDS:-900}"
+    NST_POLL_INTERVAL=5
+    NST_MAX_POLLS=$(( BC_STARTUP_TIMEOUT_SECONDS / NST_POLL_INTERVAL ))
+    [ "$NST_MAX_POLLS" -lt 1 ] && NST_MAX_POLLS=1
+
+    echo "[entrypoint] [$(( $(date +%s) - ENTRYPOINT_START ))s] Waiting for BC to start (timeout ${BC_STARTUP_TIMEOUT_SECONDS}s)..."
+    HTTP=000
+    for i in $(seq 1 "$NST_MAX_POLLS"); do
         # Check if BC process died
         if ! kill -0 $BC_PID 2>/dev/null; then
             echo "[entrypoint] ERROR: BC process died"
@@ -1498,10 +1509,22 @@ exec 3>/tmp/bc-stdin
         if [ "$HTTP" != "000" ]; then
             break
         fi
-        sleep 5
+        sleep "$NST_POLL_INTERVAL"
     done
     NST_WAIT_ELAPSED=$(( $(date +%s) - NST_WAIT_START ))
     TOTAL_ELAPSED=$(( $(date +%s) - ENTRYPOINT_START ))
+    # HTTP 000 means the endpoint never answered. Continuing from here would publish
+    # extensions against a dead NST and then touch /tmp/bc-ready, so the healthcheck's
+    # file test passes while its OData probe never can — a dead tenant announced as
+    # ready, whose real failure only surfaces much later as an opaque control-plane
+    # timeout. Stop instead. This runs in a background subshell, so exiting ends the
+    # readiness work without killing the container: BC stays up to be inspected, and
+    # /tmp/bc-ready is never created, so the tenant reports unhealthy truthfully.
+    if [ "$HTTP" = "000" ]; then
+        echo "[entrypoint] [${TOTAL_ELAPSED}s] ERROR: dev endpoint did not respond within ${BC_STARTUP_TIMEOUT_SECONDS}s — NST never became serviceable"
+        echo "[entrypoint] Raise BC_STARTUP_TIMEOUT_SECONDS when this tenant's CPU is capped. Container left running for inspection."
+        exit 1
+    fi
     echo "[entrypoint] [${TOTAL_ELAPSED}s] Dev endpoint ready (HTTP $HTTP) — NST startup: ${NST_WAIT_ELAPSED}s"
 
     # Replace Reporting Service .exe with sleep stub NOW (after BC startup probed the assembly).
