@@ -21,6 +21,12 @@
 #                                (dorny/test-reporter, EnricoMi/publish-unit-test-result-action),
 #                                Azure DevOps "Publish Test Results" task, and
 #                                AL-Go's AnalyzeTests post-step. Default off.
+#   --coverage-output <path>   Record code coverage while the suite runs and write it
+#                              to <path> as CSV: object_type,object_id,line_no,hits —
+#                              one row per executable line of the partner objects
+#                              (50000..99899, 1000000..74999999) the run loaded.
+#                              Best effort: a coverage failure is reported, never
+#                              fails the run. Needs Test Runner Extension 3.3.0.0.
 #   --company <name>           Company name (default: auto-detect)
 #   --base-url <url>           BC base URL (default: http://localhost:7048/BC)
 #   --dev-url <url>            BC Dev endpoint (default: http://localhost:7049/BC/dev)
@@ -51,6 +57,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_RUNNER_APP=""
 JUNIT_OUTPUT=""
+COVERAGE_OUTPUT=""
 RENEW_CLIENT_CONTEXT=0
 
 show_help() {
@@ -66,6 +73,12 @@ Options:
                                "50000,50001,50002"                explicit ids
                                "50000..50100,130450,200000..210000" mixed
   --junit-output <path>      Write per-test results as JUnit XML to <path>
+  --coverage-output <path>   Record code coverage while the suite runs and write it
+                             to <path> as CSV: object_type,object_id,line_no,hits —
+                             one row per executable line of the partner objects
+                             (50000..99899, 1000000..74999999) the run loaded.
+                             Best effort: a coverage failure is reported, never
+                             fails the run. Needs Test Runner Extension 3.3.0.0.
   --company <name>           Company name (default: auto-detect)
   --base-url <url>           BC OData base URL (default: http://localhost:7048/BC)
   --dev-url <url>            BC Dev endpoint (default: http://localhost:7049/BC/dev)
@@ -106,6 +119,7 @@ while [[ $# -gt 0 ]]; do
         --test-runner-app) TEST_RUNNER_APP="$2"; shift 2;;
         --disabled-tests) DISABLED_TESTS_DIR="$2"; shift 2;;
         --junit-output) JUNIT_OUTPUT="$2"; shift 2;;
+        --coverage-output) COVERAGE_OUTPUT="$2"; shift 2;;
         --renew-client-context) RENEW_CLIENT_CONTEXT=1; shift;;
         --host|--test-runner|--suite-name|--codeunit-timeout|--extension-id|--sql-password) shift 2;;
         *) echo "Unknown option: $1 (try --help)"; exit 1;;
@@ -845,6 +859,56 @@ execute_chunk() {
     return $rc
 }
 
+# === Code coverage ===
+#
+# Recorded for every session on the tier (the isolation runner gives each test
+# codeunit a session of its own) between startCoverage and stopCoverage, then
+# read back from the codeCoverageLines API page, which lists only executable
+# lines of partner objects. Never fails the run: coverage is a report about the
+# tests, not one of them.
+start_coverage() {
+    local http
+    http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 -u "$AUTH" -X POST \
+        "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.startCoverage" 2>/dev/null)
+    if [ "$http" != "200" ]; then
+        echo "WARN: could not start code coverage (HTTP $http); the Test Runner Extension may predate 3.3.0.0. Running without coverage."
+        return 1
+    fi
+    echo "Code coverage recording started."
+}
+
+export_coverage() {
+    local out="$1" http
+    http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 -u "$AUTH" -X POST \
+        "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.stopCoverage" 2>/dev/null)
+    if [ "$http" != "200" ]; then
+        echo "WARN: could not stop code coverage (HTTP $http); no coverage written."
+        return 0
+    fi
+    if py3 - "$API_BASE" "$AUTH" "$out" <<'PYEOF'
+import base64, csv, json, sys, urllib.request
+api_base, auth, out = sys.argv[1:4]
+header = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()}
+url = api_base + "/codeCoverageLines?$select=objectType,objectId,lineNo,hits"
+with open(out, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["object_type", "object_id", "line_no", "hits"])
+    while url:
+        req = urllib.request.Request(url, headers=header)
+        with urllib.request.urlopen(req, timeout=120) as r:
+            page = json.load(r)
+        for line in page.get("value", []):
+            w.writerow([line["objectType"], line["objectId"], line["lineNo"], line["hits"]])
+        url = page.get("@odata.nextLink")
+PYEOF
+    then
+        echo "Code coverage written to $out"
+    else
+        echo "WARN: could not read code coverage; no coverage written."
+        rm -f "$out"
+    fi
+}
+
 # --- Populate the suite, one part at a time ---
 CHUNK_JUNIT_DIR=$(mktemp -d)
 CHUNK_JUNITS=()
@@ -908,8 +972,10 @@ SESSION_NOTE=""
 echo "Executing $NUM_CODEUNITS codeunits via WebSocket${SESSION_NOTE}..."
 # --timeout was a per-part budget when each part was its own process. Scale it
 # by the number of parts so a suite that fit in the old total still fits.
+[ -n "$COVERAGE_OUTPUT" ] && { start_coverage || COVERAGE_OUTPUT=""; }
 execute_chunk "$NUM_CODEUNITS" "$RUN_JUNIT" "$(( TIMEOUT_MIN * ${#CHUNKS[@]} ))"
 [ $? -ne 0 ] && OVERALL_RC=1
+[ -n "$COVERAGE_OUTPUT" ] && export_coverage "$COVERAGE_OUTPUT"
 
 # === Finish the report ===
 #

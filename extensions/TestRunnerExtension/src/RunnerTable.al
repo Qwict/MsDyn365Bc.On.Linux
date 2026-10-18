@@ -234,6 +234,35 @@ page 99902 "Codeunit Run Requests"
     end;
 
     /// <summary>
+    /// Starts recording code coverage for every session on this service tier, after
+    /// dropping what an earlier run recorded. Multi-session, because the isolation
+    /// runner (130450) runs each test codeunit in a session of its own.
+    /// Read the result from codeCoverageLines after StopCoverage.
+    /// </summary>
+    [ServiceEnabled]
+    procedure StartCoverage(): Boolean
+    var
+        CodeCoverage: Record System.Tooling."Code Coverage";
+    begin
+        CodeCoverageLog(false, true);
+        CodeCoverage.DeleteAll();
+        CodeCoverageLog(true, true);
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Stops recording and brings the Code Coverage table up to date, so
+    /// codeCoverageLines reads every line the run executed.
+    /// </summary>
+    [ServiceEnabled]
+    procedure StopCoverage(): Boolean
+    begin
+        CodeCoverageRefresh();
+        CodeCoverageLog(false, true);
+        exit(true);
+    end;
+
+    /// <summary>
     /// Adds this request's codeunits to the DEFAULT suite WITHOUT clearing it.
     ///
     /// CodeunitIds is Text[2048], so a long list has to be posted in parts.
