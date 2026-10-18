@@ -5,5 +5,6 @@ permissionset 99905 "Test Runner Exec"
     Permissions =
         tabledata "Log Table" = RIMD,
         tabledata "Codeunit Run Request" = RIMD,
+        tabledata "Coverage Line" = RIMD,
         codeunit System.Apps."Extension Management" = X;
 }

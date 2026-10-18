@@ -234,31 +234,42 @@ page 99902 "Codeunit Run Requests"
     end;
 
     /// <summary>
-    /// Starts recording code coverage for every session on this service tier, after
-    /// dropping what an earlier run recorded. Multi-session, because the isolation
-    /// runner (130450) runs each test codeunit in a session of its own.
-    /// Read the result from codeCoverageLines after StopCoverage.
+    /// Turns code coverage on for the DEFAULT suite: Microsoft's Test Runner then
+    /// records each test codeunit in the test session itself and hands the lines to
+    /// the "Coverage Line Collector" exporter. Call after setupSuite, which recreates
+    /// the suite. Read the result from codeCoverageLines after the run.
     /// </summary>
     [ServiceEnabled]
     procedure StartCoverage(): Boolean
     var
-        CodeCoverage: Record System.Tooling."Code Coverage";
+        ALTestSuite: Record System.TestTools.TestRunner."AL Test Suite";
+        CoverageLine: Record "Coverage Line";
     begin
-        CodeCoverageLog(false, true);
-        CodeCoverage.DeleteAll();
-        CodeCoverageLog(true, true);
+        if not ALTestSuite.Get('DEFAULT') then
+            exit(false);
+        CoverageLine.DeleteAll();
+        ALTestSuite."CC Tracking Type" := ALTestSuite."CC Tracking Type"::"Per Codeunit";
+        ALTestSuite."CC Track All Sessions" := false;
+        ALTestSuite."CC Exporter ID" := Xmlport::"Coverage Line Collector";
+        ALTestSuite."CC Coverage Map" := ALTestSuite."CC Coverage Map"::Disabled;
+        ALTestSuite.Modify();
         exit(true);
     end;
 
     /// <summary>
-    /// Stops recording and brings the Code Coverage table up to date, so
-    /// codeCoverageLines reads every line the run executed.
+    /// Turns code coverage off for the DEFAULT suite again; the recorded lines stay
+    /// readable through codeCoverageLines.
     /// </summary>
     [ServiceEnabled]
     procedure StopCoverage(): Boolean
+    var
+        ALTestSuite: Record System.TestTools.TestRunner."AL Test Suite";
     begin
-        CodeCoverageRefresh();
-        CodeCoverageLog(false, true);
+        if not ALTestSuite.Get('DEFAULT') then
+            exit(false);
+        ALTestSuite."CC Tracking Type" := ALTestSuite."CC Tracking Type"::Disabled;
+        ALTestSuite."CC Exporter ID" := 0;
+        ALTestSuite.Modify();
         exit(true);
     end;
 

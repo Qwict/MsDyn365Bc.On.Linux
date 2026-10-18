@@ -26,7 +26,7 @@
 #                              one row per executable line of the partner objects
 #                              (50000..99899, 1000000..74999999) the run loaded.
 #                              Best effort: a coverage failure is reported, never
-#                              fails the run. Needs Test Runner Extension 3.3.0.0.
+#                              fails the run. Needs Test Runner Extension 3.3.0.1.
 #   --company <name>           Company name (default: auto-detect)
 #   --base-url <url>           BC base URL (default: http://localhost:7048/BC)
 #   --dev-url <url>            BC Dev endpoint (default: http://localhost:7049/BC/dev)
@@ -78,7 +78,7 @@ Options:
                              one row per executable line of the partner objects
                              (50000..99899, 1000000..74999999) the run loaded.
                              Best effort: a coverage failure is reported, never
-                             fails the run. Needs Test Runner Extension 3.3.0.0.
+                             fails the run. Needs Test Runner Extension 3.3.0.1.
   --company <name>           Company name (default: auto-detect)
   --base-url <url>           BC OData base URL (default: http://localhost:7048/BC)
   --dev-url <url>            BC Dev endpoint (default: http://localhost:7049/BC/dev)
@@ -861,17 +861,19 @@ execute_chunk() {
 
 # === Code coverage ===
 #
-# Recorded for every session on the tier (the isolation runner gives each test
-# codeunit a session of its own) between startCoverage and stopCoverage, then
-# read back from the codeCoverageLines API page, which lists only executable
-# lines of partner objects. Never fails the run: coverage is a report about the
-# tests, not one of them.
+# startCoverage turns coverage on for the DEFAULT suite, so Microsoft's Test
+# Runner records every test codeunit inside the test session and hands its lines
+# to the extension's collector; codeCoverageLines then lists every executable
+# line of the partner objects the run loaded, with hit counts (0 = no test ran
+# it). Recording in the test session matters: a coverage log started from an
+# OData request belongs to that request's session and sees none of the tests.
+# Never fails the run: coverage is a report about the tests, not one of them.
 start_coverage() {
     local http
     http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 -u "$AUTH" -X POST \
         "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.startCoverage" 2>/dev/null)
     if [ "$http" != "200" ]; then
-        echo "WARN: could not start code coverage (HTTP $http); the Test Runner Extension may predate 3.3.0.0. Running without coverage."
+        echo "WARN: could not start code coverage (HTTP $http); the Test Runner Extension may predate 3.3.0.1. Running without coverage."
         return 1
     fi
     echo "Code coverage recording started."
