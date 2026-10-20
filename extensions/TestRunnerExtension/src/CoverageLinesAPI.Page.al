@@ -1,6 +1,8 @@
 /// <summary>
 /// The code lines the last coverage run saw, with their hit counts. A line with 0
 /// hits is a line in a loaded object that no test ran. See "Coverage Recorder".
+/// Read from the stored CSV on every request; coverageReports returns the same lines
+/// in one response and is what run-tests.sh reads. This page stays for older callers.
 /// </summary>
 page 99904 "Coverage Lines API"
 {
@@ -12,6 +14,7 @@ page 99904 "Coverage Lines API"
     EntityName = 'codeCoverageLine';
     EntitySetName = 'codeCoverageLines';
     SourceTable = "Coverage Line";
+    SourceTableTemporary = true;
     Editable = false;
     InsertAllowed = false;
     ModifyAllowed = false;
@@ -31,4 +34,11 @@ page 99904 "Coverage Lines API"
             }
         }
     }
+
+    trigger OnOpenPage()
+    var
+        CoverageStore: Codeunit "Coverage Store";
+    begin
+        CoverageStore.FillLines(Rec);
+    end;
 }

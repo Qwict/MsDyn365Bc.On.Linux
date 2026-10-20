@@ -237,8 +237,8 @@ page 99902 "Codeunit Run Requests"
     /// <summary>
     /// Records code coverage for the next run of the DEFAULT suite: the "Coverage
     /// Recorder" starts the platform's coverage log in the test session before the
-    /// first test codeunit and writes the lines to "Coverage Line" after the last.
-    /// Call after setupSuite. Read the result from codeCoverageLines after the run.
+    /// first test codeunit and stores the lines after the last. Call after setupSuite.
+    /// Read the result from coverageReports (or codeCoverageLines) after the run.
     /// </summary>
     [ServiceEnabled]
     procedure StartCoverage(): Boolean
@@ -249,22 +249,26 @@ page 99902 "Codeunit Run Requests"
     begin
         if not ALTestSuite.Get('DEFAULT') then
             exit(false);
-        // Truncate, not DeleteAll: with global delete triggers registered BC deletes a
-        // large app's 120,000 lines one by one, longer than the runner waits for this call.
-        CoverageLine.Truncate();
+        // Lines an older version stored one record each. Truncate, not DeleteAll: with global
+        // delete triggers BC deletes 120,000 of them one by one, longer than the runner waits.
+        if not CoverageLine.IsEmpty() then
+            CoverageLine.Truncate();
         // Microsoft's own per-codeunit recording would restart the log around every codeunit.
         DisableSuiteCoverage('DEFAULT');
         if not CoverageSetup.Get() then
             CoverageSetup.Insert();
         CoverageSetup.Enabled := true;
         CoverageSetup.Generation += 1;
+        CoverageSetup.Writes := 0;
+        CoverageSetup."Write Time" := 0;
+        Clear(CoverageSetup.Coverage);
         CoverageSetup.Modify();
         exit(true);
     end;
 
     /// <summary>
     /// Stops recording code coverage; the recorded lines stay readable through
-    /// codeCoverageLines until the next startCoverage.
+    /// coverageReports and codeCoverageLines until the next startCoverage.
     /// </summary>
     [ServiceEnabled]
     procedure StopCoverage(): Boolean

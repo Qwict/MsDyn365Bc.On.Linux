@@ -1,6 +1,6 @@
 /// <summary>
 /// Records the code coverage of a whole test run in the session that runs the tests
-/// and writes it to "Coverage Line".
+/// and stores it with the "Coverage Store".
 ///
 /// Microsoft's Test Runner can record coverage itself, but only by starting and
 /// stopping the platform's coverage log around every test codeunit and handing an
@@ -11,29 +11,27 @@
 ///
 /// This recorder starts the log once, before the first test codeunit of a run, and
 /// leaves it running, so the platform adds up the hits of the whole run. After the
-/// last codeunit it reads the Code Coverage table once and writes every Code line of
+/// last codeunit it reads the Code Coverage table once and stores every Code line of
 /// the partner objects (per-tenant 50000..99899, ISV 1000000..74999999; not this
 /// extension's own 99900..99999), 0-hit lines included, which is what makes a
-/// percentage possible. In between, at most once per checkpoint interval, it writes
-/// only the covered lines whose hits changed, so a session that dies mid-run loses
-/// at most that interval.
+/// percentage possible — as one CSV blob, not one record per line. In between, at
+/// most once per checkpoint interval, it stores the covered lines so far, so a
+/// session that dies mid-run loses at most that interval.
 ///
 /// A run is one startCoverage: a generation of "Coverage Setup". Another session in
 /// the same run — the runner reconnected after a session died — continues from what
-/// "Coverage Line" already holds and adds its own hits to it.
+/// was stored and adds its own hits to it.
 /// </summary>
 codeunit 99910 "Coverage Recorder"
 {
     SingleInstance = true;
-    Permissions = tabledata "Coverage Line" = rimd,
-                  tabledata "Coverage Setup" = r,
+    Permissions = tabledata "Coverage Setup" = rm,
                   tabledata System.TestTools.TestRunner."Test Method Line" = r;
 
     var
-        // Hits per line as "Coverage Line" holds them.
-        Written: Dictionary of [Text, Integer];
-        // Hits per line from before the running log started, which its own hits add to.
-        SegmentBase: Dictionary of [Text, Integer];
+        CoverageStore: Codeunit "Coverage Store";
+        // Hits stored before the running log started, which its own hits add to; empty in a run's first session.
+        BaseHits: Dictionary of [Text, Integer];
         Recording: Boolean;
         RunGeneration: Integer;
         LastWrite: DateTime;
@@ -69,13 +67,9 @@ codeunit 99910 "Coverage Recorder"
 
     local procedure StartLog(Generation: Integer)
     begin
-        // Starting the log clears the session's hits, so they count from here on top of SegmentBase.
+        // Starting the log clears the session's hits, so they count from here on top of what is stored.
         StopLog();
-        if RunGeneration <> Generation then begin
-            Clear(Written);
-            LoadWritten();
-        end;
-        Copy(Written, SegmentBase);
+        CoverageStore.LoadHits(BaseHits);
         System.CodeCoverageLog(true, false);
         Recording := true;
         RunGeneration := Generation;
@@ -91,80 +85,68 @@ codeunit 99910 "Coverage Recorder"
     end;
 
     /// <summary>
-    /// Brings "Coverage Line" up to the running log. Complete writes every Code line
-    /// of the loaded partner objects; a checkpoint only the covered ones. Both insert
-    /// the lines it does not have yet and update the ones whose hits changed.
+    /// Stores the run's coverage so far. Complete stores every Code line of the loaded
+    /// partner objects; a checkpoint only the covered ones.
     /// </summary>
     local procedure Write(Complete: Boolean)
     var
         CodeCoverage: Record System.Tooling."Code Coverage";
-        CoverageLine: Record "Coverage Line";
-        TempNewLine: Record "Coverage Line" temporary;
-        TempChangedLine: Record "Coverage Line" temporary;
+        Remaining: Dictionary of [Text, Integer];
+        Csv: TextBuilder;
         LineKey: Text;
         Hits: Integer;
-        Stored: Integer;
+        BaseHit: Integer;
+        HasBase: Boolean;
+        LinesRead: Integer;
+        LinesStored: Integer;
+        StartedAt: DateTime;
     begin
+        StartedAt := CurrentDateTime();
+        HasBase := BaseHits.Count() > 0;
+        if HasBase then
+            Copy(BaseHits, Remaining);
         System.CodeCoverageRefresh();
         CodeCoverage.SetRange("Line Type", CodeCoverage."Line Type"::Code);
         CodeCoverage.SetFilter("Object ID", '50000..99899|1000000..74999999');
         if not Complete then
             CodeCoverage.SetFilter("No. of Hits", '>0');
-        // Read everything first: inserts stay buffered only while nothing reads in between.
         if CodeCoverage.FindSet() then
             repeat
-                LineKey := Format(CodeCoverage."Object Type") + ':' + Format(CodeCoverage."Object ID", 0, 9) + ':' + Format(CodeCoverage."Line No.", 0, 9);
-                if not SegmentBase.Get(LineKey, Hits) then
-                    Hits := 0;
-                Hits += CodeCoverage."No. of Hits";
-                if Written.Get(LineKey, Stored) then begin
-                    if Hits <> Stored then begin
-                        Written.Set(LineKey, Hits);
-                        AddLine(TempChangedLine, CodeCoverage, Hits);
+                LinesRead += 1;
+                LineKey := Format(CodeCoverage."Object Type") + ',' + Format(CodeCoverage."Object ID", 0, 9) + ',' + Format(CodeCoverage."Line No.", 0, 9);
+                Hits := CodeCoverage."No. of Hits";
+                if HasBase then
+                    if Remaining.Get(LineKey, BaseHit) then begin
+                        Hits += BaseHit;
+                        Remaining.Remove(LineKey);
                     end;
-                end else begin
-                    Written.Add(LineKey, Hits);
-                    AddLine(TempNewLine, CodeCoverage, Hits);
-                end;
+                Csv.AppendLine(LineKey + ',' + Format(Hits, 0, 9));
             until CodeCoverage.Next() = 0;
+        LinesStored := LinesRead;
+        // Lines an earlier session of this run recorded that this one did not load.
+        foreach LineKey in Remaining.Keys() do begin
+            Csv.AppendLine(LineKey + ',' + Format(Remaining.Get(LineKey), 0, 9));
+            LinesStored += 1;
+        end;
 
-        if TempNewLine.FindSet() then
-            repeat
-                CoverageLine := TempNewLine;
-                CoverageLine.Insert();
-            until TempNewLine.Next() = 0;
-        if TempChangedLine.FindSet() then
-            repeat
-                CoverageLine.SetRange("Object Type", TempChangedLine."Object Type");
-                CoverageLine.SetRange("Object ID", TempChangedLine."Object ID");
-                CoverageLine.SetRange("Line No.", TempChangedLine."Line No.");
-                CoverageLine.ModifyAll(Hits, TempChangedLine.Hits);
-            until TempChangedLine.Next() = 0;
+        CoverageStore.Save(Csv.ToText());
         LastWrite := CurrentDateTime();
+        RecordWrite(LastWrite - StartedAt, LinesRead, LinesStored);
     end;
 
-    local procedure AddLine(var TempCoverageLine: Record "Coverage Line" temporary; CodeCoverage: Record System.Tooling."Code Coverage"; Hits: Integer)
-    begin
-        TempCoverageLine.Init();
-        TempCoverageLine."Object Type" := CopyStr(Format(CodeCoverage."Object Type"), 1, MaxStrLen(TempCoverageLine."Object Type"));
-        TempCoverageLine."Object ID" := CodeCoverage."Object ID";
-        TempCoverageLine."Line No." := CodeCoverage."Line No.";
-        TempCoverageLine.Hits := Hits;
-        TempCoverageLine.Insert();
-    end;
-
-    /// <summary>
-    /// What another session of this run already wrote. Nothing for a run that just
-    /// started: startCoverage empties "Coverage Line".
-    /// </summary>
-    local procedure LoadWritten()
+    local procedure RecordWrite(Took: Duration; LinesRead: Integer; LinesStored: Integer)
     var
-        CoverageLine: Record "Coverage Line";
+        CoverageSetup: Record "Coverage Setup";
     begin
-        if CoverageLine.FindSet() then
-            repeat
-                Written.Set(CoverageLine."Object Type" + ':' + Format(CoverageLine."Object ID", 0, 9) + ':' + Format(CoverageLine."Line No.", 0, 9), CoverageLine.Hits);
-            until CoverageLine.Next() = 0;
+        if not CoverageSetup.Get() then
+            exit;
+        CoverageSetup.Writes += 1;
+        CoverageSetup."Write Time" += Took;
+        CoverageSetup."Last Write Lines Read" := LinesRead;
+        CoverageSetup."Last Write Lines Stored" := LinesStored;
+        CoverageSetup."Last Write Base Lines" := BaseHits.Count();
+        CoverageSetup."Last Write At" := LastWrite;
+        CoverageSetup.Modify();
     end;
 
     /// <summary>

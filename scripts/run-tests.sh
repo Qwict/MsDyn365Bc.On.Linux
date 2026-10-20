@@ -863,11 +863,12 @@ execute_chunk() {
 #
 # startCoverage turns coverage on for the next run: the extension's Coverage
 # Recorder starts the platform's coverage log in the test session before the
-# first test codeunit and writes the lines after the last one (Test Runner
-# Extension 3.4; 3.3 merged them after every codeunit, which made a covered run
-# of a large app several times slower). codeCoverageLines then lists every
-# executable line of the partner objects the run loaded, with hit counts (0 = no
-# test ran it). Recording in the test session matters: a coverage log started
+# first test codeunit and stores the lines as one CSV after the last one (Test
+# Runner Extension 3.4; 3.3 merged them into a table after every codeunit, which
+# made a covered run of a large app several times slower). coverageReports (3.4)
+# or codeCoverageLines (3.3) then lists every executable line of the partner
+# objects the run loaded, with hit counts (0 = no test ran it). Recording in the
+# test session matters: a coverage log started
 # from an OData request belongs to that request's session and sees none of the
 # tests. Never fails the run: coverage is a report about the tests, not one of them.
 start_coverage() {
@@ -890,9 +891,29 @@ export_coverage() {
         return 0
     fi
     if py3 - "$API_BASE" "$AUTH" "$out" <<'PYEOF'
-import base64, csv, json, sys, urllib.request
+import base64, csv, json, sys, urllib.error, urllib.request
 api_base, auth, out = sys.argv[1:4]
 header = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()}
+# Test Runner Extension 3.4+ returns the whole run as one CSV; reading 120,000 lines
+# through codeCoverageLines takes a request per page and ~25 s on a large app.
+report = None
+try:
+    req = urllib.request.Request(api_base + "/coverageReports?$select=csv", headers=header)
+    with urllib.request.urlopen(req, timeout=120) as r:
+        value = json.load(r).get("value", [])
+    if value and "csv" in value[0]:
+        report = value[0]["csv"]
+except urllib.error.HTTPError as e:
+    if e.code != 404:
+        raise
+if report is not None:
+    # Same bytes as the csv.writer below writes: CRLF line ends.
+    with open(out, "w", newline="") as f:
+        f.write("object_type,object_id,line_no,hits\r\n")
+        for line in report.splitlines():
+            if line:
+                f.write(line + "\r\n")
+    sys.exit(0)
 url = api_base + "/codeCoverageLines?$select=objectType,objectId,lineNo,hits"
 with open(out, "w", newline="") as f:
     w = csv.writer(f)
