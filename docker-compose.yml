@@ -228,11 +228,15 @@ services:
       # Cronus license is used. No effect when unset.
       - ${BC_LICENSE_HOST_PATH:-/dev/null}:/bc/custom-license.bclicense:ro
     healthcheck:
-      # Multitenant: OData Company needs a tenant, so probe the dev endpoint's
-      # /metadata, which answers 200 without one. ($$ is compose escaping:
-      # BC_MULTITENANT is read from the container's environment at probe time.)
+      # Multitenant: OData Company needs a tenant, and an authenticated dev
+      # /metadata probe without one makes the NST log "The tenant '' was not
+      # found" on every probe. The entrypoint touches /tmp/bc-ready only after
+      # its own metadata probe succeeded, so once ready the check is just
+      # "NST process alive and 7049 accepts TCP" (silent in the NST log).
+      # ($$ is compose escaping: BC_MULTITENANT is read at probe time. The [M]
+      # keeps pgrep from matching this shell's own command line.)
       test: |
-        test -f /tmp/bc-ready && { case "$$BC_MULTITENANT" in 1|true|TRUE|True|yes|YES) U=http://localhost:7049/BC/dev/metadata;; *) U=http://localhost:7048/BC/ODataV4/Company;; esac; curl -sf -o /dev/null -u '${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}' "$$U"; } || exit 1
+        test -f /tmp/bc-ready && { case "$$BC_MULTITENANT" in 1|true|TRUE|True|yes|YES) pgrep -f '[M]icrosoft.Dynamics.Nav.Server' >/dev/null && timeout 2 bash -c 'echo > /dev/tcp/127.0.0.1/7049';; *) curl -sf -o /dev/null -u '${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}' http://localhost:7048/BC/ODataV4/Company;; esac; } || exit 1
       # 2s interval (was 15s, then 5s) so the healthy transition is seen within
       # ~2s of the entrypoint touching /tmp/bc-ready. With cold boots down to
       # ~30-80s (R2R Merkle seeding + fast downloads), a 5s interval was
