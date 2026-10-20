@@ -933,15 +933,8 @@ if [ "$MT_PREPPED" != "1" ]; then
 # BC 28.4, EnableEncryption succeeds and EncryptText returns 344 bytes of real
 # ciphertext instead of the pass-through proxy's 16.
 $SQLCMD_DB -Q "UPDATE [\$ndo\$tenantproperty] SET tenanttype = 1;" 2>/dev/null
-if [ "$BC_MULTITENANT" = "1" ]; then
-    # Left blank on purpose: the NST rewrites a blank tenantid to the tenant's own
-    # id when it mounts the database. Keying it to 'default' here would pin every
-    # tenant to a tenant id that does not exist (installed-app checks then fail).
-    log_step "Multitenant: tenant property row left blank, the NST keys it to the tenant id at mount"
-else
 $SQLCMD_DB -Q "UPDATE [\$ndo\$tenantproperty] SET tenantid = N'default' WHERE ISNULL(tenantid, N'') = N'';" 2>/dev/null
 log_step "Tenant property row keyed to tenant 'default' (was blank; every tenant-property write matched 0 rows)"
-fi
 
 # Normalize demo-DB user time zones to UTC. The CRONUS backup ships
 # [User Personalization].[Time Zone] = 'Europe/Amsterdam' for the default
@@ -1327,8 +1320,20 @@ TRUNCATE TABLE [dbo].[$ndo$taskscheduling];
 MTEOF
     } > /tmp/bc-mt-app.sql
     # sqlcmd runs in this container, but the SQL text is read here, so no path issue.
+    # The data file keeps the size of the whole CRONUS database (~1 GB) however much
+    # was dropped, and every tenant restore inherits it - on a tmpfs that is RAM per
+    # tenant. Shrink to what is used (+64 MB headroom) after each strip.
+    cat > /tmp/bc-mt-shrink.sql <<'MTEOF'
+SET NOCOUNT ON;
+DECLARE @d sysname, @l sysname, @t int, @sql nvarchar(max);
+SELECT @d = name, @t = FILEPROPERTY(name, 'SpaceUsed') * 8 / 1024 + 64 FROM sys.database_files WHERE type = 0;
+SELECT @l = name FROM sys.database_files WHERE type = 1;
+SET @sql = N'DBCC SHRINKFILE (' + QUOTENAME(@d) + N', ' + CAST(@t AS nvarchar(10)) + N') WITH NO_INFOMSGS; DBCC SHRINKFILE (' + QUOTENAME(@l) + N', 32) WITH NO_INFOMSGS;';
+EXEC (@sql);
+MTEOF
     $SQLCMD -b -d "$BC_APP_DATABASE" -i /tmp/bc-mt-app.sql \
         || { log_step "ERROR: stripping the multitenant app database failed."; exit 1; }
+    $SQLCMD -b -d "$BC_APP_DATABASE" -i /tmp/bc-mt-shrink.sql >/dev/null || log_step "WARN: could not shrink the app database"
     {
         cat "$MT_APP_TABLES_SQL"
         cat <<'MTEOF'
@@ -1339,6 +1344,7 @@ MTEOF
     } > /tmp/bc-mt-tenant.sql
     $SQLCMD -b -d "$BC_TENANT_TEMPLATE_DB" -i /tmp/bc-mt-tenant.sql \
         || { log_step "ERROR: stripping the multitenant tenant template failed."; exit 1; }
+    $SQLCMD -b -d "$BC_TENANT_TEMPLATE_DB" -i /tmp/bc-mt-shrink.sql >/dev/null || log_step "WARN: could not shrink the tenant template"
     # Final template backup (stripped), overwriting the first. The template DB is
     # dropped afterwards: tenants restore from the backup and a resident copy
     # would just hold SQL memory and disk.
@@ -1347,7 +1353,7 @@ MTEOF
     $SQLCMD -Q "ALTER DATABASE [$BC_TENANT_TEMPLATE_DB] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$BC_TENANT_TEMPLATE_DB];" 2>/dev/null || true
     $SQLCMD -b -d "$BC_APP_DATABASE" -Q "EXEC sp_addextendedproperty @name = N'bc_mt_ready', @value = N'1'" \
         || { log_step "ERROR: could not mark the multitenant split complete."; exit 1; }
-    rm -f /tmp/bc-mt-app.sql /tmp/bc-mt-tenant.sql "$MT_APP_TABLES_SQL"
+    rm -f /tmp/bc-mt-app.sql /tmp/bc-mt-tenant.sql /tmp/bc-mt-shrink.sql "$MT_APP_TABLES_SQL"
     log_step "Multitenant: split done in $(( $(date +%s) - MT_SPLIT_START ))s (app DB '$BC_APP_DATABASE', tenant template $MT_TEMPLATE_BAK)."
 fi
 if [ "$BC_MULTITENANT" = "1" ]; then

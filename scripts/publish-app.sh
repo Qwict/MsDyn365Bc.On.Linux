@@ -9,7 +9,9 @@
 #   bc_publish_app /path/to/myapp.app "http://localhost:7049/BC/dev" "BCRUNNER:Admin123!" t1
 #
 # The optional 4th argument (or BC_TENANT) is a tenant id of a multitenant
-# instance (BC_MULTITENANT=1): the app is published to that tenant only.
+# instance (BC_MULTITENANT=1): the app is published to that tenant only. A copy
+# with a per-tenant package ID is published (scripts/tenant-app.py): the NST
+# rejects one package ID for two tenants as a duplicate.
 #
 # Returns 0 on success — meaning either:
 #   - HTTP 200 (fresh publish completed), or
@@ -63,13 +65,24 @@ bc_publish_app() {
         return 1
     fi
 
+    local upload="$app" tenant_copy=""
+    if [ -n "$tenant" ]; then
+        tenant_copy=$(mktemp)
+        if python3 "$(dirname "${BASH_SOURCE[0]}")/tenant-app.py" "$app" "$tenant_copy" "$tenant"; then
+            upload="$tenant_copy"
+        else
+            echo "bc_publish_app: could not derive a per-tenant package for $app, publishing it as is" >&2
+        fi
+    fi
+
     local body
     body=$(mktemp)
     local code
     code=$(curl -s -o "$body" -w "%{http_code}" --max-time 180 \
         -u "$auth" -X POST \
-        -F "file=@${app};type=application/octet-stream" \
+        -F "file=@${upload};type=application/octet-stream" \
         "${dev_url}/apps?SchemaUpdateMode=forcesync${tenant_q}" 2>/dev/null)
+    [ -n "$tenant_copy" ] && rm -f "$tenant_copy"
 
     if [ "$code" = "200" ]; then
         rm -f "$body"
