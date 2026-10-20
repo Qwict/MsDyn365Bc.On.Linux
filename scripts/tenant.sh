@@ -144,6 +144,15 @@ clone_installed_apps() {
         FROM [$APP_DB].dbo.[Installed Application] WHERE [Tenant ID] = N'default'" >/dev/null
 }
 
+# The tenant property row (tenant-side) is keyed to 'default' in the template. The
+# NST reads it by the tenant's own id: left as 'default' it matches nothing, the
+# tenant has no numeric id and anything that needs one fails ("Tenant numeric id
+# must be set"). Same thing Mount-NAVTenant -OverwriteTenantIdInDatabase does.
+key_tenant_property() {
+    local id="$1"
+    sql -Q "UPDATE [$id].dbo.[\$ndo\$tenantproperty] SET tenantid = N'$id' WHERE tenantid <> N'$id'" >/dev/null
+}
+
 # Everything a tenant left in the app database: its installed-app rows and the
 # packages it published itself through the dev endpoint (Published As = Dev, keyed
 # by tenant), with their metadata. Global apps (blank tenant) are never touched.
@@ -209,6 +218,7 @@ cmd_add() {
     fi
 
     log "registering $ID"
+    key_tenant_property "$ID" || fail 4 "tenant-property-failed"
     clone_installed_apps "$ID" || fail 4 "install-state-failed"
     register_row "$ID" || fail 4 "register-failed"
 

@@ -1326,7 +1326,10 @@ MTEOF
     cat > /tmp/bc-mt-shrink.sql <<'MTEOF'
 SET NOCOUNT ON;
 DECLARE @d sysname, @l sysname, @t int, @sql nvarchar(max);
-SELECT @d = name, @t = FILEPROPERTY(name, 'SpaceUsed') * 8 / 1024 + 64 FROM sys.database_files WHERE type = 0;
+-- reserved pages of the live objects: FILEPROPERTY SpaceUsed still counts the
+-- tables just dropped until the server has deallocated them in the background
+SELECT @d = name FROM sys.database_files WHERE type = 0;
+SELECT @t = CAST(SUM(reserved_page_count) * 8 / 1024 AS int) + 64 FROM sys.dm_db_partition_stats;
 SELECT @l = name FROM sys.database_files WHERE type = 1;
 SET @sql = N'DBCC SHRINKFILE (' + QUOTENAME(@d) + N', ' + CAST(@t AS nvarchar(10)) + N') WITH NO_INFOMSGS; DBCC SHRINKFILE (' + QUOTENAME(@l) + N', 32) WITH NO_INFOMSGS;';
 EXEC (@sql);
