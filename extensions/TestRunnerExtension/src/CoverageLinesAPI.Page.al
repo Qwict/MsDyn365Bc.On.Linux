@@ -1,6 +1,6 @@
 /// <summary>
 /// The code lines the last coverage run saw, with their hit counts. A line with 0
-/// hits is a line in a loaded object that no test ran. See "Coverage Line Collector".
+/// hits is a line in a loaded object that no test ran. See "Coverage Recorder".
 /// </summary>
 page 99904 "Coverage Lines API"
 {

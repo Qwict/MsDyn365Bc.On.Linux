@@ -1,6 +1,6 @@
 /// <summary>
 /// The executable lines of the code under test and how often the last coverage run
-/// executed each one. Filled by the "Coverage Line Collector" exporter, read through
+/// executed each one. Written by the "Coverage Recorder", read through
 /// the codeCoverageLines API page, emptied by startCoverage.
 /// </summary>
 table 99904 "Coverage Line"

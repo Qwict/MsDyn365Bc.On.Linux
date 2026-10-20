@@ -230,47 +230,73 @@ page 99902 "Codeunit Run Requests"
         // 130451 = TestIsolation=Disabled (no isolation) ← WRONG, causes cascading failures
         SuiteRunner.InitSuite('DEFAULT');
         OverrideSuiteRunner('DEFAULT', 130450);
+        DisableSuiteCoverage('DEFAULT');
         exit(AddRequestedCodeunits(SuiteRunner, 'Suite ready') > 0);
     end;
 
     /// <summary>
-    /// Turns code coverage on for the DEFAULT suite: Microsoft's Test Runner then
-    /// records each test codeunit in the test session itself and hands the lines to
-    /// the "Coverage Line Collector" exporter. Call after setupSuite, which recreates
-    /// the suite. Read the result from codeCoverageLines after the run.
+    /// Records code coverage for the next run of the DEFAULT suite: the "Coverage
+    /// Recorder" starts the platform's coverage log in the test session before the
+    /// first test codeunit and writes the lines to "Coverage Line" after the last.
+    /// Call after setupSuite. Read the result from codeCoverageLines after the run.
     /// </summary>
     [ServiceEnabled]
     procedure StartCoverage(): Boolean
     var
         ALTestSuite: Record System.TestTools.TestRunner."AL Test Suite";
         CoverageLine: Record "Coverage Line";
+        CoverageSetup: Record "Coverage Setup";
     begin
         if not ALTestSuite.Get('DEFAULT') then
             exit(false);
-        CoverageLine.DeleteAll();
-        ALTestSuite."CC Tracking Type" := ALTestSuite."CC Tracking Type"::"Per Codeunit";
-        ALTestSuite."CC Track All Sessions" := false;
-        ALTestSuite."CC Exporter ID" := Xmlport::"Coverage Line Collector";
-        ALTestSuite."CC Coverage Map" := ALTestSuite."CC Coverage Map"::Disabled;
-        ALTestSuite.Modify();
+        // Truncate, not DeleteAll: with global delete triggers registered BC deletes a
+        // large app's 120,000 lines one by one, longer than the runner waits for this call.
+        CoverageLine.Truncate();
+        // Microsoft's own per-codeunit recording would restart the log around every codeunit.
+        DisableSuiteCoverage('DEFAULT');
+        if not CoverageSetup.Get() then
+            CoverageSetup.Insert();
+        CoverageSetup.Enabled := true;
+        CoverageSetup.Generation += 1;
+        CoverageSetup.Modify();
         exit(true);
     end;
 
     /// <summary>
-    /// Turns code coverage off for the DEFAULT suite again; the recorded lines stay
-    /// readable through codeCoverageLines.
+    /// Stops recording code coverage; the recorded lines stay readable through
+    /// codeCoverageLines until the next startCoverage.
     /// </summary>
     [ServiceEnabled]
     procedure StopCoverage(): Boolean
     var
         ALTestSuite: Record System.TestTools.TestRunner."AL Test Suite";
+        CoverageSetup: Record "Coverage Setup";
     begin
         if not ALTestSuite.Get('DEFAULT') then
             exit(false);
+        DisableSuiteCoverage('DEFAULT');
+        if CoverageSetup.Get() then begin
+            CoverageSetup.Enabled := false;
+            CoverageSetup.Modify();
+        end;
+        exit(true);
+    end;
+
+    /// <summary>
+    /// Turns off the coverage settings Microsoft's Test Runner reads from the suite,
+    /// including any a Test Runner Extension 3.3 run left behind.
+    /// </summary>
+    local procedure DisableSuiteCoverage(SuiteName: Code[10])
+    var
+        ALTestSuite: Record System.TestTools.TestRunner."AL Test Suite";
+    begin
+        if not ALTestSuite.Get(SuiteName) then
+            exit;
+        if (ALTestSuite."CC Tracking Type" = ALTestSuite."CC Tracking Type"::Disabled) and (ALTestSuite."CC Exporter ID" = 0) then
+            exit;
         ALTestSuite."CC Tracking Type" := ALTestSuite."CC Tracking Type"::Disabled;
         ALTestSuite."CC Exporter ID" := 0;
         ALTestSuite.Modify();
-        exit(true);
     end;
 
     /// <summary>

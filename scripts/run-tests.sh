@@ -861,13 +861,15 @@ execute_chunk() {
 
 # === Code coverage ===
 #
-# startCoverage turns coverage on for the DEFAULT suite, so Microsoft's Test
-# Runner records every test codeunit inside the test session and hands its lines
-# to the extension's collector; codeCoverageLines then lists every executable
-# line of the partner objects the run loaded, with hit counts (0 = no test ran
-# it). Recording in the test session matters: a coverage log started from an
-# OData request belongs to that request's session and sees none of the tests.
-# Never fails the run: coverage is a report about the tests, not one of them.
+# startCoverage turns coverage on for the next run: the extension's Coverage
+# Recorder starts the platform's coverage log in the test session before the
+# first test codeunit and writes the lines after the last one (Test Runner
+# Extension 3.4; 3.3 merged them after every codeunit, which made a covered run
+# of a large app several times slower). codeCoverageLines then lists every
+# executable line of the partner objects the run loaded, with hit counts (0 = no
+# test ran it). Recording in the test session matters: a coverage log started
+# from an OData request belongs to that request's session and sees none of the
+# tests. Never fails the run: coverage is a report about the tests, not one of them.
 start_coverage() {
     local http
     http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 -u "$AUTH" -X POST \
