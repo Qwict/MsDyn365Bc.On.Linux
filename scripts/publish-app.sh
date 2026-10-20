@@ -6,6 +6,10 @@
 #   . "$REPO_DIR/scripts/publish-app.sh"
 #   bc_publish_app /path/to/myapp.app
 #   bc_publish_app /path/to/myapp.app "http://localhost:7049/BC/dev" "BCRUNNER:Admin123!"
+#   bc_publish_app /path/to/myapp.app "http://localhost:7049/BC/dev" "BCRUNNER:Admin123!" t1
+#
+# The optional 4th argument (or BC_TENANT) is a tenant id of a multitenant
+# instance (BC_MULTITENANT=1): the app is published to that tenant only.
 #
 # Returns 0 on success — meaning either:
 #   - HTTP 200 (fresh publish completed), or
@@ -46,6 +50,9 @@ bc_publish_app() {
     local app="$1"
     local dev_url="${2:-http://localhost:7049/BC/dev}"
     local auth="${3:-${BC_SERVER_USERNAME:-BCRUNNER}:${BC_SERVER_PASSWORD:-Admin123!}}"
+    local tenant="${4:-${BC_TENANT:-}}"
+    local tenant_q=""
+    [ -n "$tenant" ] && tenant_q="&tenant=${tenant}"
 
     if [ -z "$app" ]; then
         echo "bc_publish_app: missing required argument: <app-path>" >&2
@@ -62,7 +69,7 @@ bc_publish_app() {
     code=$(curl -s -o "$body" -w "%{http_code}" --max-time 180 \
         -u "$auth" -X POST \
         -F "file=@${app};type=application/octet-stream" \
-        "${dev_url}/apps?SchemaUpdateMode=forcesync" 2>/dev/null)
+        "${dev_url}/apps?SchemaUpdateMode=forcesync${tenant_q}" 2>/dev/null)
 
     if [ "$code" = "200" ]; then
         rm -f "$body"
@@ -78,7 +85,7 @@ bc_publish_app() {
 
     echo ""
     echo "ERROR: dev endpoint returned HTTP $code for $(basename "$app")"
-    echo "       URL: ${dev_url}/apps?SchemaUpdateMode=forcesync"
+    echo "       URL: ${dev_url}/apps?SchemaUpdateMode=forcesync${tenant_q}"
     echo "       Body:"
     sed 's/^/         /' "$body"
     echo ""

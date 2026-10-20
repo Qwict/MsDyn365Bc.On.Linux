@@ -43,6 +43,29 @@ BC_DB_PASSWORD="${BC_DB_PASSWORD:-Test1234}"
 BC_DATABASE="${BC_DATABASE:-CRONUS}"
 BC_DB_USER="${BC_DB_USER:-bctest}"
 SQL_SERVER="${SQL_SERVER:-sql}"
+
+# Multitenant mode (BC_MULTITENANT=1, see MULTITENANT.md). One NST serves many
+# tenant databases off a shared application database. The CRONUS backup is
+# restored as a tenant template, prepared like a single-tenant DB, then split
+# into an application DB (BC_DATABASE, "app" when left at the default) and a
+# tenant template backup that scripts/tenant.sh restores once per tenant.
+# BC_DATABASE keeps meaning "the database the NST is configured with" (the app
+# DB); during Step 3 it temporarily points at the template.
+# Unset, none of this runs and the single-tenant path is unchanged.
+case "${BC_MULTITENANT:-}" in
+    1|true|TRUE|True|yes|YES) BC_MULTITENANT=1 ;;
+    *) BC_MULTITENANT=0 ;;
+esac
+if [ "$BC_MULTITENANT" = "1" ]; then
+    BC_TENANT_TEMPLATE_DB="${BC_TENANT_TEMPLATE_DB:-tenant_template}"
+    [ "$BC_DATABASE" = "CRONUS" ] && BC_DATABASE="app"
+    BC_APP_DATABASE="$BC_DATABASE"
+    # Extensions are published per tenant through the dev endpoint (?tenant=<id>).
+    export BC_SKIP_APP_PUBLISH=true
+    # Normally defaulted in Step 3, which a restart of an already-split instance skips.
+    BC_SERVER_USERNAME="${BC_SERVER_USERNAME:-BCRUNNER}"
+    BC_SERVER_PASSWORD="${BC_SERVER_PASSWORD:-Admin123!}"
+fi
 ARTIFACTS="/bc/artifacts"
 SERVICE_DIR="/bc/service"
 
@@ -338,6 +361,23 @@ if [ -f "$NST_CONFIG" ]; then
     if [ -n "$CURRENT_DB" ] && [ "$CURRENT_DB" != "$BC_DATABASE" ]; then
         log_step "Repointing service tier from database '$CURRENT_DB' to '$BC_DATABASE'"
         sed -i "s|DatabaseName\" value=\"[^\"]*\"|DatabaseName\" value=\"$BC_DATABASE\"|" "$NST_CONFIG"
+    fi
+fi
+
+# Multitenant switch, reconciled every boot. Only flipped to false when it was
+# true, so a single-tenant instance never has its CustomSettings touched.
+if [ -f "$NST_CONFIG" ]; then
+    if [ "$BC_MULTITENANT" = "1" ]; then
+        if grep -q '<add key="Multitenant" value="false"' "$NST_CONFIG"; then
+            sed -i 's|<add key="Multitenant" value="false"|<add key="Multitenant" value="true"|' "$NST_CONFIG"
+            log_step "Multitenant=true (BC_MULTITENANT=1)"
+        elif ! grep -q '<add key="Multitenant"' "$NST_CONFIG"; then
+            sed -i '/<\/appSettings>/i\  <add key="Multitenant" value="true"/>' "$NST_CONFIG"
+            log_step "Multitenant=true (BC_MULTITENANT=1)"
+        fi
+    elif grep -q '<add key="Multitenant" value="true"' "$NST_CONFIG"; then
+        sed -i 's|<add key="Multitenant" value="true"|<add key="Multitenant" value="false"|' "$NST_CONFIG"
+        log_step "Multitenant=false (BC_MULTITENANT is off)"
     fi
 fi
 
@@ -748,6 +788,34 @@ ELSE
 ALTER SERVER ROLE sysadmin ADD MEMBER [$BC_DB_USER];
 "
 
+# Multitenant: decide whether the split already happened (idempotent restart).
+# Done = the app DB exists AND the template backup (written last) is on the SQL
+# volume. Anything less is a boot that died half-way: drop what it left and
+# redo it, which is safe because no tenant can be registered before the marker.
+MT_PREPPED=0
+if [ "$BC_MULTITENANT" = "1" ]; then
+    MT_TEMPLATE_BAK="/var/opt/mssql/data/${BC_TENANT_TEMPLATE_DB}.bak"
+    MT_MARKER=$($SQLCMD -h -1 -W -Q "SET NOCOUNT ON; EXEC master.dbo.xp_fileexist N'$MT_TEMPLATE_BAK'" 2>/dev/null | head -1 | awk '{print $1}')
+    # Completion marker: an extended property on the app DB, set as the very last
+    # step of the split (the template backup alone cannot prove the split finished,
+    # it is written before the app DB is stripped).
+    MT_READY=$($SQLCMD -h -1 -Q "SET NOCOUNT ON; IF DB_ID(N'$BC_APP_DATABASE') IS NULL SELECT 0 ELSE SELECT COUNT(*) FROM [$BC_APP_DATABASE].sys.extended_properties WHERE class = 0 AND name = N'bc_mt_ready'" 2>/dev/null | tr -d '[:space:]')
+    if [ "$MT_MARKER" = "1" ] && [ "$MT_READY" = "1" ]; then
+        MT_PREPPED=1
+        log_step "Multitenant: app database '$BC_APP_DATABASE' and tenant template backup already in place, skipping restore and split."
+    else
+        log_step "Multitenant: preparing tenant template '$BC_TENANT_TEMPLATE_DB', then splitting off '$BC_APP_DATABASE'."
+        $SQLCMD -Q "
+        IF DB_ID(N'$BC_TENANT_TEMPLATE_DB') IS NOT NULL BEGIN
+            ALTER DATABASE [$BC_TENANT_TEMPLATE_DB] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$BC_TENANT_TEMPLATE_DB]; END
+        IF DB_ID(N'$BC_APP_DATABASE') IS NOT NULL BEGIN
+            ALTER DATABASE [$BC_APP_DATABASE] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$BC_APP_DATABASE]; END
+        " || { log_step "ERROR: could not drop a partial multitenant database set."; exit 1; }
+        # Everything up to the split targets the template, as if it were the single DB.
+        BC_DATABASE="$BC_TENANT_TEMPLATE_DB"
+    fi
+fi
+
 # Restore database if needed
 DB_EXISTS=$($SQLCMD -h -1 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.databases WHERE name='$BC_DATABASE'" 2>/dev/null | tr -d '[:space:]')
 if [ "$DB_EXISTS" != "1" ]; then
@@ -777,6 +845,7 @@ fi
 SQLCMD_DB="sqlcmd -S $SQL_SERVER -U $BC_DB_USER -P $BC_DB_PASSWORD -d $BC_DATABASE -C -No"
 
 # Encryption key
+if [ "$MT_PREPPED" != "1" ]; then
 $SQLCMD_DB -Q "
 IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = '\$ndo\$publicencryptionkey')
     CREATE TABLE [dbo].[\$ndo\$publicencryptionkey] ([id] INT NOT NULL PRIMARY KEY, [publickey] NVARCHAR(1024) NOT NULL);
@@ -784,6 +853,7 @@ DELETE FROM [dbo].[\$ndo\$publicencryptionkey] WHERE [id] = 0;
 INSERT INTO [dbo].[\$ndo\$publicencryptionkey] ([id], [publickey]) VALUES (0,
 N'<RSAKeyValue><Modulus>xbzyD+SGxykyAv82XOEFtDzWEIok0MM5SAc+CS6Mq0W5LwiyXeakWyblq1XgYi3CDu700986ZVRi4KJjruZlzBeZ7IWXD4lEEpTCRuqoxasRTnwVpyVqGuHclJAnUpjeBS6HvaS/iesYWwxZcmlsmzJHvF3hXdDmLj+8GSKgo4IhschPCIpnoH8+FREX++VpwfZH1ejMk5Izds/ZI70Xc/OWfRfaYy3rtCFeZQ1R5T1AhlNJDgpn0a1oP86F8yDGYawB2GJKIewdcWE8usu4QesrFnlS1g/IJcFXe71/TiJjryqRJPk8ze3Jh9+atx57OnI4R3QvuM/lQ7YoN1RVjw==</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>');
 " 2>/dev/null
+fi
 
 # License import.
 #
@@ -836,6 +906,11 @@ if [ -n "$LICENSE_TO_IMPORT" ]; then
     log_step "License imported and verified: $(basename "$LICENSE_TO_IMPORT")"
 fi
 
+# Everything from here to the end of Step 3's database setup (tenant property,
+# time zone, tuning, app clearing, service users) is tenant-side or runs once on
+# the template. When the multitenant split already happened it is all baked in.
+if [ "$MT_PREPPED" != "1" ]; then
+
 # Sandbox tenant type, and give the row the tenant id the NST actually uses.
 #
 # The CRONUS demo backup ships exactly one [$ndo$tenantproperty] row with
@@ -858,8 +933,15 @@ fi
 # BC 28.4, EnableEncryption succeeds and EncryptText returns 344 bytes of real
 # ciphertext instead of the pass-through proxy's 16.
 $SQLCMD_DB -Q "UPDATE [\$ndo\$tenantproperty] SET tenanttype = 1;" 2>/dev/null
+if [ "$BC_MULTITENANT" = "1" ]; then
+    # Left blank on purpose: the NST rewrites a blank tenantid to the tenant's own
+    # id when it mounts the database. Keying it to 'default' here would pin every
+    # tenant to a tenant id that does not exist (installed-app checks then fail).
+    log_step "Multitenant: tenant property row left blank, the NST keys it to the tenant id at mount"
+else
 $SQLCMD_DB -Q "UPDATE [\$ndo\$tenantproperty] SET tenantid = N'default' WHERE ISNULL(tenantid, N'') = N'';" 2>/dev/null
 log_step "Tenant property row keyed to tenant 'default' (was blank; every tenant-property write matched 0 rows)"
+fi
 
 # Normalize demo-DB user time zones to UTC. The CRONUS backup ships
 # [User Personalization].[Time Zone] = 'Europe/Amsterdam' for the default
@@ -1183,7 +1265,96 @@ BEGIN
         NEWID(), GETUTCDATE(), '$SVC_GUID', GETUTCDATE(), '$SVC_GUID');
 END
 " 2>/dev/null
+fi  # MT_PREPPED != 1
+
 log_step "Database ready ($BC_SERVER_USERNAME). Step 3 (DB setup): $(($(date +%s) - STEP3_START))s"
+
+# Multitenant split: template (fully prepared above) -> app DB + tenant template.
+# Same result as Export-NAVApplication / Remove-NAVApplication, in plain SQL:
+# the app DB keeps exactly the application tables, the tenant template loses them.
+if [ "$BC_MULTITENANT" = "1" ] && [ "$MT_PREPPED" != "1" ]; then
+    MT_SPLIT_START=$(date +%s)
+    MT_APP_TABLES_SQL="/tmp/bc-mt-app-tables.sql"
+    cat > "$MT_APP_TABLES_SQL" <<'MTEOF'
+SET NOCOUNT ON;
+DECLARE @keep TABLE (name sysname PRIMARY KEY);
+INSERT INTO @keep VALUES
+ (N'$ndo$dbproperty'),(N'$ndo$cachesync'),(N'$ndo$taskscheduling'),(N'$ndo$inplacepublishingstate'),
+ (N'$ndo$inplacepublishingstatus'),(N'$ndo$inplacepublishingworkloads'),(N'$ndo$inplacepublishingbaseline'),
+ (N'$ndo$textlookup'),(N'$ndo$textmap'),(N'$ndo$textobjectmap'),(N'Object'),(N'Object Metadata'),
+ (N'Server Instance'),(N'Add-in'),(N'NAV App Object Metadata'),(N'NAV App Tenant App'),(N'NAV App'),
+ (N'NAV App Dependencies'),(N'NAV App Capabilities'),(N'NAV App Object Prerequisites'),(N'Media'),
+ (N'Media Set'),(N'Published Application'),(N'Application Object Metadata'),(N'Application Dependency'),
+ (N'Installed Application'),(N'Inplace Installed Application'),(N'Report Layout Definition'),
+ (N'Application Resource'),(N'Permission Set'),(N'Permission'),(N'Debugger Breakpoint'),(N'Debugger Watch'),
+ (N'Send-To Program'),(N'Style Sheet'),(N'Profile'),(N'Profile Metadata'),(N'Profile Page Metadata'),
+ (N'Chart'),(N'Web Service'),(N'Configuration Package File'),(N'Entitlement Set'),(N'Entitlement'),
+ (N'Membership Entitlement'),(N'Page Documentation'),(N'OData Edm Type'),(N'Upgrade Blob Storage'),
+ (N'Report Layout'),(N'Media Resources'),(N'NAV App Resource'),(N'NAV App Publish Reference'),
+ (N'Power BI Blob'),(N'Power BI Default Selection');
+DECLARE @sql nvarchar(max);
+MTEOF
+    MT_DATA_DIR="/var/opt/mssql/data"
+    # The same file is written twice: first the prepared template (source of the
+    # app DB), finally the stripped template (what tenants restore from).
+    MT_TMP_BAK="$MT_TEMPLATE_BAK"
+    log_step "Multitenant: backing up '$BC_TENANT_TEMPLATE_DB' ..."
+    $SQLCMD -b -Q "BACKUP DATABASE [$BC_TENANT_TEMPLATE_DB] TO DISK=N'$MT_TMP_BAK' WITH COPY_ONLY, INIT, COMPRESSION" \
+        || { log_step "ERROR: multitenant template backup failed."; exit 1; }
+    MT_DATA_NAME=$($SQLCMD -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='$MT_TMP_BAK'" 2>/dev/null | head -1 | cut -f1)
+    MT_LOG_NAME=$($SQLCMD -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='$MT_TMP_BAK'" 2>/dev/null | head -2 | tail -1 | cut -f1)
+    $SQLCMD -b -Q "
+        RESTORE DATABASE [$BC_APP_DATABASE] FROM DISK='$MT_TMP_BAK'
+        WITH MOVE '$MT_DATA_NAME' TO '$MT_DATA_DIR/$BC_APP_DATABASE.mdf',
+             MOVE '$MT_LOG_NAME' TO '$MT_DATA_DIR/${BC_APP_DATABASE}_log.ldf'
+    " || { log_step "ERROR: multitenant app database restore failed."; exit 1; }
+    rm -f /tmp/bc-mt-app.sql
+    {
+        cat "$MT_APP_TABLES_SQL"
+        cat <<'MTEOF'
+-- Not one of the 53, but the NST reads the public encryption key from the app DB
+-- too (without it: "An encryption key must be imported ... before using Sql
+-- Authentication"), so it stays in both.
+INSERT INTO @keep VALUES (N'$ndo$publicencryptionkey');
+SELECT @sql = STRING_AGG(CAST(N'DROP VIEW ' + QUOTENAME(SCHEMA_NAME(schema_id)) + N'.' + QUOTENAME(name) AS nvarchar(max)), N'; ') FROM sys.views;
+IF @sql IS NOT NULL EXEC (@sql);
+SELECT @sql = STRING_AGG(CAST(N'DROP TABLE ' + QUOTENAME(SCHEMA_NAME(t.schema_id)) + N'.' + QUOTENAME(t.name) AS nvarchar(max)), N'; ')
+FROM sys.tables t WHERE t.name NOT IN (SELECT name FROM @keep);
+IF @sql IS NOT NULL EXEC (@sql);
+SELECT @sql = STRING_AGG(CAST(N'DROP SEQUENCE ' + QUOTENAME(SCHEMA_NAME(schema_id)) + N'.' + QUOTENAME(name) AS nvarchar(max)), N'; ') FROM sys.sequences;
+IF @sql IS NOT NULL EXEC (@sql);
+TRUNCATE TABLE [dbo].[$ndo$taskscheduling];
+MTEOF
+    } > /tmp/bc-mt-app.sql
+    # sqlcmd runs in this container, but the SQL text is read here, so no path issue.
+    $SQLCMD -b -d "$BC_APP_DATABASE" -i /tmp/bc-mt-app.sql \
+        || { log_step "ERROR: stripping the multitenant app database failed."; exit 1; }
+    {
+        cat "$MT_APP_TABLES_SQL"
+        cat <<'MTEOF'
+SELECT @sql = STRING_AGG(CAST(N'DROP TABLE ' + QUOTENAME(SCHEMA_NAME(t.schema_id)) + N'.' + QUOTENAME(t.name) AS nvarchar(max)), N'; ')
+FROM sys.tables t WHERE t.name IN (SELECT name FROM @keep);
+IF @sql IS NOT NULL EXEC (@sql);
+MTEOF
+    } > /tmp/bc-mt-tenant.sql
+    $SQLCMD -b -d "$BC_TENANT_TEMPLATE_DB" -i /tmp/bc-mt-tenant.sql \
+        || { log_step "ERROR: stripping the multitenant tenant template failed."; exit 1; }
+    # Final template backup (stripped), overwriting the first. The template DB is
+    # dropped afterwards: tenants restore from the backup and a resident copy
+    # would just hold SQL memory and disk.
+    $SQLCMD -b -Q "BACKUP DATABASE [$BC_TENANT_TEMPLATE_DB] TO DISK=N'$MT_TEMPLATE_BAK' WITH COPY_ONLY, INIT, COMPRESSION" \
+        || { log_step "ERROR: multitenant tenant template backup failed."; exit 1; }
+    $SQLCMD -Q "ALTER DATABASE [$BC_TENANT_TEMPLATE_DB] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$BC_TENANT_TEMPLATE_DB];" 2>/dev/null || true
+    $SQLCMD -b -d "$BC_APP_DATABASE" -Q "EXEC sp_addextendedproperty @name = N'bc_mt_ready', @value = N'1'" \
+        || { log_step "ERROR: could not mark the multitenant split complete."; exit 1; }
+    rm -f /tmp/bc-mt-app.sql /tmp/bc-mt-tenant.sql "$MT_APP_TABLES_SQL"
+    log_step "Multitenant: split done in $(( $(date +%s) - MT_SPLIT_START ))s (app DB '$BC_APP_DATABASE', tenant template $MT_TEMPLATE_BAK)."
+fi
+if [ "$BC_MULTITENANT" = "1" ]; then
+    # From here on the NST's database is the app DB.
+    BC_DATABASE="$BC_APP_DATABASE"
+    SQLCMD_DB="sqlcmd -S $SQL_SERVER -U $BC_DB_USER -P $BC_DB_PASSWORD -d $BC_DATABASE -C -No"
+fi
 
 # =============================================================================
 # Step 4: Start BC server in background, publish test runner, then wait
@@ -1426,7 +1597,12 @@ done
 # comparing its key with the one in the database, and the writes above are silenced,
 # so a bad boot left nothing to compare against a good one. One line, read-only.
 _enc_sql() { $SQLCMD_DB -h -1 -W -Q "SET NOCOUNT ON; $1" 2>&1 | head -1 | tr -d '\r'; }
+if [ "$BC_MULTITENANT" = "1" ]; then
+    # The tenant-side tables live in the tenant databases, not in the app DB.
+    log_step "Multitenant: NST starts against app DB '$BC_DATABASE'; tenants are mounted with /bc/scripts/tenant.sh add <id>."
+else
 log_step "Encryption state before NST start: public-key rows=$(_enc_sql "SELECT COUNT(*) FROM [\$ndo\$publicencryptionkey]") tenant-key-file='$(_enc_sql "SELECT ISNULL(encryptionkeyfilename, N'') FROM [\$ndo\$tenantproperty]")' tenant-id='$(_enc_sql "SELECT ISNULL(tenantid, N'') FROM [\$ndo\$tenantproperty]")' keys-dir=[$(ls "$BC_KEYS_DIR" 2>/dev/null | tr '\n' ' ')]"
+fi
 
 log_step "Starting BC service tier..."
 # Start BC — use a FIFO to keep stdin open for /console mode
@@ -1505,7 +1681,13 @@ exec 3>/tmp/bc-stdin
             wait $BC_PID 2>/dev/null
             exit 1
         fi
-        HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$DEV_URL/packages" 2>&1)
+        if [ "$BC_MULTITENANT" = "1" ]; then
+            # /packages needs a tenant in multitenant mode; /metadata answers without one.
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
+                -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" "$DEV_URL/BC/dev/metadata" 2>&1)
+        else
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$DEV_URL/packages" 2>&1)
+        fi
         if [ "$HTTP" != "000" ]; then
             break
         fi

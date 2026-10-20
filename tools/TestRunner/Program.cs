@@ -29,6 +29,7 @@ using StreamJsonRpc;
 
 var host = "localhost:7085";
 var odataHost = "localhost:7052"; // OData API host for suite setup
+var tenant = ""; // multitenant instance: tenant id, empty = single-tenant (no tenant parameter anywhere)
 var company = "CRONUS International Ltd.";
 var user = "BCRUNNER";
 var password = "Admin123!";
@@ -52,6 +53,7 @@ for (int i = 0; i < args.Length; i++)
 {
     if (args[i] == "--host" && i + 1 < args.Length) host = args[++i];
     else if (args[i] == "--odata-host" && i + 1 < args.Length) odataHost = args[++i];
+    else if (args[i] == "--tenant" && i + 1 < args.Length) tenant = args[++i];
     else if (args[i] == "--company" && i + 1 < args.Length) company = args[++i];
     else if (args[i] == "--user" && i + 1 < args.Length) user = args[++i];
     else if (args[i] == "--password" && i + 1 < args.Length) password = args[++i];
@@ -191,7 +193,7 @@ async Task<int> RunTests()
         Log($"Setting up suite '{suiteName}' via OData (codeunits: {codeunitFilter})...");
         try
         {
-            using var http = new HttpClient();
+            using var http = NewHttpClient();
             http.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
                 "Basic", Convert.ToBase64String(authBytes));
             // Discover company ID via standard API
@@ -422,7 +424,8 @@ async Task PrintLiveResults(byte[] authBytes, int codeunitsRun, int numCodeunits
         // Reuse HttpClient and company ID across calls
         if (cachedHttp == null)
         {
-            cachedHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            cachedHttp = NewHttpClient();
+            cachedHttp.Timeout = TimeSpan.FromSeconds(30);
             cachedHttp.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
                 "Basic", Convert.ToBase64String(authBytes));
         }
@@ -584,17 +587,23 @@ async Task<(JsonRpc, ClientWebSocket, CancellationTokenSource)> Connect(byte[] a
     }
 }
 
+// OData client; with --tenant every request carries tenant=<id>.
+HttpClient NewHttpClient() => tenant == ""
+    ? new HttpClient()
+    : new HttpClient(new TenantQueryHandler(new HttpClientHandler(), tenant));
+
 async Task<(JsonRpc, ClientWebSocket, CancellationTokenSource)> ConnectOnce(
     byte[] authBytes, string clientServicesPassword, MetadataTokenCapture tc, CancellationToken ct)
 {
-    Log($"Connecting to ws://{host}/ws/connect");
+    var wsUrl = $"ws://{host}/ws/connect";
+    Log($"Connecting to {wsUrl}" + (tenant != "" ? $" (tenant {tenant})" : ""));
     var sessionEndedCts = new CancellationTokenSource();
     var ws = new ClientWebSocket();
     JsonRpc? rpc = null;
     try
     {
         ws.Options.SetRequestHeader("Authorization", $"Basic {Convert.ToBase64String(authBytes)}");
-        await ws.ConnectAsync(new Uri($"ws://{host}/ws/connect"), ct);
+        await ws.ConnectAsync(new Uri(wsUrl), ct);
         rpc = new JsonRpc(new WebSocketMessageHandler(ws));
         rpc.TraceSource.Switch.Level = System.Diagnostics.SourceLevels.Verbose;
         rpc.TraceSource.Listeners.Add(tc);
@@ -602,8 +611,15 @@ async Task<(JsonRpc, ClientWebSocket, CancellationTokenSource)> ConnectOnce(
         rpc.AddLocalRpcTarget(callbacks);
         callbacks.Rpc = rpc;
         rpc.StartListening();
-        await rpc.InvokeWithCancellationAsync<JToken>("OpenConnection",
-            new object[] { new { LCID = 1033, DefaultLCID = 1033, TimeZoneId = "UTC", ClientConnectionType = 115, Credentials = new { UserName = user, Password = clientServicesPassword } } }, ct);
+        // A multitenant NST has no default tenant, and wants it named twice: the
+        // client-services password carries it as "<tenant>\<password>" (that is what
+        // authentication reads), and the request carries it in ConnectionRequest.TenantId
+        // (that is what the session is opened on). Either alone fails with "A tenant was
+        // not specified" / "The tenant '<password>' is not mounted". Single-tenant
+        // requests are left exactly as before.
+        var connectionRequest = JObject.FromObject(new { LCID = 1033, DefaultLCID = 1033, TimeZoneId = "UTC", ClientConnectionType = 115, Credentials = new { UserName = user, Password = tenant != "" ? tenant + "\\" + clientServicesPassword : clientServicesPassword } });
+        if (tenant != "") connectionRequest["TenantId"] = tenant;
+        await rpc.InvokeWithCancellationAsync<JToken>("OpenConnection", new object[] { connectionRequest }, ct);
         Log("Connected.");
         return (rpc, ws, sessionEndedCts);
     }
@@ -669,6 +685,22 @@ async Task<(JsonRpc rpc, ClientWebSocket ws, CancellationTokenSource sessionEnde
         if (attempt < maxAttempts) await Task.Delay(TimeSpan.FromSeconds(2), ct);
     }
     return null;
+}
+
+// Adds tenant=<id> to every request URI (the OData side of --tenant).
+class TenantQueryHandler : DelegatingHandler
+{
+    private readonly string _tenant;
+    public TenantQueryHandler(HttpMessageHandler inner, string tenant) : base(inner) => _tenant = tenant;
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        var b = new UriBuilder(request.RequestUri!);
+        var q = b.Query.TrimStart('?');
+        b.Query = (q.Length == 0 ? "" : q + "&") + "tenant=" + Uri.EscapeDataString(_tenant);
+        request.RequestUri = b.Uri;
+        return base.SendAsync(request, ct);
+    }
 }
 
 class Callbacks

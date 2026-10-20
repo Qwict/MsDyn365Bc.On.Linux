@@ -34,6 +34,9 @@
 #   --auth <user:pass>         Authentication (default: BCRUNNER:Admin123!)
 #   --timeout <minutes>        Overall timeout (default: 30)
 #   --test-runner-app <path>   TestRunnerExtension .app (auto-detected)
+#   --tenant <id>              Run against tenant <id> of a multitenant instance
+#                              (BC_MULTITENANT=1): every BC request carries
+#                              tenant=<id>, including the test client session.
 
 set -uo pipefail
 
@@ -59,6 +62,7 @@ TEST_RUNNER_APP=""
 JUNIT_OUTPUT=""
 COVERAGE_OUTPUT=""
 RENEW_CLIENT_CONTEXT=0
+TENANT=""
 
 show_help() {
     cat <<'HELPEOF'
@@ -86,6 +90,8 @@ Options:
   --auth <user:pass>         Authentication (default: BCRUNNER:Admin123!)
   --timeout <minutes>        Overall timeout (default: 30)
   --test-runner-app <path>   TestRunnerExtension .app (auto-detected)
+  --tenant <id>              Tenant of a multitenant instance (BC_MULTITENANT=1);
+                             every BC request and the test session use it
   --disabled-tests <dir>     Directory with DisabledTests JSON files
   --renew-client-context     Open a NEW client session before every test codeunit.
                              Off by default, matching BcContainerHelper's
@@ -121,6 +127,7 @@ while [[ $# -gt 0 ]]; do
         --junit-output) JUNIT_OUTPUT="$2"; shift 2;;
         --coverage-output) COVERAGE_OUTPUT="$2"; shift 2;;
         --renew-client-context) RENEW_CLIENT_CONTEXT=1; shift;;
+        --tenant) TENANT="$2"; shift 2;;
         --host|--test-runner|--suite-name|--codeunit-timeout|--extension-id|--sql-password) shift 2;;
         *) echo "Unknown option: $1 (try --help)"; exit 1;;
     esac
@@ -128,8 +135,28 @@ done
 
 echo "=== BC Test Runner ==="
 
+if [ -n "$TENANT" ] && ! [[ "$TENANT" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+    echo "ERROR: invalid --tenant '$TENANT' (expected ^[a-z0-9][a-z0-9-]{0,62}\$)"
+    exit 1
+fi
+
 # --- Helper ---
 py3() { env -u PYTHONHOME -u PYTHONPATH python3 "$@"; }
+
+# curl for every BC request. With --tenant, tenant=<id> is added to the URL
+# (the last argument, which is where every call here puts it); without it this
+# is plain curl.
+bc_curl() {
+    if [ -z "$TENANT" ]; then curl "$@"; return; fi
+    local args=("$@") last
+    last="${args[$(( $# - 1 ))]}"
+    case "$last" in
+        *\?*) last="${last}&tenant=${TENANT}" ;;
+        *) last="${last}?tenant=${TENANT}" ;;
+    esac
+    args[$(( $# - 1 ))]="$last"
+    curl "${args[@]}"
+}
 
 # Derive scheme://host (no port, no path) and instance path from BASE_URL
 # so fallback URLs on other ports use the same host instead of hardcoded localhost.
@@ -167,7 +194,7 @@ COMPANIES_JSON=""
 for url in "${BASE_URL}/ODataV4/Company" \
            "${BASE_URL}/api/v2.0/companies" \
            "${_API_FALLBACK}/api/v2.0/companies"; do
-    COMPANIES_JSON=$(curl -sf --max-time 10 -u "$AUTH" "$url" 2>/dev/null || true)
+    COMPANIES_JSON=$(bc_curl -sf --max-time 10 -u "$AUTH" "$url" 2>/dev/null || true)
     [ -n "$COMPANIES_JSON" ] && break
 done
 if [ -z "$COMPANIES_JSON" ]; then
@@ -209,7 +236,7 @@ COMPANY_ID=${COMPANY_PICK#*$'\t'}
 
 if [ -z "$COMPANY_ID" ]; then
     for url in "${BASE_URL}/api/v2.0/companies" "${_API_FALLBACK}/api/v2.0/companies"; do
-        COMPANY_ID=$(curl -sf --max-time 10 -u "$AUTH" "$url" 2>/dev/null \
+        COMPANY_ID=$(bc_curl -sf --max-time 10 -u "$AUTH" "$url" 2>/dev/null \
             | py3 -c "import sys,json; ms=[{k.lower():v for k,v in c.items()} for c in json.load(sys.stdin)['value']]; [print(m.get('id',m.get('systemid',''))) for m in ms if m.get('name','')==sys.argv[1]]" "$COMPANY" 2>/dev/null || true)
         [ -n "$COMPANY_ID" ] && break
     done
@@ -223,13 +250,13 @@ echo "Company: $COMPANY ($COMPANY_ID)"
 # === Determine API Base URL ===
 API_PORT_BASE=""
 for base in "${BASE_URL}" "$_API_FALLBACK"; do
-    HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -u "$AUTH" \
+    HTTP=$(bc_curl -s -o /dev/null -w "%{http_code}" --max-time 10 -u "$AUTH" \
         "${base}/api/custom/automation/v1.0/companies(${COMPANY_ID})/codeunitRunRequests" 2>/dev/null || echo "000")
     [ "$HTTP" = "200" ] && API_PORT_BASE="$base" && break
 done
 if [ -z "$API_PORT_BASE" ]; then
     for base in "${BASE_URL}" "$_API_FALLBACK"; do
-        T=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -u "$AUTH" "${base}/api/v2.0/companies" 2>/dev/null || echo "000")
+        T=$(bc_curl -s -o /dev/null -w "%{http_code}" --max-time 5 -u "$AUTH" "${base}/api/v2.0/companies" 2>/dev/null || echo "000")
         [ "$T" = "200" ] && API_PORT_BASE="$base" && break
     done
     [ -z "$API_PORT_BASE" ] && API_PORT_BASE="$BASE_URL"
@@ -245,16 +272,16 @@ API_BASE="${API_PORT_BASE}/api/custom/automation/v1.0/companies(${COMPANY_ID})"
 
 # === Ensure TestRunnerExtension Published ===
 echo -n "Checking TestRunner API... "
-HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -u "$AUTH" "${API_BASE}/codeunitRunRequests" 2>/dev/null || echo "000")
+HTTP=$(bc_curl -s -o /dev/null -w "%{http_code}" --max-time 10 -u "$AUTH" "${API_BASE}/codeunitRunRequests" 2>/dev/null || echo "000")
 if [ "$HTTP" = "200" ]; then
     echo "available"
 else
     echo "not found, publishing..."
-    bc_publish_app "$TEST_RUNNER_APP" "$DEV_URL" "$AUTH" || exit 1
+    bc_publish_app "$TEST_RUNNER_APP" "$DEV_URL" "$AUTH" "$TENANT" || exit 1
     echo -n "  Waiting for API..."
     for i in $(seq 1 30); do
         sleep 2
-        HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -u "$AUTH" "${API_BASE}/codeunitRunRequests" 2>/dev/null || echo "000")
+        HTTP=$(bc_curl -s -o /dev/null -w "%{http_code}" --max-time 10 -u "$AUTH" "${API_BASE}/codeunitRunRequests" 2>/dev/null || echo "000")
         [ "$HTTP" = "200" ] && break
         echo -n "."
     done
@@ -266,7 +293,7 @@ fi
 # === Publish Test App (if provided) ===
 if [ -n "$APP_FILE" ] && [ -f "$APP_FILE" ]; then
     echo -n "Publishing $(basename "$APP_FILE")... "
-    if bc_publish_app "$APP_FILE" "$DEV_URL" "$AUTH"; then
+    if bc_publish_app "$APP_FILE" "$DEV_URL" "$AUTH" "$TENANT"; then
         echo "OK"
     else
         # bc_publish_app already printed the diagnostic body and likely
@@ -444,7 +471,7 @@ setup_suite_chunk() {
     echo -n "Setting up test suite${label}... "
     local create_body create_http
     create_body=$(mktemp)
-    create_http=$(curl -s -o "$create_body" -w "%{http_code}" --max-time 15 -u "$AUTH" -X POST \
+    create_http=$(bc_curl -s -o "$create_body" -w "%{http_code}" --max-time 15 -u "$AUTH" -X POST \
         -H "Content-Type: application/json" \
         -d "{\"CodeunitIds\": \"$chunk\"}" \
         "${API_BASE}/codeunitRunRequests" 2>/dev/null)
@@ -478,7 +505,7 @@ setup_suite_chunk() {
 
     local setup_http setup_body
     setup_body=$(mktemp)
-    setup_http=$(curl -s -o "$setup_body" -w "%{http_code}" --max-time 60 -u "$AUTH" -X POST \
+    setup_http=$(bc_curl -s -o "$setup_body" -w "%{http_code}" --max-time 60 -u "$AUTH" -X POST \
         "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.${action}" 2>/dev/null)
     if [ "$setup_http" != "200" ] && [ "$setup_http" != "204" ]; then
         echo "FAIL (HTTP $setup_http)"
@@ -549,7 +576,7 @@ verify_suite_populated() {
     # silently — exactly the failure mode we're guarding against.
     local attempt
     for attempt in $(seq 1 20); do
-        VERIFY_LAST_RESPONSE=$(curl -sf --max-time 10 -u "$AUTH" \
+        VERIFY_LAST_RESPONSE=$(bc_curl -sf --max-time 10 -u "$AUTH" \
             "${API_BASE}/testResults?\$filter=testSuite%20eq%20%27DEFAULT%27%20and%20lineType%20eq%20%27Function%27&\$top=500" 2>/dev/null || true)
         if [ -n "$VERIFY_LAST_RESPONSE" ]; then
             VERIFY_LAST_DETAIL=$(echo "$VERIFY_LAST_RESPONSE" | EXPECTED="$expected_ids" py3 -c "
@@ -577,7 +604,7 @@ sys.exit(0 if matched else 1)
         fi
         # Suite still empty for our codeunits — re-call setupSuite. The
         # metadata may have synced since the previous attempt.
-        curl -s -o /dev/null --max-time 60 -u "$AUTH" -X POST \
+        bc_curl -s -o /dev/null --max-time 60 -u "$AUTH" -X POST \
             "${API_BASE}/codeunitRunRequests(${req_id})/Microsoft.NAV.setupSuite" 2>/dev/null
         sleep 2
     done
@@ -670,13 +697,13 @@ apply_disabled_tests() {
     [ ${#DISABLED_CHUNKS[@]} -eq 0 ] && return 0
     local applied=0 dis_chunk dis_resp dis_id
     for dis_chunk in "${DISABLED_CHUNKS[@]}"; do
-        dis_resp=$(curl -s --max-time 15 -u "$AUTH" -X POST \
+        dis_resp=$(bc_curl -s --max-time 15 -u "$AUTH" -X POST \
             -H "Content-Type: application/json" \
             -d "{\"CodeunitIds\": \"$dis_chunk\"}" \
             "${API_BASE}/codeunitRunRequests" 2>/dev/null)
         dis_id=$(echo "$dis_resp" | py3 -c "import sys,json; print(json.load(sys.stdin)['Id'])" 2>/dev/null || true)
         if [ -n "$dis_id" ]; then
-            curl -s -o /dev/null --max-time 30 -u "$AUTH" -X POST \
+            bc_curl -s -o /dev/null --max-time 30 -u "$AUTH" -X POST \
                 "${API_BASE}/codeunitRunRequests(${dis_id})/Microsoft.NAV.disableTests" 2>/dev/null
             applied=$((applied + 1))
         fi
@@ -785,9 +812,10 @@ execute_chunk() {
         # fails the read, and the completeness step turns that into a loud
         # error rather than a stale or duplicated result set — so a report
         # left behind by an earlier run in the same container is removed first.
-        local in_container_junit="/tmp/$(basename "$junit_path")"
+        local in_container_junit="/tmp/${TENANT:+$TENANT-}$(basename "$junit_path")"
         ( cd "$REPO_DIR" && docker compose exec -T bc rm -f "$in_container_junit" </dev/null )
         local renew_flag=(); if [ "$RENEW_CLIENT_CONTEXT" = "1" ]; then renew_flag=(--renew-client-context); fi
+        [ -n "$TENANT" ] && renew_flag+=(--tenant "$TENANT")
         ( cd "$REPO_DIR" && printf '%s' "$AUTH_PASS" | docker compose exec -T bc \
             env DOTNET_STARTUP_HOOKS= dotnet /bc/tools/TestRunner/TestRunner.dll \
             --verbose \
@@ -823,6 +851,7 @@ execute_chunk() {
         # Pre-built binary on the host — no SDK needed, just the .NET 8 runtime.
         echo "[run-tests] Using pre-built TestRunner at $HOST_PREBUILT"
         local renew_flag=(); if [ "$RENEW_CLIENT_CONTEXT" = "1" ]; then renew_flag=(--renew-client-context); fi
+        [ -n "$TENANT" ] && renew_flag+=(--tenant "$TENANT")
         printf '%s' "$AUTH_PASS" | dotnet "$HOST_PREBUILT" \
             --verbose \
             --host "$WS_HOST" \
@@ -840,6 +869,7 @@ execute_chunk() {
         rc=$?
     else
         local renew_flag=(); if [ "$RENEW_CLIENT_CONTEXT" = "1" ]; then renew_flag=(--renew-client-context); fi
+        [ -n "$TENANT" ] && renew_flag+=(--tenant "$TENANT")
         printf '%s' "$AUTH_PASS" | dotnet run --project "$REPO_DIR/tools/TestRunner" -v q -- \
             --verbose \
             --host "$WS_HOST" \
@@ -870,7 +900,7 @@ execute_chunk() {
 # Never fails the run: coverage is a report about the tests, not one of them.
 start_coverage() {
     local http
-    http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 -u "$AUTH" -X POST \
+    http=$(bc_curl -s -o /dev/null -w "%{http_code}" --max-time 60 -u "$AUTH" -X POST \
         "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.startCoverage" 2>/dev/null)
     if [ "$http" != "200" ]; then
         echo "WARN: could not start code coverage (HTTP $http); the Test Runner Extension may predate 3.3.0.1. Running without coverage."
@@ -881,17 +911,19 @@ start_coverage() {
 
 export_coverage() {
     local out="$1" http
-    http=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 -u "$AUTH" -X POST \
+    http=$(bc_curl -s -o /dev/null -w "%{http_code}" --max-time 120 -u "$AUTH" -X POST \
         "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.stopCoverage" 2>/dev/null)
     if [ "$http" != "200" ]; then
         echo "WARN: could not stop code coverage (HTTP $http); no coverage written."
         return 0
     fi
-    if py3 - "$API_BASE" "$AUTH" "$out" <<'PYEOF'
+    if py3 - "$API_BASE" "$AUTH" "$out" "$TENANT" <<'PYEOF'
 import base64, csv, json, sys, urllib.request
-api_base, auth, out = sys.argv[1:4]
+api_base, auth, out, tenant = sys.argv[1:5]
 header = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()}
 url = api_base + "/codeCoverageLines?$select=objectType,objectId,lineNo,hits"
+if tenant:
+    url += "&tenant=" + tenant
 with open(out, "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["object_type", "object_id", "line_no", "hits"])
@@ -902,6 +934,8 @@ with open(out, "w", newline="") as f:
         for line in page.get("value", []):
             w.writerow([line["objectType"], line["objectId"], line["lineNo"], line["hits"]])
         url = page.get("@odata.nextLink")
+        if url and tenant and "tenant=" not in url:
+            url += ("&" if "?" in url else "?") + "tenant=" + tenant
 PYEOF
     then
         echo "Code coverage written to $out"
