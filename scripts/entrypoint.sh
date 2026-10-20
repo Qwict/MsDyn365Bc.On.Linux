@@ -1625,6 +1625,13 @@ mkfifo /tmp/bc-stdin 2>/dev/null || true
 # makes the docker-compose passthrough silently dead. Server GC remains the
 # default and is what every non-experimental path gets.
 export DOTNET_gcServer="${DOTNET_gcServer:-1}"
+# Multitenant: one NST carries every tenant, so its heap matters more than in a
+# one-tenant container. Server GC defaults to one heap per core (40 here) and the
+# NST sat at 7-8 GB with five tenants; four heaps keep server GC's compile speed
+# at 2.7 GB. The value is hexadecimal. Overridable like the rest.
+if [ "$BC_MULTITENANT" = "1" ]; then
+    export DOTNET_GCHeapCount="${DOTNET_GCHeapCount:-4}"
+fi
 # Default 0 (JMP-hook safety), but honor a caller override so the
 # docker-compose passthrough is actually usable for A/B experiments —
 # the unconditional export made that knob silently dead.
