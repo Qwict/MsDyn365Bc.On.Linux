@@ -36,6 +36,7 @@ Verified on BC 29.0 (build 29.0.54011.56707) with a probe app, 2026-10-21:
 |---|---|
 | `CodeCoverageLog(true, MultiSession)` starts recording and resets all hits; `false` stops it. With `MultiSession = true` hits from other sessions are recorded too. | Start once per run; a restart loses hits. |
 | The `Code Coverage` table (2000000049) only has rows for objects the session loaded — until `CodeCoverageInclude(AllObj)` registers objects up front. Included objects get all their lines at 0 hits; includes survive a later `CodeCoverageLog(true)`. Include is a no-op while the log is off. | Include the code under test after starting the log: untouched objects then count as 0%. |
+| A second `CodeCoverageInclude` call in the same log undoes the first: with one call per app and two apps in scope, nothing stayed registered. | Include every app under test in one call, with an `App Package ID` filter that lists all their packages. |
 | Include does **not** load table, page or report *extensions*: they get rows only once their code runs, under their own type and ID. | Extension objects no test ran cannot be measured; report them as unmeasured instead of hiding them. |
 | Rows are only visible after `CodeCoverageRefresh()`. | Refresh before every read. |
 | `AllObj."App Package ID"` equals the installed app's `Package ID` (`NAV App Installed App`). `App Runtime Package ID` differs for some apps. | Scope objects to an app through `App Package ID`. |

@@ -63,13 +63,21 @@ codeunit 99912 "Coverage Scope"
     procedure IncludeInLog()
     var
         AllObj: Record AllObj;
+        PackageFilter: Text;
     begin
+        // One call for every app: with a second CodeCoverageInclude call in the same log,
+        // BC 29 kept none of the objects either call registered (measured on two apps).
         if TempScopeApp.FindSet() then
             repeat
-                AllObj.SetRange("App Package ID", TempScopeApp."Package ID");
-                SetCodeObjectTypes(AllObj);
-                CodeCoverageInclude(AllObj);
+                if PackageFilter <> '' then
+                    PackageFilter += '|';
+                PackageFilter += Format(TempScopeApp."Package ID", 0, 4);
             until TempScopeApp.Next() = 0;
+        if PackageFilter = '' then
+            exit;
+        AllObj.SetFilter("App Package ID", PackageFilter);
+        SetCodeObjectTypes(AllObj);
+        CodeCoverageInclude(AllObj);
     end;
 
     /// <summary>

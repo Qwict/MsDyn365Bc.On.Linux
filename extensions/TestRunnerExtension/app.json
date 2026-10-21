@@ -2,7 +2,7 @@
   "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
   "name": "Test Runner Extension",
   "publisher": "ALDirectCompile",
-  "version": "4.0.0.0",
+  "version": "4.0.0.1",
   "runtime": "16.0",
   "target": "OnPrem",
   "platform": "27.0.0.0",
