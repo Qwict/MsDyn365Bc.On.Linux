@@ -61,6 +61,23 @@ listed in the report (`M,ignored`). `startCoverage` (no IDs) keeps the old behav
 the legacy scope: every loaded object in the partner ID ranges, nothing included up
 front, hits of the test session only, so an older `run-tests.sh` still works.
 
+**A dependency is never the code under test.** After the IDs are resolved, the extension
+drops every app that is a direct or transitive dependency of another app in the scope
+(`NavApp.GetModuleInfo` and `ModuleInfo.Dependencies()`, followed transitively; an app
+that is not installed ends that branch, and a seen app is not followed twice, so a cycle
+cannot loop). The default scope of `run-tests.sh` is the test app's dependencies minus
+Microsoft's apps and test libraries, so a test app that depends on both the app under test
+and the base app that app builds on would otherwise measure the whole base app: with a
+538k line base app that gave 0.2% coverage, a 10 minute run (the inventory and final writes
+of every line) and no artifact. The dropped apps are listed in `M,dependency_dropped`, and
+the summary prints `Left out (dependency of another app under test): <ids>`. The same
+pruning applies to explicit `--coverage-app` values: to measure a base app, name it alone.
+
+Example: the test app depends on `Feature` and `Base`, and `Feature` depends on `Base`.
+`run-tests.sh` may print both as its scope, but the report has `A,<Feature id>,...` only,
+`M,dependency_dropped,<Base id>`, and no `Base` object anywhere. With
+`--coverage-app <Base id>` alone, `Base` is measured.
+
 **Which sessions are recorded.** `startCoverageForApps` records the test session only
 (`CodeCoverageLog(true, false)`). The tests, and the code under test they call, run in that
 session, so it sees everything the suite does. Recording every session
@@ -123,7 +140,9 @@ F,<type>,<id>,<line>,<executed 0|1>,<signature>  a trigger or procedure
 
 Metadata keys: `version` (2), `generation` (the run), `complete` (1 after the last test
 codeunit), `mode` (`apps` or `legacy`), `sessions` (`test` or `all`: the sessions recorded), `started`, `written`, `ignored` (the app ids
-asked for but not measured, semicolon separated; only present when there are any) and
+asked for but not measured, semicolon separated; only present when there are any),
+`dependency_dropped` (the app ids asked for but left out because another app in the scope
+depends on them, semicolon separated; only present when there are any) and
 the recorder's diagnostics, which describe the writes **before** this one, since a
 write's own cost is only known after it is stored:
 

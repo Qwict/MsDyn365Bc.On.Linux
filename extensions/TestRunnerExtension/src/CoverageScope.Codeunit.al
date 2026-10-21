@@ -8,6 +8,12 @@
 /// installed, or is this extension is ignored, not an error, and listed so the report
 /// can say what was asked for but not measured.
 ///
+/// A dependency is never the code under test: an app that is a direct or transitive
+/// dependency of another app in the scope is left out and listed (GetDroppedAppIds). A
+/// test app that depends on both the app under test and the base app that app builds on
+/// would otherwise measure the whole base app, hundreds of thousands of lines. To measure
+/// a base app, name it alone.
+///
 /// Without a scope (startCoverage of an older run-tests.sh) the scope is "legacy": every
 /// loaded object in the partner ID ranges, and nothing is included up front.
 /// </summary>
@@ -26,6 +32,7 @@ codeunit 99912 "Coverage Scope"
         // Distinct object IDs in scope, ascending.
         ObjectIds: List of [Integer];
         IgnoredAppIds: List of [Text];
+        DroppedAppIds: List of [Text];
         Legacy: Boolean;
 
     /// <summary>
@@ -42,11 +49,17 @@ codeunit 99912 "Coverage Scope"
         Clear(ObjectKeys);
         Clear(ObjectIds);
         Clear(IgnoredAppIds);
+        Clear(DroppedAppIds);
         Legacy := not Scoped;
         if Legacy then
             exit;
         foreach AppIdText in AppIds.Split(',') do
             ResolveApp(AppIdText.Trim());
+        DropDependencies();
+        if TempScopeApp.FindSet() then
+            repeat
+                CollectObjects(TempScopeApp."App ID", TempScopeApp."Package ID");
+            until TempScopeApp.Next() = 0;
     end;
 
     procedure IsLegacy(): Boolean
@@ -91,6 +104,15 @@ codeunit 99912 "Coverage Scope"
     procedure GetIgnoredAppIds(): List of [Text]
     begin
         exit(IgnoredAppIds);
+    end;
+
+    /// <summary>
+    /// The ids of the apps asked for but left out because another app in the scope depends
+    /// on them, for the report.
+    /// </summary>
+    procedure GetDroppedAppIds(): List of [Text]
+    begin
+        exit(DroppedAppIds);
     end;
 
     /// <summary>
@@ -171,7 +193,72 @@ codeunit 99912 "Coverage Scope"
         TempScopeApp.Publisher := InstalledApp.Publisher;
         TempScopeApp.Version := CopyStr(AppVersion(InstalledApp), 1, MaxStrLen(TempScopeApp.Version));
         TempScopeApp.Insert();
-        CollectObjects(AppId, InstalledApp."Package ID");
+    end;
+
+    /// <summary>
+    /// Removes every app that another app in the scope depends on, directly or through
+    /// other apps. The dependencies of each app are read first and the apps removed after,
+    /// so the outcome does not depend on the order of the list.
+    /// </summary>
+    local procedure DropDependencies()
+    var
+        TempScopeApp2: Record "Coverage Scope App" temporary;
+        Dependencies: List of [Text];
+        ToDrop: List of [Text];
+        DropId: Text;
+    begin
+        if TempScopeApp.FindSet() then
+            repeat
+                Dependencies := DependencyClosure(TempScopeApp."App ID");
+                // The scope is a set of at most a few apps: a nested loop is cheap.
+                TempScopeApp2.Copy(TempScopeApp, true);
+                TempScopeApp2.FindSet();
+                repeat
+                    if (TempScopeApp2."App ID" <> TempScopeApp."App ID") and Dependencies.Contains(AppIdKey(TempScopeApp2."App ID")) then
+                        if not ToDrop.Contains(AppIdKey(TempScopeApp2."App ID")) then
+                            ToDrop.Add(AppIdKey(TempScopeApp2."App ID"));
+                until TempScopeApp2.Next() = 0;
+            until TempScopeApp.Next() = 0;
+        foreach DropId in ToDrop do begin
+            TempScopeApp.Get(GuidOf(DropId));
+            TempScopeApp.Delete();
+            DroppedAppIds.Add(DropId);
+        end;
+    end;
+
+    /// <summary>
+    /// The ids of all apps AppId depends on, directly or not, as lower case text. An app
+    /// that is not installed has no known dependencies and ends that branch; an id seen
+    /// before is not followed again, so a cycle cannot loop.
+    /// </summary>
+    local procedure DependencyClosure(AppId: Guid): List of [Text]
+    var
+        Module: ModuleInfo;
+        Dependency: ModuleDependencyInfo;
+        Seen: List of [Text];
+        Pending: List of [Guid];
+        Current: Guid;
+    begin
+        Pending.Add(AppId);
+        while Pending.Count() > 0 do begin
+            Current := Pending.Get(Pending.Count());
+            Pending.RemoveAt(Pending.Count());
+            if NavApp.GetModuleInfo(Current, Module) then
+                foreach Dependency in Module.Dependencies() do
+                    if not Seen.Contains(AppIdKey(Dependency.Id)) then begin
+                        Seen.Add(AppIdKey(Dependency.Id));
+                        Pending.Add(Dependency.Id);
+                    end;
+        end;
+        exit(Seen);
+    end;
+
+    local procedure GuidOf(AppIdText: Text): Guid
+    var
+        AppId: Guid;
+    begin
+        Evaluate(AppId, AppIdText);
+        exit(AppId);
     end;
 
     local procedure CollectObjects(AppId: Guid; PackageId: Guid)

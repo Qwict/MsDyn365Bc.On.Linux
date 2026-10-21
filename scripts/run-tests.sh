@@ -973,6 +973,7 @@ resolve_coverage_apps() {
         COVERAGE_APP_IDS="$ids"
         if [ -n "$ids" ]; then
             echo "Coverage scope (--coverage-app): $ids"
+            echo "  (the extension leaves out any of these that another one depends on; to measure a base app, name it alone)"
             return 0
         fi
         echo "Coverage scope: none of the --coverage-app values is a GUID."
@@ -1009,6 +1010,7 @@ PYEOF
         echo "  $name ($id)"
         ids="${ids:+$ids,}$id"
     done <<< "$resolved"
+    echo "  (the extension leaves out any of these that another one depends on; the report lists them)"
     COVERAGE_APP_IDS="$ids"
 }
 
