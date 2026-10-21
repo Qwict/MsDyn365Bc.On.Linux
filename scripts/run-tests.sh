@@ -23,10 +23,30 @@
 #                                AL-Go's AnalyzeTests post-step. Default off.
 #   --coverage-output <path>   Record code coverage while the suite runs and write it
 #                              to <path> as CSV: object_type,object_id,line_no,hits —
-#                              one row per executable line of the partner objects
-#                              (50000..99899, 1000000..74999999) the run loaded.
+#                              one row per executable line of the apps under test.
 #                              Best effort: a coverage failure is reported, never
-#                              fails the run. Needs Test Runner Extension 3.3.0.1.
+#                              fails the run. Needs Test Runner Extension 3.4 (legacy
+#                              report: every loaded partner object, lines only).
+#   --coverage-app <guid>      An app under test (repeatable). Default: the dependencies
+#                              of the --app test app, minus Microsoft's apps and apps
+#                              whose name contains "test" (test libraries). The resolved
+#                              scope is printed. Scoped coverage needs Test Runner
+#                              Extension 4.0; older ones record every loaded partner
+#                              object instead (legacy mode).
+#   --coverage-cobertura <path>  Also write the coverage as Cobertura XML (package per
+#                              app, class per object, every Code line; methods need
+#                              Test Runner Extension 4.0).
+#   --coverage-lcov <path>     Also write the coverage as an LCOV tracefile (functions
+#                              need Test Runner Extension 4.0).
+#   --coverage-root <dir>      The directory the report's file paths are relative to
+#                              (the repository root). Default: the git toplevel of
+#                              --coverage-source when that is inside a git work tree,
+#                              else --coverage-source itself.
+#   --coverage-source <dir>    Directory with the apps' .al sources. Objects are mapped
+#                              to their files so Cobertura/LCOV name repository-relative
+#                              paths and file line numbers. Without it a class is named
+#                              after its object ("Codeunit 50100").
+#                              Any of the three outputs turns coverage recording on.
 #   --company <name>           Company name (default: auto-detect)
 #   --base-url <url>           BC base URL (default: http://localhost:7048/BC)
 #   --dev-url <url>            BC Dev endpoint (default: http://localhost:7049/BC/dev)
@@ -61,6 +81,13 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_RUNNER_APP=""
 JUNIT_OUTPUT=""
 COVERAGE_OUTPUT=""
+COVERAGE_COBERTURA=""
+COVERAGE_LCOV=""
+COVERAGE_SOURCE=""
+COVERAGE_ROOT=""
+COVERAGE_ALL_SESSIONS=0
+COVERAGE_TMP=""
+COVERAGE_APPS=()
 RENEW_CLIENT_CONTEXT=0
 TENANT=""
 
@@ -79,10 +106,33 @@ Options:
   --junit-output <path>      Write per-test results as JUnit XML to <path>
   --coverage-output <path>   Record code coverage while the suite runs and write it
                              to <path> as CSV: object_type,object_id,line_no,hits —
-                             one row per executable line of the partner objects
-                             (50000..99899, 1000000..74999999) the run loaded.
+                             one row per executable line of the apps under test.
                              Best effort: a coverage failure is reported, never
-                             fails the run. Needs Test Runner Extension 3.3.0.1.
+                             fails the run. Needs Test Runner Extension 3.4 (its
+                             legacy report: every loaded partner object, lines only).
+  --coverage-app <guid>      An app under test (repeatable). Default: the dependencies
+                             of the --app test app, minus Microsoft's apps and apps
+                             whose name contains "test" (test libraries). The resolved
+                             scope is printed. Scoped coverage needs Test Runner
+                             Extension 4.0; older ones record every loaded partner
+                             object instead (legacy mode).
+  --coverage-cobertura <path>  Also write the coverage as Cobertura XML (methods need
+                             Test Runner Extension 4.0)
+  --coverage-lcov <path>     Also write the coverage as an LCOV tracefile (functions
+                             need Test Runner Extension 4.0)
+  --coverage-source <dir>    Directory with the apps' .al sources, so Cobertura and
+                             LCOV name repository-relative paths and file line numbers
+                             (default: classes are named after their object).
+  --coverage-root <dir>      Directory the report's file paths are relative to, the
+                             repository root. Default: the git toplevel of
+                             --coverage-source if it is inside a git work tree, else
+                             --coverage-source itself.
+  --coverage-all-sessions    Record the hits of every session on the service tier, not
+                             only the test session (default). Needs Test Runner
+                             Extension 4.1; an older one records the test session only.
+                             On a multitenant service tier this also records other
+                             tenants' sessions (more overhead, foreign hits).
+                             Any of the three outputs turns coverage recording on.
   --company <name>           Company name (default: auto-detect)
   --base-url <url>           BC OData base URL (default: http://localhost:7048/BC)
   --dev-url <url>            BC Dev endpoint (default: http://localhost:7049/BC/dev)
@@ -126,6 +176,12 @@ while [[ $# -gt 0 ]]; do
         --disabled-tests) DISABLED_TESTS_DIR="$2"; shift 2;;
         --junit-output) JUNIT_OUTPUT="$2"; shift 2;;
         --coverage-output) COVERAGE_OUTPUT="$2"; shift 2;;
+        --coverage-cobertura) COVERAGE_COBERTURA="$2"; shift 2;;
+        --coverage-lcov) COVERAGE_LCOV="$2"; shift 2;;
+        --coverage-source) COVERAGE_SOURCE="$2"; shift 2;;
+        --coverage-root) COVERAGE_ROOT="$2"; shift 2;;
+        --coverage-all-sessions) COVERAGE_ALL_SESSIONS=1; shift;;
+        --coverage-app) COVERAGE_APPS+=("$2"); shift 2;;
         --renew-client-context) RENEW_CLIENT_CONTEXT=1; shift;;
         --tenant) TENANT="$2"; shift 2;;
         --host|--test-runner|--suite-name|--codeunit-timeout|--extension-id|--sql-password) shift 2;;
@@ -891,40 +947,199 @@ execute_chunk() {
 
 # === Code coverage ===
 #
-# startCoverage turns coverage on for the DEFAULT suite, so Microsoft's Test
-# Runner records every test codeunit inside the test session and hands its lines
-# to the extension's collector; codeCoverageLines then lists every executable
-# line of the partner objects the run loaded, with hit counts (0 = no test ran
-# it). Recording in the test session matters: a coverage log started from an
-# OData request belongs to that request's session and sees none of the tests.
-# Never fails the run: coverage is a report about the tests, not one of them.
+# Coverage is recorded by the extension's Coverage Recorder in the test session
+# (a log started from an OData request belongs to that request's session and
+# sees none of the tests). startCoverageForApps names the apps under test, so
+# the denominator is their code and the report lists untouched objects at 0%;
+# an older extension only has startCoverage, which records every loaded partner
+# object (legacy mode; a 3.4 extension's report has no function data). The
+# extension keeps the whole run as one text report (docs/CODE-COVERAGE.md); scripts/coverage_report.py turns it
+# into the CSV, Cobertura and LCOV files. Never fails the run: coverage is a
+# report about the tests, not one of them.
+COVERAGE_APP_IDS=""
+
+# Fills COVERAGE_APP_IDS (comma separated) and prints the scope.
+resolve_coverage_apps() {
+    local ids="" id name resolved
+    if [ ${#COVERAGE_APPS[@]} -gt 0 ]; then
+        for id in "${COVERAGE_APPS[@]}"; do
+            # The id goes into a JSON body; only a GUID is accepted.
+            if ! [[ "$id" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+                echo "WARN: --coverage-app '$id' is not a GUID; ignored."
+                continue
+            fi
+            ids="${ids:+$ids,}$(echo "$id" | tr 'A-Z' 'a-z')"
+        done
+        COVERAGE_APP_IDS="$ids"
+        if [ -n "$ids" ]; then
+            echo "Coverage scope (--coverage-app): $ids"
+            return 0
+        fi
+        echo "Coverage scope: none of the --coverage-app values is a GUID."
+        return 0
+    fi
+    if [ -z "$APP_FILE" ] || [ ! -f "$APP_FILE" ]; then
+        echo "Coverage scope: empty (no --app test app to read dependencies from, no --coverage-app)."
+        return 0
+    fi
+    # The apps under test are the test app's own dependencies, minus Microsoft's
+    # apps and test libraries (name contains "test"): those are tools, and their
+    # code running is incidental.
+    resolved=$(py3 - "$SCRIPT_DIR" "$APP_FILE" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from _bcapp import read_app_info
+info = read_app_info(sys.argv[2])
+if info is None:
+    sys.exit(0)
+for d in info["dependencies"]:
+    if d["publisher"].strip().lower() == "microsoft":
+        continue
+    if "test" in d["name"].lower():
+        continue
+    print(d["id"] + "\t" + (d["name"] or d["id"]))
+PYEOF
+)
+    if [ -z "$resolved" ]; then
+        echo "Coverage scope: empty (the test app has no dependency that is neither Microsoft's nor a test library; pass --coverage-app)."
+        return 0
+    fi
+    echo "Coverage scope (test app dependencies):"
+    while IFS=$'\t' read -r id name; do
+        echo "  $name ($id)"
+        ids="${ids:+$ids,}$id"
+    done <<< "$resolved"
+    COVERAGE_APP_IDS="$ids"
+}
+
+# POSTs an OData action on the run request. Sets ACTION_HTTP and ACTION_FALSE:
+# an action that failed inside the extension still answers 200 with {"value":false},
+# so the body counts, not just the status.
+coverage_action() {
+    local name="$1" body="${2:-}" out
+    local args=(-s -w $'\n%{http_code}' --max-time 120 -u "$AUTH" -X POST)
+    [ -n "$body" ] && args+=(-H "Content-Type: application/json" -d "$body")
+    out=$(bc_curl "${args[@]}" "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.${name}" 2>/dev/null)
+    ACTION_HTTP="${out##*$'\n'}"
+    ACTION_FALSE=0
+    if [[ "${out%$'\n'*}" =~ \"value\"[[:space:]]*:[[:space:]]*false ]]; then
+        ACTION_FALSE=1
+    fi
+    [ "$ACTION_HTTP" = "200" ] || [ "$ACTION_HTTP" = "204" ]
+}
+
 start_coverage() {
-    local http
-    http=$(bc_curl -s -o /dev/null -w "%{http_code}" --max-time 60 -u "$AUTH" -X POST \
-        "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.startCoverage" 2>/dev/null)
-    if [ "$http" != "200" ]; then
-        echo "WARN: could not start code coverage (HTTP $http); the Test Runner Extension may predate 3.3.0.1. Running without coverage."
+    resolve_coverage_apps
+    if [ -n "$COVERAGE_APP_IDS" ]; then
+        local action=startCoverageForApps rc=0
+        local body="{\"appIds\":\"${COVERAGE_APP_IDS}\"}"
+        if [ "$COVERAGE_ALL_SESSIONS" = 1 ]; then
+            coverage_action startCoverageForAppsAllSessions "$body"; rc=$?
+            if [ "$rc" -ne 0 ] && { [ "$ACTION_HTTP" = "400" ] || [ "$ACTION_HTTP" = "404" ]; }; then
+                echo "WARN: startCoverageForAppsAllSessions not available (HTTP $ACTION_HTTP); the Test Runner Extension predates 4.1. Recording the test session only."
+            else
+                action=""
+            fi
+        fi
+        [ -n "$action" ] && { coverage_action "$action" "$body"; rc=$?; }
+        if [ "$rc" -eq 0 ]; then
+            if [ "$ACTION_FALSE" = 0 ]; then
+                echo "Code coverage recording started for the apps under test."
+                return 0
+            fi
+            echo "WARN: startCoverageForApps returned false (the app ids may be too long for the extension). Falling back to legacy coverage of every loaded partner object."
+        elif [ "$ACTION_HTTP" != "400" ] && [ "$ACTION_HTTP" != "404" ]; then
+            echo "WARN: could not start code coverage (HTTP $ACTION_HTTP). Running without coverage."
+            return 1
+        else
+            echo "WARN: startCoverageForApps not available (HTTP $ACTION_HTTP); the Test Runner Extension is older. Falling back to legacy coverage of every loaded partner object."
+        fi
+    else
+        echo "Falling back to legacy coverage of every loaded partner object."
+    fi
+    if ! coverage_action startCoverage; then
+        echo "WARN: could not start code coverage (HTTP $ACTION_HTTP); the Test Runner Extension may predate 3.4. Running without coverage."
         return 1
     fi
-    echo "Code coverage recording started."
+    if [ "$ACTION_FALSE" = 1 ]; then
+        echo "WARN: startCoverage returned false. Running without coverage."
+        return 1
+    fi
+    echo "Code coverage recording started (legacy mode)."
+}
+
+# Where report paths are relative to: --coverage-root, else the git toplevel of
+# --coverage-source, else --coverage-source itself.
+resolve_coverage_root() {
+    [ -n "$COVERAGE_ROOT" ] && return 0
+    [ -z "$COVERAGE_SOURCE" ] && return 0
+    COVERAGE_ROOT=$(git -C "$COVERAGE_SOURCE" rev-parse --show-toplevel 2>/dev/null) || COVERAGE_ROOT=""
+    [ -z "$COVERAGE_ROOT" ] && COVERAGE_ROOT="$COVERAGE_SOURCE"
+    return 0
 }
 
 export_coverage() {
-    local out="$1" http
-    http=$(bc_curl -s -o /dev/null -w "%{http_code}" --max-time 120 -u "$AUTH" -X POST \
-        "${API_BASE}/codeunitRunRequests(${REQUEST_ID})/Microsoft.NAV.stopCoverage" 2>/dev/null)
-    if [ "$http" != "200" ]; then
-        echo "WARN: could not stop code coverage (HTTP $http); no coverage written."
+    local kind complete
+    if ! coverage_action stopCoverage; then
+        echo "WARN: could not stop code coverage (HTTP $ACTION_HTTP); no coverage written."
         return 0
     fi
-    if py3 - "$API_BASE" "$AUTH" "$out" "$TENANT" <<'PYEOF'
-import base64, csv, json, sys, urllib.request
+    [ "$ACTION_FALSE" = 1 ] && echo "WARN: stopCoverage returned false; reading what was recorded anyway."
+    COVERAGE_TMP=$(mktemp -d)
+    # The directory goes away on any exit path, a signal included.
+    trap 'rm -rf "$COVERAGE_TMP"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # Reads the run. Writes report.txt (v2) or legacy.csv (legacy, the same bytes
+    # the CSV has always had: header, CRLF) into the directory and prints
+    # "<kind> <complete>"; kind "empty" means the extension answered with a v2
+    # report field that holds nothing.
+    if kind=$(py3 - "$API_BASE" "$AUTH" "$COVERAGE_TMP" "$TENANT" <<'PYEOF'
+import base64, csv, json, os, sys, urllib.error, urllib.request
 api_base, auth, out, tenant = sys.argv[1:5]
 header = {"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()}
+row = None
+# Extension 3.4+ returns the whole run in one request; "report" (v2) only exists
+# on the newest, "csv" on 3.4. Selecting a field the extension lacks is an error,
+# so retry with fewer fields before giving up on the API.
+for fields in ("generation,complete,report,csv", "complete,csv", "csv"):
+    try:
+        url = api_base + "/coverageReports?$select=" + fields
+        if tenant:
+            url += "&tenant=" + tenant
+        req = urllib.request.Request(url, headers=header)
+        with urllib.request.urlopen(req, timeout=120) as r:
+            value = json.load(r).get("value", [])
+        row = value[0] if value else {}
+        break
+    except urllib.error.HTTPError as e:
+        if e.code not in (400, 404):
+            raise
+if row is not None and "report" in row:
+    # An empty report is an answer, not a missing field: the extension ran but
+    # wrote nothing, so the legacy path below would only find nothing as well.
+    if not row["report"]:
+        print("empty unknown")
+        sys.exit(0)
+    with open(os.path.join(out, "report.txt"), "w", encoding="utf-8", newline="") as f:
+        f.write(row["report"])
+    c = row.get("complete")
+    print("v2", "true" if c is True else "false" if c is False else "unknown")
+    sys.exit(0)
+path = os.path.join(out, "legacy.csv")
+if row and "csv" in row:
+    # Same bytes as the csv.writer below writes: CRLF line ends.
+    with open(path, "w", newline="") as f:
+        f.write("object_type,object_id,line_no,hits\r\n")
+        for line in row["csv"].splitlines():
+            if line:
+                f.write(line + "\r\n")
+    print("legacy unknown")
+    sys.exit(0)
 url = api_base + "/codeCoverageLines?$select=objectType,objectId,lineNo,hits"
 if tenant:
     url += "&tenant=" + tenant
-with open(out, "w", newline="") as f:
+with open(path, "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["object_type", "object_id", "line_no", "hits"])
     while url:
@@ -936,13 +1151,51 @@ with open(out, "w", newline="") as f:
         url = page.get("@odata.nextLink")
         if url and tenant and "tenant=" not in url:
             url += ("&" if "?" in url else "?") + "tenant=" + tenant
+print("legacy unknown")
 PYEOF
-    then
-        echo "Code coverage written to $out"
+    ); then
+        :
     else
         echo "WARN: could not read code coverage; no coverage written."
-        rm -f "$out"
+        rm -rf "$COVERAGE_TMP"
+        return 0
     fi
+    kind="${kind##*$'\n'}"
+    complete="${kind#* }"
+    kind="${kind%% *}"
+    if [ "$kind" = "empty" ]; then
+        echo "NOTE: the Test Runner Extension wrote no coverage report: coverage never started in the test session. No coverage files written."
+        rm -rf "$COVERAGE_TMP"
+        return 0
+    fi
+    if [ "$complete" = "false" ]; then
+        echo "WARN: coverage report incomplete (the run ended before the final write; hits since the last checkpoint are missing)."
+    fi
+
+    resolve_coverage_root
+    local args=()
+    [ -n "$COVERAGE_COBERTURA" ] && args+=(--cobertura "$COVERAGE_COBERTURA")
+    [ -n "$COVERAGE_LCOV" ] && args+=(--lcov "$COVERAGE_LCOV")
+    [ -n "$COVERAGE_SOURCE" ] && args+=(--source "$COVERAGE_SOURCE")
+    [ -n "$COVERAGE_ROOT" ] && args+=(--root "$COVERAGE_ROOT")
+    [ "$complete" != "unknown" ] && args+=(--complete "$complete")
+    if [ "$kind" = "v2" ]; then
+        [ -n "$COVERAGE_OUTPUT" ] && args+=(--csv-out "$COVERAGE_OUTPUT")
+        args+=(--report "$COVERAGE_TMP/report.txt")
+    else
+        echo "NOTE: the Test Runner Extension returned no v2 report; Cobertura/LCOV (if asked for) carry lines only, classes named after objects."
+        [ -n "$COVERAGE_OUTPUT" ] && cp "$COVERAGE_TMP/legacy.csv" "$COVERAGE_OUTPUT"
+        args+=(--legacy-csv "$COVERAGE_TMP/legacy.csv")
+    fi
+    if py3 "$SCRIPT_DIR/coverage_report.py" "${args[@]}"; then
+        [ -n "$COVERAGE_OUTPUT" ] && echo "Code coverage CSV written to $COVERAGE_OUTPUT"
+        [ -n "$COVERAGE_COBERTURA" ] && echo "Cobertura written to $COVERAGE_COBERTURA"
+        [ -n "$COVERAGE_LCOV" ] && echo "LCOV written to $COVERAGE_LCOV"
+    else
+        echo "WARN: could not convert the code coverage report; files may be missing."
+    fi
+    rm -rf "$COVERAGE_TMP"
+    return 0
 }
 
 # --- Populate the suite, one part at a time ---
@@ -1008,10 +1261,11 @@ SESSION_NOTE=""
 echo "Executing $NUM_CODEUNITS codeunits via WebSocket${SESSION_NOTE}..."
 # --timeout was a per-part budget when each part was its own process. Scale it
 # by the number of parts so a suite that fit in the old total still fits.
-[ -n "$COVERAGE_OUTPUT" ] && { start_coverage || COVERAGE_OUTPUT=""; }
+COVERAGE_ON=0
+[ -n "$COVERAGE_OUTPUT$COVERAGE_COBERTURA$COVERAGE_LCOV" ] && { start_coverage && COVERAGE_ON=1; }
 execute_chunk "$NUM_CODEUNITS" "$RUN_JUNIT" "$(( TIMEOUT_MIN * ${#CHUNKS[@]} ))"
 [ $? -ne 0 ] && OVERALL_RC=1
-[ -n "$COVERAGE_OUTPUT" ] && export_coverage "$COVERAGE_OUTPUT"
+[ "$COVERAGE_ON" = 1 ] && export_coverage
 
 # === Finish the report ===
 #
