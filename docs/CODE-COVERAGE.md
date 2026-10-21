@@ -171,17 +171,17 @@ with coverage in alternating runs:
 
 | Suite | Code lines in scope | Without | With | Overhead |
 |---|---|---|---|---|
-| 4PS Base Application BE, 143 tests | 22,626 | 115.7 s | 121.5 s | +5.0% (median +5.9%) |
-| 4PS Base Application W1, 4,899 tests | 564,472 | 1,330 s | 1,405 s | +5.6% |
-| 4PS Dynamic Documents Core BE, 122 tests | 694 | 8.2 s | 9.8 s | +1.5 s, fixed cost |
+| Medium app, 143 tests | 22,626 | 115.7 s | 121.5 s | +5.0% (median +5.9%) |
+| Large app, 4,899 tests | 564,472 | 1,330 s | 1,405 s | +5.6% |
+| Small app, 122 tests | 694 | 8.2 s | 9.8 s | +1.5 s, fixed cost |
 
-Where it goes, on the BE suite: about 4% is the platform's own line tracking while
+Where it goes, on the medium app: about 4% is the platform's own line tracking while
 the tests run; the rest is the inventory and final writes (~1.3 s each), reading the
 report (~1.2 s) and converting it (0.06 s). A write reads ~15,000-18,000 lines a second
 when warm, so the fixed cost grows with the size of the apps under test, not with the
 number of tests; checkpoints are bounded to ~2% of the run. The first read of a large
-scope in a freshly started service tier is slower (W1: 163 s instead of 29 s once).
-A Cobertura file is ~150 bytes per line (W1: 81 MB).
+scope in a freshly started service tier is slower (the large app: 163 s instead of 29 s once).
+A Cobertura file is ~150 bytes per line (the large app: 81 MB).
 
 ## Known limits
 
@@ -190,7 +190,7 @@ A Cobertura file is ~150 bytes per line (W1: 81 MB).
   add no lines to the total.
 - The line total can grow during a run: extension objects that Include cannot register
   get their lines when their code first runs, so a checkpoint or a killed run can show a
-  smaller total than a complete one (observed on BE: inventory 20,243 lines, complete
+  smaller total than a complete one (observed on the medium app: inventory 20,243 lines, complete
   report 22,626).
 - Hits since the last checkpoint are lost if the test session dies; the report is then
   marked incomplete.
