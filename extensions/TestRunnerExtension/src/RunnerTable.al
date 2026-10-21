@@ -254,11 +254,25 @@ page 99902 "Codeunit Run Requests"
     /// Records code coverage like startCoverage, for the apps in appIds (comma separated
     /// app GUIDs): their objects are included in the log, so code no test ran counts as
     /// 0% instead of being absent. An id that is not a GUID or not an installed app is
-    /// ignored, and listed as such in the report, not an error. Returns false when the
-    /// suite does not exist or appIds is longer than 2048 characters.
+    /// ignored, and listed as such in the report, not an error. Only the test session is
+    /// recorded. Returns false when the suite does not exist or appIds is longer than
+    /// 2048 characters.
     /// </summary>
     [ServiceEnabled]
     procedure StartCoverageForApps(appIds: Text): Boolean
+    begin
+        exit(EnableCoverage(true, appIds, false));
+    end;
+
+    /// <summary>
+    /// Like startCoverageForApps, but records the hits of every session on the service
+    /// tier (CodeCoverageLog MultiSession), not only the test session's. Use it when the
+    /// code under test runs in other sessions (web service calls, background sessions).
+    /// On a service tier shared with other tenants their sessions may be recorded as
+    /// well, which is why the test session alone is the default.
+    /// </summary>
+    [ServiceEnabled]
+    procedure StartCoverageForAppsAllSessions(appIds: Text): Boolean
     begin
         exit(EnableCoverage(true, appIds, true));
     end;

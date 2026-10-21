@@ -143,9 +143,15 @@ codeunit 99913 "Coverage Report Builder"
 
     local procedure AppendMetadata(var Report: TextBuilder; var Scope: Codeunit "Coverage Scope")
     var
+        CoverageSetup: Record "Coverage Setup";
         IgnoredAppIds: List of [Text];
         Mode: Text;
+        Sessions: Text;
     begin
+        Sessions := 'test';
+        if CoverageSetup.Get() then
+            if CoverageSetup."Multi Session" then
+                Sessions := 'all';
         Mode := 'apps';
         if Scope.IsLegacy() then
             Mode := 'legacy';
@@ -153,6 +159,7 @@ codeunit 99913 "Coverage Report Builder"
         Report.AppendLine('M,generation,' + Format(RunGeneration, 0, 9));
         Report.AppendLine('M,complete,' + Flag(RunComplete));
         Report.AppendLine('M,mode,' + Mode);
+        Report.AppendLine('M,sessions,' + Sessions);
         Report.AppendLine('M,started,' + Format(RunStartedAt, 0, 9));
         Report.AppendLine('M,written,' + Format(CurrentDateTime(), 0, 9));
         // The cost of the recorder's earlier writes, see SetDiagnostics.
