@@ -434,6 +434,11 @@ def _methods(r, key, mapping=None):
     line assigned to the function whose signature line precedes it, by bisecting
     the sorted function lines, so an object with thousands of lines stays cheap.
 
+    Only coverable functions are returned: those with at least one Code line (an
+    empty trigger or a procedure of only comments has none, as in other tools'
+    models: ReportGenerator, lcov). `line` is the declaration line; writers that
+    need a line a tool can match to a DA record use the first Code line, mine[0].
+
     A name comes from the signature BC gave, else from the .al source when it is
     mapped, else it is "L<line>". Names are unique within an object (a table's
     field triggers are all OnValidate): a repeat gets "@<line>"."""
@@ -450,6 +455,8 @@ def _methods(r, key, mapping=None):
     out = []
     seen = set()
     for (ln, executed, sig), lines in zip(funcs, mine):
+        if not lines:
+            continue
         if not is_declaration(sig):
             sig = _declaration_from_source(mapping, key, ln) or ""
         name = method_name(sig) or f"L{ln + off}"
@@ -519,12 +526,9 @@ def to_cobertura(r, mapping=None, source_dir=None, timestamp_ms=None, methods=No
                        f'line-rate="{_rate(cc, cl):.4f}" branch-rate="0" complexity="0">')
             out.append("          <methods>")
             for _ln, name, executed, mine, sig in methods.get(key, []):
-                if mine:
-                    mr = _rate(sum(1 for _n, h in mine if h > 0), len(mine))
-                else:
-                    mr = 1.0 if executed else 0.0
+                mr = _rate(sum(1 for _n, h in mine if h > 0), len(mine))
                 out.append(f'            <method name={q(name)} signature={q(sig)} '
-                           f'line-rate="{mr:.4f}" branch-rate="0" complexity="0">')
+                           f'line-rate="{mr:.4f}" branch-rate="0">')
                 out.append("              <lines>")
                 for n, h in mine:
                     out.append(f'                <line number="{n + off}" hits="{h}" branch="false"/>')
@@ -544,7 +548,9 @@ def to_cobertura(r, mapping=None, source_dir=None, timestamp_ms=None, methods=No
 
 def to_lcov(r, mapping=None, methods=None):
     """LCOV tracefile: one record per object. FN names carry no comma, which is
-    the field separator."""
+    the field separator. FN is at the function's first Code line, the first line
+    that has a DA record: lcov 2.x (genhtml) rejects an FN on a line without one.
+    Functions without Code lines are left out of FN/FNDA/FNF/FNH."""
     if methods is None:
         methods = compute_methods(r, mapping)
     out = []
@@ -553,8 +559,8 @@ def to_lcov(r, mapping=None, methods=None):
         lines = r.lines.get(key, {})
         fns = methods.get(key, [])
         out += ["TN:", f"SF:{fname}"]
-        for ln, name, _e, _m, _s in fns:
-            out.append(f"FN:{ln + off},{name.replace(',', '_')}")
+        for _ln, name, _e, mine, _s in fns:
+            out.append(f"FN:{mine[0][0] + off},{name.replace(',', '_')}")
         for _ln, name, executed, _m, _s in fns:
             out.append(f"FNDA:{1 if executed else 0},{name.replace(',', '_')}")
         out += [f"FNF:{len(fns)}",
@@ -589,6 +595,8 @@ def summary(r, complete=None):
     out = ["=== Code coverage ==="]
     if r.meta.get("mode"):
         out.append(f"Mode: {r.meta['mode']}")
+    if r.meta.get("sessions"):
+        out.append(f"Sessions recorded: {r.meta['sessions']}")
     ignored = [x for x in _unquote(r.meta.get("ignored", "")).split(";") if x]
     if ignored:
         out.append("WARNING: not measured: " + ", ".join(ignored))
@@ -601,8 +609,8 @@ def summary(r, complete=None):
         keys = by_app[app_id]
         lv = sum(len(r.lines.get(k, {})) for k in keys)
         lc = sum(_covered(r.lines.get(k, {})) for k in keys)
-        fns = [f for k in keys for f in r.functions.get(k, [])]
-        fe = sum(1 for f in fns if f[1])
+        fns = [f for k in keys for f in _methods(r, k)]
+        fe = sum(1 for f in fns if f[2])
         meas = [k for k in keys if r.objects.get(k, {"measured": True})["measured"]]
         unm = [k for k in keys if not r.objects.get(k, {"measured": True})["measured"]]
         out.append(f"{_app_name(r, app_id)}: {_pct(lc, lv)} lines ({lc}/{lv}), "

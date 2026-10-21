@@ -34,7 +34,7 @@ Verified on BC 29.0 (build 29.0.54011.56707) with a probe app, 2026-10-21:
 
 | Platform behaviour | Consequence |
 |---|---|
-| `CodeCoverageLog(true, MultiSession)` starts recording and resets all hits; `false` stops it. With `MultiSession = true` hits from other sessions are recorded too. | Start once per run; a restart loses hits. |
+| `CodeCoverageLog(true, MultiSession)` starts recording and resets all hits; `false` stops it. With `MultiSession = true` the hits of every session on the service tier are recorded, not only the calling session's; on a multitenant service tier that includes other tenants' sessions (more tracking work, and foreign hits on the same app). | Start once per run; a restart loses hits. Record the test session only by default (`MultiSession = false`); all sessions is an explicit opt-in. |
 | The `Code Coverage` table (2000000049) only has rows for objects the session loaded — until `CodeCoverageInclude(AllObj)` registers objects up front. Included objects get all their lines at 0 hits; includes survive a later `CodeCoverageLog(true)`. Include is a no-op while the log is off. | Include the code under test after starting the log: untouched objects then count as 0%. |
 | A second `CodeCoverageInclude` call in the same log undoes the first: with one call per app and two apps in scope, nothing stayed registered. | Include every app under test in one call, with an `App Package ID` filter that lists all their packages. |
 | Include does **not** load table, page or report *extensions*: they get rows only once their code runs, under their own type and ID. | Extension objects no test ran cannot be measured; report them as unmeasured instead of hiding them. |
@@ -59,8 +59,18 @@ are found in `AllObj` through each app's package ID and included after the log s
 An ID that is not a GUID, not installed, or the extension's own is not measured and is
 listed in the report (`M,ignored`). `startCoverage` (no IDs) keeps the old behaviour,
 the legacy scope: every loaded object in the partner ID ranges, nothing included up
-front, hits of the test session only (`Multi Session` false; true in apps mode), so an
-older `run-tests.sh` still works.
+front, hits of the test session only, so an older `run-tests.sh` still works.
+
+**Which sessions are recorded.** `startCoverageForApps` records the test session only
+(`CodeCoverageLog(true, false)`). The tests, and the code under test they call, run in that
+session, so it sees everything the suite does. Recording every session
+(`MultiSession = true`) is a cost on a multitenant service tier: the platform tracks the
+lines of other tenants' sessions as well, and if they run the same app their hits land in
+the report and inflate it. It only pays when the code under test runs in another session
+(a web service call, a background session). That case is the opt-in
+`startCoverageForAppsAllSessions` (same arguments), selected by `run-tests.sh
+--coverage-all-sessions`; an extension older than 4.1 lacks it, and the script then warns and
+records the test session only. The report says which was used (`M,sessions`).
 
 `run-tests.sh --coverage-app <id>` names the apps (repeatable). Without it, the apps
 under test default to the test app's dependencies, leaving out Microsoft's apps and
@@ -80,7 +90,7 @@ the test session: the script says so and writes no files. An incomplete report p
 
 The `Coverage Recorder` (SingleInstance, in the session that runs the tests):
 
-1. before the first test codeunit of a run: starts the log (multi-session), includes
+1. before the first test codeunit of a run: starts the log (the test session, or all sessions when asked), includes
    the scope's objects, and writes the inventory — every line in scope at 0 hits;
 2. writes the run so far between test codeunits under the checkpoint policy below, and
    after the last test codeunit, marking the report complete;
@@ -112,7 +122,7 @@ F,<type>,<id>,<line>,<executed 0|1>,<signature>  a trigger or procedure
 ```
 
 Metadata keys: `version` (2), `generation` (the run), `complete` (1 after the last test
-codeunit), `mode` (`apps` or `legacy`), `started`, `written`, `ignored` (the app ids
+codeunit), `mode` (`apps` or `legacy`), `sessions` (`test` or `all`: the sessions recorded), `started`, `written`, `ignored` (the app ids
 asked for but not measured, semicolon separated; only present when there are any) and
 the recorder's diagnostics, which describe the writes **before** this one, since a
 write's own cost is only known after it is stored:
@@ -147,10 +157,23 @@ callers.
 | `--coverage-source <dir>` | Maps objects to their .al files under `<dir>` (skipping `.alpackages`, `.git`, `.snapshots`, `node_modules`, `.vscode`), so the Cobertura and LCOV files name file paths and file line numbers |
 | `--coverage-root <dir>` | The directory those paths are relative to. Default: the git toplevel of `--coverage-source` when it is inside a git work tree, else `--coverage-source` |
 | `--coverage-app <id>` | An app under test (repeatable) |
+| `--coverage-all-sessions` | Record every session on the service tier, not only the test session (needs extension 4.1; see Recording) |
 
 Without `--coverage-source` a class is named after its object (`Codeunit 50100`). With
 it, `filename` and `SF` are POSIX paths relative to the root and Cobertura's single
 `<source>` is `.`, so Azure DevOps and GitLab resolve them against the repository root.
+
+Standards conformance. The Cobertura file validates against `coverage-04.dtd`
+(`xmllint --dtdvalid`): `complexity` is on `coverage`, `package` and `class`, where the DTD
+requires it, and not on `method`, where it does not allow it. The LCOV file is read by
+lcov/genhtml 2.x without `--ignore-errors`: genhtml rejects an `FN` on a line without a `DA`
+record ("unexpected category UNK"), and a function's declaration line has none. So `FN` is
+at the function's **first executable (Code) line**, the first line that has a `DA`.
+A function with no executable line (an empty trigger, a procedure of only comments) is not
+coverable: it is left out of `FN`/`FNDA`/`FNF`/`FNH`, out of Cobertura `<methods>` and out
+of the summary's function counts, as ReportGenerator does, so every tool reports the same
+function totals. Cobertura methods have no line of their own; their `<lines>` are the
+Code lines from the declaration to the next one.
 
 Method names: the procedure or trigger name from the signature; when BC gave none, the
 name at the mapped line in the .al file; else `L<line>`. A name is unique within its
@@ -162,7 +185,9 @@ that were asked for but not measured; they are not in the Cobertura or LCOV file
 list only objects with lines.
 
 Minimum Test Runner Extension: 4.0 for scoped coverage and for Cobertura/LCOV with
-functions; 3.4 for the legacy report (lines only, every loaded partner object).
+functions; 3.4 for the legacy report (lines only, every loaded partner object); 4.1 for
+`--coverage-all-sessions` (4.0 recorded every session in scoped mode; 4.1 records the test
+session only unless asked).
 
 ## Performance
 

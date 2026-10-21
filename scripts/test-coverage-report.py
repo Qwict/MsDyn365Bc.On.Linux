@@ -191,7 +191,7 @@ class SourceMappingTests(unittest.TestCase):
         # relative: the viewer resolves filenames against the repository root
         self.assertEqual(root.find("sources/source").text, ".")
         lcov = cr.to_lcov(r, self.m)
-        self.assertIn("SF:src/Ops.al\nFN:18,OnRun\nFNDA:1,OnRun\nFNF:1\nFNH:1\nDA:19,2\n", lcov)
+        self.assertIn("SF:src/Ops.al\nFN:19,OnRun\nFNDA:1,OnRun\nFNF:1\nFNH:1\nDA:19,2\n", lcov)
 
 
 class WriterTests(unittest.TestCase):
@@ -218,23 +218,24 @@ class WriterTests(unittest.TestCase):
         # the partial line keeps branch="false": no branch counts are invented
         self.assertEqual(lines, [("5", "3", "false"), ("6", "0", "false"), ("7", "1", "false")])
         methods = {m.get("name"): m for m in cu.find("methods")}
-        self.assertEqual(sorted(methods), ["Bar", "Foo"])
+        # Bar has no Code line: not coverable, so not a method
+        self.assertEqual(sorted(methods), ["Foo"])
         self.assertEqual([ln.get("number") for ln in methods["Foo"].iter("line")], ["5", "6", "7"])
-        self.assertEqual(methods["Bar"].get("line-rate"), "0.0000")
+        self.assertEqual(methods["Foo"].get("line-rate"), f"{2 / 3:.4f}")
 
     def test_lcov(self):
         lcov = cr.to_lcov(self.r)
         self.assertIn(
-            "TN:\nSF:Codeunit 50100\nFN:3,Foo\nFN:9,Bar\nFNDA:1,Foo\nFNDA:0,Bar\n"
-            "FNF:2\nFNH:1\nDA:5,3\nDA:6,0\nDA:7,1\nLF:3\nLH:2\nend_of_record\n", lcov)
+            "TN:\nSF:Codeunit 50100\nFN:5,Foo\nFNDA:1,Foo\n"
+            "FNF:1\nFNH:1\nDA:5,3\nDA:6,0\nDA:7,1\nLF:3\nLH:2\nend_of_record\n", lcov)
         self.assertEqual(lcov.count("end_of_record"), 4)
         self.assertNotIn("50201", lcov)
 
     def test_summary(self):
         s = cr.summary(self.r)
-        self.assertIn("My App: 60.0% lines (3/5), 2/4 functions, 3 objects measured, 0 unmeasured", s)
+        self.assertIn("My App: 60.0% lines (3/5), 2/3 functions, 3 objects measured, 0 unmeasured", s)
         self.assertIn("Other App: 100.0% lines (1/1), 1/1 functions, 1 objects measured, 1 unmeasured", s)
-        self.assertIn("Total: 66.7% lines (4/6), 3/5 functions, 4 objects measured, 1 unmeasured", s)
+        self.assertIn("Total: 66.7% lines (4/6), 3/4 functions, 4 objects measured, 1 unmeasured", s)
         self.assertIn("PageExtension 50201", s)
         self.assertIn("Complete: yes", s)
         self.assertNotIn("more", s.split("Unmeasured")[1])
@@ -316,6 +317,83 @@ class LegacyV2Tests(unittest.TestCase):
         self.assertEqual(sorted(r.lines[("Codeunit", 1)]), [4, 5])
 
 
+# Elements and attributes coverage-04.dtd allows (https://raw.githubusercontent.com/
+# cobertura/web/master/htdocs/xml/coverage-04.dtd), as {element: (attributes, children)}.
+DTD = {
+    "coverage": ({"line-rate", "branch-rate", "lines-covered", "lines-valid",
+                  "branches-covered", "branches-valid", "complexity", "version",
+                  "timestamp"}, {"sources", "packages"}),
+    "sources": (set(), {"source"}),
+    "source": (set(), set()),
+    "packages": (set(), {"package"}),
+    "package": ({"name", "line-rate", "branch-rate", "complexity"}, {"classes"}),
+    "classes": (set(), {"class"}),
+    "class": ({"name", "filename", "line-rate", "branch-rate", "complexity"},
+              {"methods", "lines"}),
+    "methods": (set(), {"method"}),
+    "method": ({"name", "signature", "line-rate", "branch-rate"}, {"lines"}),
+    "lines": (set(), {"line"}),
+    "line": ({"number", "hits", "branch", "condition-coverage"}, {"conditions"}),
+}
+DTD_REQUIRED = {
+    "coverage": DTD["coverage"][0] - set(),
+    "package": DTD["package"][0],
+    "class": DTD["class"][0],
+    "method": DTD["method"][0],
+    "line": {"number", "hits"},
+}
+
+
+class StandardsTests(unittest.TestCase):
+    """What other tools reject: pinned from coverage-04.dtd and lcov 2.x."""
+
+    def check_dtd(self, root):
+        for el in root.iter():
+            self.assertIn(el.tag, DTD, f"element <{el.tag}> not in the DTD")
+            attrs, children = DTD[el.tag]
+            extra = set(el.attrib) - attrs
+            self.assertFalse(extra, f"<{el.tag}> has attributes the DTD does not allow: {extra}")
+            missing = DTD_REQUIRED.get(el.tag, set()) - set(el.attrib)
+            self.assertFalse(missing, f"<{el.tag}> lacks required attributes: {missing}")
+            for child in el:
+                self.assertIn(child.tag, children, f"<{child.tag}> not allowed in <{el.tag}>")
+
+    def test_cobertura_conforms_to_the_dtd(self):
+        r = cr.parse_report(REPORT)
+        self.check_dtd(ET.fromstring(cr.to_cobertura(r, timestamp_ms=1)))
+
+    def test_method_has_no_complexity(self):
+        root = ET.fromstring(cr.to_cobertura(cr.parse_report(REPORT), timestamp_ms=1))
+        self.assertTrue(all("complexity" not in m.attrib for m in root.iter("method")))
+        self.assertTrue(all("complexity" in c.attrib for c in root.iter("class")))
+
+    def test_lcov_fn_is_on_a_line_with_da(self):
+        r = cr.parse_report(
+            "F,Codeunit,1,3,1,procedure A()\nL,Codeunit,1,5,1,0\nL,Codeunit,1,6,0,0\n"
+            "F,Codeunit,1,9,0,procedure Empty()\n"
+            "F,Codeunit,1,12,0,procedure B()\nL,Codeunit,1,14,0,0\n")
+        lcov = cr.to_lcov(r)
+        fn = {x.split(":")[1].split(",")[0] for x in lcov.split("\n") if x.startswith("FN:")}
+        da = {x.split(":")[1].split(",")[0] for x in lcov.split("\n") if x.startswith("DA:")}
+        self.assertEqual(fn, {"5", "14"})
+        self.assertTrue(fn <= da)
+        self.assertNotIn("Empty", lcov)
+        self.assertIn("FNF:2\nFNH:1\n", lcov)
+
+    def test_empty_functions_are_not_counted_anywhere(self):
+        text = ("L,Codeunit,1,5,1,0\nF,Codeunit,1,3,1,procedure A()\n"
+                "F,Codeunit,1,8,0,procedure Empty()\nF,Codeunit,1,10,0,trigger OnRun()\n")
+        r = cr.parse_report(text)
+        self.assertIn("1/1 functions", cr.summary(r))
+        cob = cr.to_cobertura(r, timestamp_ms=1)
+        self.assertNotIn("Empty", cob)
+        self.assertEqual(cob.count("<method "), 1)
+
+    def test_session_mode_is_in_the_summary(self):
+        r = cr.parse_report("M,sessions,test\nL,Codeunit,1,5,1,0\n")
+        self.assertIn("Sessions recorded: test", cr.summary(r))
+
+
 class MethodNameTests(unittest.TestCase):
     def test_redaction_text_is_not_a_declaration(self):
         self.assertFalse(cr.is_declaration(REDACTION))
@@ -327,9 +405,9 @@ class MethodNameTests(unittest.TestCase):
     def test_redacted_without_source_falls_back_to_the_line(self):
         r = cr.parse_report(f'F,Codeunit,1,7,1,"{REDACTION}"\nF,Codeunit,1,9,0,\nL,Codeunit,1,8,1,0\n')
         names = [m[1] for m in cr._methods(r, ("Codeunit", 1))]
-        self.assertEqual(names, ["L7", "L9"])
+        self.assertEqual(names, ["L7"])  # L9 has no Code line: not coverable
         lcov = cr.to_lcov(r)
-        self.assertIn("FN:7,L7", lcov)
+        self.assertIn("FN:8,L7", lcov)
         self.assertNotIn("ShowMyCode", lcov)
 
     def test_redacted_name_comes_from_the_source(self):
@@ -338,7 +416,7 @@ class MethodNameTests(unittest.TestCase):
                 f.write(AL_OPS)
             m = cr.map_sources(d)
             r = cr.parse_report(f'F,Codeunit,50100,12,1,"{REDACTION}"\n'
-                                f'F,Codeunit,50102,4,0,\nL,Codeunit,50100,14,1,0\n')
+                                f'F,Codeunit,50102,4,0,\nL,Codeunit,50100,14,1,0\nL,Codeunit,50102,5,1,0\n')
             ms = cr._methods(r, ("Codeunit", 50100), m)
             self.assertEqual(ms[0][1], "Foo")
             self.assertEqual(ms[0][4], "procedure Foo()")
@@ -365,8 +443,8 @@ class MethodNameTests(unittest.TestCase):
             self.assertEqual([x.get("name") for x in root.iter("method")], names)
 
     def test_comma_in_a_name_is_safe_in_lcov(self):
-        r = cr.parse_report('F,Codeunit,1,3,1,"procedure ""A,B""()"\n')
-        fn = [ln for ln in cr.to_lcov(r).split("\n") if ln.startswith("FN")]
+        r = cr.parse_report('F,Codeunit,1,3,1,"procedure ""A,B""()"\nL,Codeunit,1,4,1,0\n')
+        fn = [ln for ln in cr.to_lcov(r).split("\n") if ln.startswith(("FN:", "FNDA:"))]
         self.assertTrue(all(ln.count(",") == 1 for ln in fn), fn)
 
 

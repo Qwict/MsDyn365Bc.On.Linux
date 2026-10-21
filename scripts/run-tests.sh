@@ -82,6 +82,7 @@ COVERAGE_COBERTURA=""
 COVERAGE_LCOV=""
 COVERAGE_SOURCE=""
 COVERAGE_ROOT=""
+COVERAGE_ALL_SESSIONS=0
 COVERAGE_TMP=""
 COVERAGE_APPS=()
 RENEW_CLIENT_CONTEXT=0
@@ -122,6 +123,11 @@ Options:
                              repository root. Default: the git toplevel of
                              --coverage-source if it is inside a git work tree, else
                              --coverage-source itself.
+  --coverage-all-sessions    Record the hits of every session on the service tier, not
+                             only the test session (default). Needs Test Runner
+                             Extension 4.1; an older one records the test session only.
+                             On a multitenant service tier this also records other
+                             tenants' sessions (more overhead, foreign hits).
                              Any of the three outputs turns coverage recording on.
   --company <name>           Company name (default: auto-detect)
   --base-url <url>           BC OData base URL (default: http://localhost:7048/BC)
@@ -168,6 +174,7 @@ while [[ $# -gt 0 ]]; do
         --coverage-lcov) COVERAGE_LCOV="$2"; shift 2;;
         --coverage-source) COVERAGE_SOURCE="$2"; shift 2;;
         --coverage-root) COVERAGE_ROOT="$2"; shift 2;;
+        --coverage-all-sessions) COVERAGE_ALL_SESSIONS=1; shift;;
         --coverage-app) COVERAGE_APPS+=("$2"); shift 2;;
         --renew-client-context) RENEW_CLIENT_CONTEXT=1; shift;;
         --host|--test-runner|--suite-name|--codeunit-timeout|--extension-id|--sql-password) shift 2;;
@@ -994,7 +1001,18 @@ coverage_action() {
 start_coverage() {
     resolve_coverage_apps
     if [ -n "$COVERAGE_APP_IDS" ]; then
-        if coverage_action startCoverageForApps "{\"appIds\":\"${COVERAGE_APP_IDS}\"}"; then
+        local action=startCoverageForApps rc=0
+        local body="{\"appIds\":\"${COVERAGE_APP_IDS}\"}"
+        if [ "$COVERAGE_ALL_SESSIONS" = 1 ]; then
+            coverage_action startCoverageForAppsAllSessions "$body"; rc=$?
+            if [ "$rc" -ne 0 ] && { [ "$ACTION_HTTP" = "400" ] || [ "$ACTION_HTTP" = "404" ]; }; then
+                echo "WARN: startCoverageForAppsAllSessions not available (HTTP $ACTION_HTTP); the Test Runner Extension predates 4.1. Recording the test session only."
+            else
+                action=""
+            fi
+        fi
+        [ -n "$action" ] && { coverage_action "$action" "$body"; rc=$?; }
+        if [ "$rc" -eq 0 ]; then
             if [ "$ACTION_FALSE" = 0 ]; then
                 echo "Code coverage recording started for the apps under test."
                 return 0
