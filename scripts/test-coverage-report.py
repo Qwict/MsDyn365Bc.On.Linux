@@ -237,6 +237,16 @@ class WriterTests(unittest.TestCase):
         self.assertIn("Total: 66.7% lines (4/6), 3/5 functions, 4 objects measured, 1 unmeasured", s)
         self.assertIn("PageExtension 50201", s)
         self.assertIn("Complete: yes", s)
+        self.assertNotIn("more", s.split("Unmeasured")[1])
+
+    def test_summary_caps_unmeasured_list(self):
+        for i in range(30):
+            self.r.objects[("PageExtension", 60000 + i)] = {"measured": False, "app": APP2}
+        s = cr.summary(self.r)
+        line = [x for x in s.splitlines() if x.startswith("Unmeasured")][0]
+        self.assertIn("31 unmeasured", s)
+        self.assertEqual(line.count("PageExtension"), 20)
+        self.assertTrue(line.endswith("... and 11 more"))
 
 
 REDACTION = ("The extension that declares this object has its manifest property "

@@ -157,19 +157,20 @@ codeunit 99910 "Coverage Recorder"
 
     /// <summary>
     /// Whether a checkpoint is due between two test codeunits: when the time since the last
-    /// write is at least twenty times what that write took, and at least ten seconds. A
-    /// write then costs about 5% of the run however large the apps under test are, and a
-    /// session that dies loses the hits of the last interval only, which on a small app is
-    /// ten seconds. A fixed interval would be too slow for a small app and too heavy for
+    /// write is at least fifty times what that write took, and at least thirty seconds. That
+    /// bounds the checkpoint cost to about 2% of the run however large the apps under test
+    /// are. A session that dies loses at most the hits since the last checkpoint; the
+    /// inventory written at the start keeps the denominator, and the report is then marked
+    /// incomplete. A fixed interval would be too slow for a small app and too heavy for
     /// a big one.
     /// </summary>
     local procedure CheckpointDue(): Boolean
     var
         Interval: BigInteger;
     begin
-        Interval := 20 * LastWriteMs;
-        if Interval < 10000 then
-            Interval := 10000;
+        Interval := 50 * LastWriteMs;
+        if Interval < 30000 then
+            Interval := 30000;
         exit(CurrentDateTime() - LastWrite >= Interval);
     end;
 }

@@ -614,7 +614,8 @@ def summary(r, complete=None):
                f"{tm} objects measured, {len(unmeasured)} unmeasured")
     if unmeasured:
         out.append("Unmeasured (BC has no lines for them; no test ran their code): " +
-                   ", ".join(_label(k) for k in sorted(unmeasured)))
+                   ", ".join(_label(k) for k in sorted(unmeasured)[:20]) +
+                   (f" ... and {len(unmeasured) - 20} more" if len(unmeasured) > 20 else ""))
     out.append("Complete: " + {True: "yes", False: "NO", None: "unknown"}[complete])
     diag = [f"{label} {r.meta[k]}" for k, label in _DIAGNOSTICS if k in r.meta]
     if diag:

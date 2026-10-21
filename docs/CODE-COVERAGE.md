@@ -89,11 +89,11 @@ Every write reads only the scope's object IDs, so its cost follows the size of t
 apps under test, not of the database.
 
 **Checkpoint policy.** After a test codeunit that is not the last, the recorder writes
-when the time since the last write is at least the larger of 10 s and 20 times the
-duration of that write. That bounds the write overhead to about 5% of the run whatever
-the size of the apps, and a session that dies loses at most the last interval, about
-10 s of hits for a small app. A fixed interval would be too slow for small apps and too
-heavy for big ones. Because the inventory is written first, a run
+when the time since the last write is at least the larger of 30 s and 50 times the
+duration of that write. That bounds the checkpoint overhead to about 2% of the run
+whatever the size of the apps, and a session that dies loses at most the hits since the
+last checkpoint. A fixed interval would be too slow for small apps and too heavy for big
+ones. Because the inventory is written first, a run
 that never reaches its final write still has the right denominator; the report says it
 is incomplete.
 
@@ -168,6 +168,10 @@ functions; 3.4 for the legacy report (lines only, every loaded partner object).
 - Line coverage and function coverage only; BC has no branch data.
 - Table, page and report extensions no test ran are listed as unmeasured objects but
   add no lines to the total.
+- The line total can grow during a run: extension objects that Include cannot register
+  get their lines when their code first runs, so a checkpoint or a killed run can show a
+  smaller total than a complete one (observed on BE: inventory 20,243 lines, complete
+  report 22,626).
 - Hits since the last checkpoint are lost if the test session dies; the report is then
   marked incomplete.
 
