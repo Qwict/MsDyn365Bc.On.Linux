@@ -4,23 +4,22 @@
 ///
 /// Microsoft's Test Runner can record coverage itself, but only by starting and
 /// stopping the platform's coverage log around every test codeunit and handing an
-/// exporter the session's whole Code Coverage table each time. Merging that table
-/// into "Coverage Line" once per codeunit — about 120,000 lines of a large app, one
-/// record at a time — made a covered run three to eight times slower than a plain
-/// one, nearly all of it between the codeunits.
+/// exporter the session's whole Code Coverage table each time. That made a covered run
+/// three to eight times slower than a plain one, nearly all of it between the codeunits,
+/// and it only ever saw the objects the tests happened to load.
 ///
 /// This recorder starts the log once, before the first test codeunit of a run, and
-/// leaves it running, so the platform adds up the hits of the whole run. After the
-/// last codeunit it reads the Code Coverage table once and stores every Code line of
-/// the partner objects (per-tenant 50000..99899, ISV 1000000..74999999; not this
-/// extension's own 99900..99999), 0-hit lines included, which is what makes a
-/// percentage possible — as one CSV blob, not one record per line. In between, at
-/// most once per checkpoint interval, it stores the covered lines so far, so a
-/// session that dies mid-run loses at most that interval.
+/// leaves it running, so the platform adds up the hits of the whole run. Right after
+/// starting it includes the objects of the run's scope ("Coverage Scope") and stores the
+/// inventory: every line of the scope at 0 hits. A run that dies early thus still has its
+/// denominator. After that it stores the run so far between test codeunits, as often as
+/// the checkpoint policy allows (CheckpointDue), and once more after the last codeunit,
+/// which marks the report complete. Every write reads only the scope's
+/// objects ("Coverage Reader"), so its cost follows the size of the apps under test.
 ///
-/// A run is one startCoverage: a generation of "Coverage Setup". Another session in
-/// the same run — the runner reconnected after a session died — continues from what
-/// was stored and adds its own hits to it.
+/// A run is one startCoverage or startCoverageForApps: a generation of "Coverage Setup".
+/// Another session in the same run, the runner reconnected after a session died,
+/// continues from what was stored and adds its own hits to it.
 /// </summary>
 codeunit 99910 "Coverage Recorder"
 {
@@ -29,12 +28,17 @@ codeunit 99910 "Coverage Recorder"
                   tabledata System.TestTools.TestRunner."Test Method Line" = r;
 
     var
-        CoverageStore: Codeunit "Coverage Store";
-        // Hits stored before the running log started, which its own hits add to; empty in a run's first session.
-        BaseHits: Dictionary of [Text, Integer];
+        Scope: Codeunit "Coverage Scope";
+        Reader: Codeunit "Coverage Reader";
+        Builder: Codeunit "Coverage Report Builder";
+        Store: Codeunit "Coverage Store";
         Recording: Boolean;
         RunGeneration: Integer;
+        RunStartedAt: DateTime;
         LastWrite: DateTime;
+        LastWriteMs: BigInteger;
+        IncludeMs: BigInteger;
+        InventoryLines: Integer;
 
     [EventSubscriber(ObjectType::Codeunit, Codeunit::System.TestTools.TestRunner."Test Runner - Mgt", 'OnBeforeCodeunitRun', '', false, false)]
     local procedure OnBeforeCodeunitRun(var TestMethodLine: Record System.TestTools.TestRunner."Test Method Line")
@@ -49,7 +53,7 @@ codeunit 99910 "Coverage Recorder"
         end;
         if Recording and (RunGeneration = CoverageSetup.Generation) then
             exit;
-        StartLog(CoverageSetup.Generation);
+        StartLog(CoverageSetup);
     end;
 
     [EventSubscriber(ObjectType::Codeunit, Codeunit::System.TestTools.TestRunner."Test Runner - Mgt", 'OnAfterCodeunitRun', '', false, false)]
@@ -58,83 +62,68 @@ codeunit 99910 "Coverage Recorder"
         if not Recording then
             exit;
         if IsLastCodeunit(TestMethodLine) then begin
-            Write(true);
+            Write(true, false);
             StopLog();
         end else
-            if CurrentDateTime() - LastWrite >= CheckpointInterval() then
-                Write(false);
+            if CheckpointDue() then
+                Write(false, false);
     end;
 
-    local procedure StartLog(Generation: Integer)
+    /// <summary>
+    /// Starts the log for the run, then includes the scope and stores the inventory. The
+    /// order matters: Include does nothing while the log is off, and starting the log
+    /// clears the session's hits, so they count from here on top of what is stored.
+    /// </summary>
+    local procedure StartLog(CoverageSetup: Record "Coverage Setup")
+    var
+        IncludeStartedAt: DateTime;
     begin
-        // Starting the log clears the session's hits, so they count from here on top of what is stored.
         StopLog();
-        CoverageStore.LoadHits(BaseHits);
-        System.CodeCoverageLog(true, false);
+        Scope.Resolve(CoverageSetup.Scoped, CoverageSetup."Scope App Ids");
+        Reader.LoadBase();
+        CodeCoverageLog(true, CoverageSetup."Multi Session");
+        IncludeStartedAt := CurrentDateTime();
+        Scope.IncludeInLog();
+        IncludeMs := CurrentDateTime() - IncludeStartedAt;
         Recording := true;
-        RunGeneration := Generation;
-        LastWrite := CurrentDateTime();
+        RunGeneration := CoverageSetup.Generation;
+        RunStartedAt := CoverageSetup."Started At";
+        LastWriteMs := 0;
+        InventoryLines := 0;
+        Write(false, true);
+        InventoryLines := Builder.GetLineCount();
     end;
 
     local procedure StopLog()
     begin
         if not Recording then
             exit;
-        System.CodeCoverageLog(false, false);
+        CodeCoverageLog(false, false);
         Recording := false;
     end;
 
     /// <summary>
-    /// Stores the run's coverage so far. Complete stores every Code line of the loaded
-    /// partner objects; a checkpoint only the covered ones.
+    /// Stores the run's coverage so far: every line of the scope with its hits. Complete
+    /// marks the report as the finished run's.
     /// </summary>
-    local procedure Write(Complete: Boolean)
+    local procedure Write(Complete: Boolean; Inventory: Boolean)
     var
-        CodeCoverage: Record System.Tooling."Code Coverage";
-        Remaining: Dictionary of [Text, Integer];
-        Csv: TextBuilder;
-        LineKey: Text;
-        Hits: Integer;
-        BaseHit: Integer;
-        HasBase: Boolean;
-        LinesRead: Integer;
-        LinesStored: Integer;
+        CoverageSetup: Record "Coverage Setup";
         StartedAt: DateTime;
+        RowsRead: Integer;
     begin
         StartedAt := CurrentDateTime();
-        HasBase := BaseHits.Count() > 0;
-        if HasBase then
-            Copy(BaseHits, Remaining);
-        System.CodeCoverageRefresh();
-        CodeCoverage.SetRange("Line Type", CodeCoverage."Line Type"::Code);
-        CodeCoverage.SetFilter("Object ID", '50000..99899|1000000..74999999');
-        if not Complete then
-            CodeCoverage.SetFilter("No. of Hits", '>0');
-        if CodeCoverage.FindSet() then
-            repeat
-                LinesRead += 1;
-                LineKey := Format(CodeCoverage."Object Type") + ',' + Format(CodeCoverage."Object ID", 0, 9) + ',' + Format(CodeCoverage."Line No.", 0, 9);
-                Hits := CodeCoverage."No. of Hits";
-                if HasBase then
-                    if Remaining.Get(LineKey, BaseHit) then begin
-                        Hits += BaseHit;
-                        Remaining.Remove(LineKey);
-                    end;
-                Csv.AppendLine(LineKey + ',' + Format(Hits, 0, 9));
-            until CodeCoverage.Next() = 0;
-        LinesStored := LinesRead;
-        // Lines an earlier session of this run recorded that this one did not load.
-        foreach LineKey in Remaining.Keys() do begin
-            Csv.AppendLine(LineKey + ',' + Format(Remaining.Get(LineKey), 0, 9));
-            LinesStored += 1;
-        end;
-
-        CoverageStore.Save(Csv.ToText());
+        Builder.Initialize(RunGeneration, Complete, RunStartedAt);
+        if CoverageSetup.Get() then
+            Builder.SetDiagnostics(CoverageSetup.Writes, CoverageSetup."Write Time", LastWriteMs, IncludeMs, InventoryLines, Inventory);
+        RowsRead := Reader.ReadInto(Scope, Builder);
+        Store.Save(Builder.ToText(Scope), Complete, Builder);
         LastWrite := CurrentDateTime();
-        RecordWrite(LastWrite - StartedAt, LinesRead, LinesStored);
+        LastWriteMs := LastWrite - StartedAt;
+        RecordWrite(LastWrite - StartedAt, RowsRead);
     end;
 
-    local procedure RecordWrite(Took: Duration; LinesRead: Integer; LinesStored: Integer)
+    local procedure RecordWrite(Took: Duration; RowsRead: Integer)
     var
         CoverageSetup: Record "Coverage Setup";
     begin
@@ -142,9 +131,9 @@ codeunit 99910 "Coverage Recorder"
             exit;
         CoverageSetup.Writes += 1;
         CoverageSetup."Write Time" += Took;
-        CoverageSetup."Last Write Lines Read" := LinesRead;
-        CoverageSetup."Last Write Lines Stored" := LinesStored;
-        CoverageSetup."Last Write Base Lines" := BaseHits.Count();
+        CoverageSetup."Last Write Lines Read" := RowsRead;
+        CoverageSetup."Last Write Lines Stored" := Builder.GetLineCount();
+        CoverageSetup."Last Write Base Lines" := Reader.BaseLineCount();
         CoverageSetup."Last Write At" := LastWrite;
         CoverageSetup.Modify();
     end;
@@ -166,17 +155,21 @@ codeunit 99910 "Coverage Recorder"
         exit(PendingLine.IsEmpty());
     end;
 
-    local procedure Copy(Source: Dictionary of [Text, Integer]; var Target: Dictionary of [Text, Integer])
+    /// <summary>
+    /// Whether a checkpoint is due between two test codeunits: when the time since the last
+    /// write is at least twenty times what that write took, and at least ten seconds. A
+    /// write then costs about 5% of the run however large the apps under test are, and a
+    /// session that dies loses the hits of the last interval only, which on a small app is
+    /// ten seconds. A fixed interval would be too slow for a small app and too heavy for
+    /// a big one.
+    /// </summary>
+    local procedure CheckpointDue(): Boolean
     var
-        LineKey: Text;
+        Interval: BigInteger;
     begin
-        Clear(Target);
-        foreach LineKey in Source.Keys() do
-            Target.Add(LineKey, Source.Get(LineKey));
-    end;
-
-    local procedure CheckpointInterval(): Integer
-    begin
-        exit(120000);
+        Interval := 20 * LastWriteMs;
+        if Interval < 10000 then
+            Interval := 10000;
+        exit(CurrentDateTime() - LastWrite >= Interval);
     end;
 }

@@ -1,8 +1,13 @@
 /// <summary>
-/// The last coverage run's lines in one response: csv holds one line
-/// object_type,object_id,line_no,hits per executable line of the loaded partner objects
-/// (no header; 0 hits = no test ran it). Reading 120,000 lines through codeCoverageLines
-/// takes one request per page and one record per line; this is one request.
+/// The last coverage run's report in one response.
+///
+/// report is the v2 text of "Coverage Report Builder" (see docs/CODE-COVERAGE.md): the
+/// run's metadata, apps, objects, lines and functions. complete says the run reached its
+/// final write; the counts are what the report holds: objects in scope, executable lines,
+/// the lines with at least one hit, and objects BC has no lines for (extensions no test
+/// ran). csv is the 3.x format for older callers, object_type,object_id,line_no,hits per
+/// executable line, no header, cut out of the report.
+/// Reading 120,000 lines through one record each takes a request per page; this is one.
 /// </summary>
 page 99907 "Coverage Report API"
 {
@@ -28,17 +33,25 @@ page 99907 "Coverage Report API"
             {
                 field(generation; Rec.Generation) { }
                 field(csv; Csv) { }
+                field(report; ReportText) { }
+                field(complete; Rec.Complete) { }
+                field(objects; Rec.Objects) { }
+                field(lines; Rec.Lines) { }
+                field(coveredLines; Rec."Covered Lines") { }
+                field(unmeasuredObjects; Rec."Unmeasured Objects") { }
             }
         }
     }
 
     var
         Csv: Text;
+        ReportText: Text;
 
     trigger OnAfterGetRecord()
     var
         CoverageStore: Codeunit "Coverage Store";
     begin
-        Csv := CoverageStore.Read();
+        ReportText := CoverageStore.ReadReport();
+        Csv := CoverageStore.CsvFromReport(ReportText);
     end;
 }

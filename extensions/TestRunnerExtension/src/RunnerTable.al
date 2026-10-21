@@ -238,37 +238,69 @@ page 99902 "Codeunit Run Requests"
     /// Records code coverage for the next run of the DEFAULT suite: the "Coverage
     /// Recorder" starts the platform's coverage log in the test session before the
     /// first test codeunit and stores the lines after the last. Call after setupSuite.
-    /// Read the result from coverageReports (or codeCoverageLines) after the run.
+    /// Read the result from coverageReports after the run.
+    ///
+    /// This is the run without a scope, which older run-tests.sh versions use: every
+    /// object the tests load in the partner ID ranges, and nothing included up front.
+    /// startCoverageForApps measures named apps, untouched objects included.
     /// </summary>
     [ServiceEnabled]
     procedure StartCoverage(): Boolean
+    begin
+        exit(EnableCoverage(false, '', false));
+    end;
+
+    /// <summary>
+    /// Records code coverage like startCoverage, for the apps in appIds (comma separated
+    /// app GUIDs): their objects are included in the log, so code no test ran counts as
+    /// 0% instead of being absent. An id that is not a GUID or not an installed app is
+    /// ignored, and listed as such in the report, not an error. Returns false when the
+    /// suite does not exist or appIds is longer than 2048 characters.
+    /// </summary>
+    [ServiceEnabled]
+    procedure StartCoverageForApps(appIds: Text): Boolean
+    begin
+        exit(EnableCoverage(true, appIds, true));
+    end;
+
+    /// <summary>
+    /// Starts a new coverage run: a new generation with an empty report and the scope it
+    /// was given.
+    /// </summary>
+    local procedure EnableCoverage(Scoped: Boolean; AppIds: Text; MultiSession: Boolean): Boolean
     var
         ALTestSuite: Record System.TestTools.TestRunner."AL Test Suite";
-        CoverageLine: Record "Coverage Line";
         CoverageSetup: Record "Coverage Setup";
     begin
         if not ALTestSuite.Get('DEFAULT') then
             exit(false);
-        // Lines an older version stored one record each. Truncate, not DeleteAll: with global
-        // delete triggers BC deletes 120,000 of them one by one, longer than the runner waits.
-        if not CoverageLine.IsEmpty() then
-            CoverageLine.Truncate();
+        if StrLen(AppIds) > MaxStrLen(CoverageSetup."Scope App Ids") then
+            exit(false);
         // Microsoft's own per-codeunit recording would restart the log around every codeunit.
         DisableSuiteCoverage('DEFAULT');
         if not CoverageSetup.Get() then
             CoverageSetup.Insert();
         CoverageSetup.Enabled := true;
         CoverageSetup.Generation += 1;
+        CoverageSetup."Multi Session" := MultiSession;
+        CoverageSetup.Scoped := Scoped;
+        CoverageSetup."Scope App Ids" := CopyStr(AppIds, 1, MaxStrLen(CoverageSetup."Scope App Ids"));
+        CoverageSetup."Started At" := CurrentDateTime();
+        CoverageSetup.Complete := false;
         CoverageSetup.Writes := 0;
         CoverageSetup."Write Time" := 0;
-        Clear(CoverageSetup.Coverage);
+        CoverageSetup.Objects := 0;
+        CoverageSetup.Lines := 0;
+        CoverageSetup."Covered Lines" := 0;
+        CoverageSetup."Unmeasured Objects" := 0;
+        Clear(CoverageSetup.Report);
         CoverageSetup.Modify();
         exit(true);
     end;
 
     /// <summary>
     /// Stops recording code coverage; the recorded lines stay readable through
-    /// coverageReports and codeCoverageLines until the next startCoverage.
+    /// coverageReports until the next startCoverage or startCoverageForApps.
     /// </summary>
     [ServiceEnabled]
     procedure StopCoverage(): Boolean
