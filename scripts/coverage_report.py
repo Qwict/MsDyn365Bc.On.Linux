@@ -600,6 +600,10 @@ def summary(r, complete=None):
     ignored = [x for x in _unquote(r.meta.get("ignored", "")).split(";") if x]
     if ignored:
         out.append("WARNING: not measured: " + ", ".join(ignored))
+    dropped = [x for x in _unquote(r.meta.get("dependency_dropped", "")).split(";") if x]
+    if dropped:
+        # Left-out apps have no A record, so only their ids are known.
+        out.append("Left out (dependency of another app under test): " + ", ".join(dropped))
     if complete is False:
         out.append("WARNING: INCOMPLETE REPORT - the run ended before the final write; "
                    "hits since the last checkpoint are missing")

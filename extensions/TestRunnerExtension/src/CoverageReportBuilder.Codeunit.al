@@ -145,6 +145,7 @@ codeunit 99913 "Coverage Report Builder"
     var
         CoverageSetup: Record "Coverage Setup";
         IgnoredAppIds: List of [Text];
+        DroppedAppIds: List of [Text];
         Mode: Text;
         Sessions: Text;
     begin
@@ -175,6 +176,10 @@ codeunit 99913 "Coverage Report Builder"
         if IgnoredAppIds.Count() > 0 then
             // Semicolons: a comma would split the value into fields.
             Report.AppendLine('M,ignored,' + Quote(JoinText(IgnoredAppIds, ';')));
+        DroppedAppIds := Scope.GetDroppedAppIds();
+        if DroppedAppIds.Count() > 0 then
+            // Apps left out of the scope because another app in it depends on them.
+            Report.AppendLine('M,dependency_dropped,' + Quote(JoinText(DroppedAppIds, ';')));
     end;
 
     local procedure AppendApps(var Report: TextBuilder; var Scope: Codeunit "Coverage Scope")

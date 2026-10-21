@@ -308,6 +308,13 @@ class LegacyV2Tests(unittest.TestCase):
         self.assertIn("last write ms 400", s)
         self.assertIn("inventory lines 1200", s)
 
+    def test_dependency_dropped_in_summary(self):
+        r = cr.parse_report("M,mode,apps\nM,dependency_dropped,aaa;bbb\n"
+                            "A,ccc,Feature,P,1.0.0.0\n")
+        s = cr.summary(r)
+        self.assertIn("Left out (dependency of another app under test): aaa, bbb", s)
+        self.assertNotIn("Left out", cr.summary(cr.parse_report("M,mode,apps\n")))
+
     def test_control_characters_in_a_signature_keep_the_record_whole(self):
         text = ("F,Codeunit,1,3,1,procedure A()\x0b x\x1c y\r\nL,Codeunit,1,4,2,0\r\n"
                 "L,Codeunit,1,5,0,0\r\n")
