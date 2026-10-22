@@ -5,7 +5,7 @@ Docker Compose. No fork — the unmodified Microsoft .NET 8 service tier is
 patched at runtime so it boots and serves on Linux.
 
 ```bash
-git clone https://github.com/StefanMaron/MsDyn365Bc.On.Linux.git
+git clone https://github.com/aldevtools/MsDyn365Bc.On.Linux.git
 cd MsDyn365Bc.On.Linux
 docker compose up -d --wait
 ```
@@ -15,7 +15,7 @@ The `--wait` flag returns once BC is healthy. **First boot takes ~5 minutes**
 starts take ~1 minute.
 
 You don't need to build anything: `docker compose up` **pulls the prebuilt,
-publicly accessible image** (`ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest`)
+publicly accessible image** (`ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest`)
 when it isn't already in your local cache — no GHCR auth required. To grab a
 newer published build later, run `docker compose pull`. Only contributors
 hacking on the image itself need `docker compose build` (an explicit build
@@ -377,7 +377,7 @@ BC_DEV_PORT=17049 docker compose up -d
 | `BC_CODEUNIT_IDS_MAX_CHARS` | `1000` | Characters of codeunit ids `run-tests.sh` sends per suite-setup request. BC's `CodeunitIds` field is `Text[2048]`; the default leaves room for the test suite to grow. |
 
 **SQL Server image:** the `sql` service defaults to
-`ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd`, a mirror of
+`ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-zstd`, a mirror of
 `mcr.microsoft.com/mssql/server:2022-latest` with the layers recompressed
 to zstd, refreshed weekly by `.github/workflows/mirror-sql-image.yml`.
 
@@ -393,7 +393,7 @@ can't handle zstd layers. Point `BC_SQL_IMAGE` anywhere you like:
 
 ```bash
 # gzip fallback
-BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022 docker compose up -d
+BC_SQL_IMAGE=ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022 docker compose up -d
 
 # straight from Microsoft
 BC_SQL_IMAGE=mcr.microsoft.com/mssql/server:2022-latest docker compose up -d
@@ -439,7 +439,7 @@ patched DLLs).
 
 bc-linux ships starter CI/CD templates so downstream projects can run AL
 tests against a Linux BC without forking or copy-pasting hundreds of lines
-of YAML. The image at `ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest`
+of YAML. The image at `ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest`
 is publicly accessible — no GHCR auth needed.
 
 | Path                                         | What it is                                                                |
@@ -456,7 +456,7 @@ name: BC Tests
 on: [push, pull_request, workflow_dispatch]
 jobs:
   bc-tests:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
     with:
       bc_version:     "27.5"
       app_dirs:       "app"
@@ -476,7 +476,7 @@ This repository includes a devcontainer at `.devcontainer/devcontainer.json`.
 Open it in a Codespace and BC starts automatically via Docker-in-Docker.
 The AL Language extension is pre-installed.
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/StefanMaron/MsDyn365Bc.On.Linux)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/aldevtools/MsDyn365Bc.On.Linux)
 
 ---
 
@@ -543,7 +543,7 @@ derives the project name from the working directory's basename, which is
 `docker compose down --remove-orphans` deletes the first job's BC in the
 middle of its test run, and both die with GitHub's generic "the runner has
 received a shutdown signal" — which points nowhere near the cause
-([issue #24](https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues/24)).
+([issue #24](https://github.com/aldevtools/MsDyn365Bc.On.Linux/issues/24)).
 
 Every pipeline in this repo therefore takes a machine-wide lease
 (`scripts/ci-lock.sh`) around the container lifecycle, so jobs sharing a
@@ -556,7 +556,7 @@ once on one self-hosted machine, give each caller its own slot:
 ```yaml
 jobs:
   bc-tests:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
     with:
       instance_slot: 1     # project bc-linux-1; every port +100
 ```
@@ -608,5 +608,5 @@ versions. Trigger it manually with custom versions:
 versions: "27.0,27.5,28.0"
 ```
 
-The published image is `ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner`
+The published image is `ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner`
 (public). The `:latest` tag tracks `master`.

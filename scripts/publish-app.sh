@@ -75,18 +75,41 @@ bc_publish_app() {
         fi
     fi
 
+    # How long curl waits for the dev endpoint to answer. It was 180s, and a
+    # publish of the AL language corpus app on BC 29.0 took 75-150s, with
+    # 2:28 measured in one run. BC does not stop at our limit: curl gives
+    # up, the publish goes on inside the tier, and the job fails anyway.
+    # 600s is four times the slowest publish seen. BC_PUBLISH_TIMEOUT
+    # overrides it.
+    local max_time="${BC_PUBLISH_TIMEOUT:-600}"
+
     local body
     body=$(mktemp)
-    local code
-    code=$(curl -s -o "$body" -w "%{http_code}" --max-time 180 \
+    local code started elapsed
+    started=$(date +%s)
+    code=$(curl -s -o "$body" -w "%{http_code}" --max-time "$max_time" \
         -u "$auth" -X POST \
         -F "file=@${upload};type=application/octet-stream" \
         "${dev_url}/apps?SchemaUpdateMode=forcesync${tenant_q}" 2>/dev/null)
+    elapsed=$(( $(date +%s) - started ))
     [ -n "$tenant_copy" ] && rm -f "$tenant_copy"
+    # Logged for every publish, so the margin to the limit shows in the log
+    # before it is used up.
+    echo "  publish $(basename "$app"): HTTP $code after ${elapsed}s (limit ${max_time}s)" >&2
 
     if [ "$code" = "200" ]; then
         rm -f "$body"
         return 0
+    fi
+
+    if [ "$code" = "000" ] && [ "$elapsed" -ge "$max_time" ]; then
+        echo ""
+        echo "ERROR: no answer from the dev endpoint within ${max_time}s for $(basename "$app")"
+        echo "       The publish may still be running inside BC. Raise"
+        echo "       BC_PUBLISH_TIMEOUT if this app is known to publish slowly."
+        echo ""
+        rm -f "$body"
+        return 1
     fi
 
     if [ "$code" = "422" ] \
@@ -115,9 +138,9 @@ bc_publish_app() {
         echo "              can't install the app."
         echo ""
         echo "       FIX:   switch to the FTS-capable SQL image:"
-        echo "                BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts"
+        echo "                BC_SQL_IMAGE=ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-fts"
         echo "              or, in the reusable workflows:"
-        echo "                sql_image: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts"
+        echo "                sql_image: ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-fts"
         echo "              It is not the default because FTS adds ~550 MB to the"
         echo "              SQL image. See KNOWN-LIMITATIONS.md."
         echo ""

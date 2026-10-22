@@ -236,7 +236,12 @@ STEP2_START=$(date +%s)
 # copy it to. Everything else Step 2 writes is a constant.
 SERVICE_STAMP_FILE="$SERVICE_DIR/.bc-service-stamp"
 SERVICE_CONFIG_FP=$(printf '%s|%s|%s' "$SQL_SERVER" "$BC_DB_USER" "$BC_DB_PASSWORD" | md5sum | cut -c1-12)
-SERVICE_STAMP="v1|platform=$PLATFORM_VERSION|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)|config=$SERVICE_CONFIG_FP"
+# The fourth is the binary patcher plus the switch that turns its text patches on. The hook
+# alone is not enough: a change to PatchNclTestPage (or BC_WINDOWS_TEXT) rewrites the
+# service DLLs but leaves StartupHook.dll untouched, so a warm volume kept the DLLs the
+# previous patcher produced and the new patch never ran.
+SERVICE_PATCHER_FP="$(stat -c '%s-%Y' /bc/tools/patcher/PatchNclTestPage.dll 2>/dev/null || echo none)-text${BC_WINDOWS_TEXT:-1}"
+SERVICE_STAMP="v2|platform=$PLATFORM_VERSION|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)|patcher=$SERVICE_PATCHER_FP|config=$SERVICE_CONFIG_FP"
 if [ -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ] && \
    [ "$(cat "$SERVICE_STAMP_FILE" 2>/dev/null || true)" != "$SERVICE_STAMP" ]; then
     log_step "Service tier in the volume was built by a different platform/image — rebuilding it"
@@ -564,6 +569,27 @@ if [ -f /bc/tools/patcher/PatchNclTestPage.dll ]; then
     if $PATCHER types "$SERVICE_DIR/Microsoft.Dynamics.Nav.Types.dll" 2>&1 | tail -1; then
         log_step "Patched Nav.Types.dll (TestClientProxy Assembly.Load → LoadFrom)"
     fi
+    # Text behaviour a Windows tier has and Linux does not (issue #113). Both are constants
+    # inside CoreLib's precompiled code, so no runtime hook can reach them; BC's own call
+    # sites are rewritten in the IL instead.
+    #   newline:  Environment.NewLine is CRLF (error texts, TextBuilder, XML, ...)
+    #   encoding: Encoding.GetEncoding(0), the ANSI code page, is windows-1252, not UTF-8
+    #   uri:      new Uri("/path") is a file URI here and an error on Windows (HTTP objects only)
+    #   culture:  ICU's narrow no-break space before AM/PM in time patterns is a plain space
+    # BC_WINDOWS_TEXT=0 leaves the assemblies as Microsoft shipped them.
+    if [ "${BC_WINDOWS_TEXT:-1}" = "1" ]; then
+        for TXT_ASM in Microsoft.Dynamics.Nav.Ncl Microsoft.Dynamics.Nav.Types; do
+            for TXT_PATCH in newline encoding uri culture; do
+                if $PATCHER $TXT_PATCH "$SERVICE_DIR/$TXT_ASM.dll" 2>&1 | tail -1; then
+                    log_step "Patched $TXT_ASM.dll ($TXT_PATCH, Windows text behaviour)"
+                fi
+            done
+        done
+        # JsonObject.WriteToYaml: YamlDotNet takes its line break from Environment.NewLine too.
+        if [ -f "$SERVICE_DIR/YamlDotNet.dll" ] && $PATCHER newline "$SERVICE_DIR/YamlDotNet.dll" 2>&1 | tail -1; then
+            log_step "Patched YamlDotNet.dll (newline, Windows text behaviour)"
+        fi
+    fi
 fi
 
 # Fix Add-Ins directory case (Linux is case-sensitive, BC expects "Add-Ins")
@@ -723,8 +749,11 @@ if [ "${BC_RDLC_RENDERER:-}" = "mono" ]; then
                     Microsoft.BusinessCentral.Reporting.Server.dll \
                     >> "$RDLC_LOG" 2>&1); then
                 # HeadlessPageSettings.dll is not optional: the patched
-                # Reporting.Server.dll holds real calls into it.
+                # Reporting.Server.dll holds real calls into it. Neither is
+                # System.IO.Packaging.dll: the patched ReportViewer takes its
+                # Packaging types from it (Word and Excel output, issue #144).
                 cp /bc/rdlc/RdlcNativeBridge.dll /bc/rdlc/librdlc_native.so \
+                   /bc/rdlc/System.IO.Packaging.dll \
                    /bc/rdlc/Microsoft.VisualBasic.dll /bc/rdlc/HeadlessPageSettings.dll \
                    /bc/rdlc/libBCRdlc.IcuBridge.so /bc/rdlc/libSystem.Globalization.Native.so \
                    "$SIDE_DIR/"
@@ -741,6 +770,11 @@ if [ "${BC_RDLC_RENDERER:-}" = "mono" ]; then
             fi
         else
             rdlc_disable "ReportViewer in this BC build is not one this renderer knows (see $RDLC_LOG)"
+        fi
+        # CI jobs do not keep /tmp, so a refusal that only names the log file
+        # cannot be diagnosed from the job output (issue #143). Print its end.
+        if [ "$RDLC_ENABLED" = "0" ] && [ -s "$RDLC_LOG" ]; then
+            tail -n 30 "$RDLC_LOG" | sed 's/^/[entrypoint] RDLC patch log: /' >&2
         fi
         # A refused patch must not leave a partly-written assembly behind.
         if [ "$RDLC_ENABLED" = "0" ]; then
@@ -1676,6 +1710,10 @@ exec 3>/tmp/bc-stdin
 
     INSTANCE=$(grep -oP 'ServerInstance" value="\K[^"]+' $SERVICE_DIR/CustomSettings.config 2>/dev/null || echo "BC")
     DEV_URL="http://localhost:7049"
+    # How long each dev-endpoint publish below may take. These were 120s and
+    # 300s, and a publish on BC 29.0 has taken 2:28. Same variable and default
+    # as scripts/publish-app.sh.
+    PUBLISH_TIMEOUT="${BC_PUBLISH_TIMEOUT:-600}"
     NST_WAIT_START=$(date +%s)
 
     # How long NST may take to answer on the dev endpoint. Not a constant: the same
@@ -1884,7 +1922,7 @@ PYEOF
                     continue
                 fi
 
-                HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 300 \
+                HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$PUBLISH_TIMEOUT" \
                     -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_FILE;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=forcesync" 2>/dev/null)
@@ -1988,7 +2026,7 @@ PYEOF
                 # the only valid values, none of which auto-install missing
                 # tenant deps), so we have to wipe stuck-published apps in
                 # SQL beforehand instead.
-                HTTP=$(curl -s -o /tmp/install-tenant.out -w "%{http_code}" --max-time 120 \
+                HTTP=$(curl -s -o /tmp/install-tenant.out -w "%{http_code}" --max-time "$PUBLISH_TIMEOUT" \
                     -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_PATH;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=synchronize" 2>/dev/null)
@@ -2018,7 +2056,7 @@ PYEOF
             while IFS= read -r APP_PATH; do
                 [ -z "$APP_PATH" ] && continue
                 NAME=$(basename "$APP_PATH")
-                HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 \
+                HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$PUBLISH_TIMEOUT" \
                     -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_PATH;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=synchronize" 2>/dev/null)

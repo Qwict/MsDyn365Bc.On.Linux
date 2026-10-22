@@ -46,6 +46,14 @@ class Program
             return PatchTestPageClient.Run(inputPath, outputPath);
         if (command == "types")
             return PatchNavTypes.Run(inputPath, outputPath);
+        if (command == "culture")
+            return PatchCulture.Run(inputPath, outputPath);
+        if (command == "uri")
+            return PatchHttpUri.Run(inputPath, outputPath);
+        if (command == "encoding")
+            return PatchEncoding.Run(inputPath, outputPath);
+        if (command == "newline")
+            return PatchNewline.Run(inputPath, outputPath);
 
         // Default: patch Nav.Ncl.dll
 

@@ -5,9 +5,9 @@ name: BC tests on Linux (compile from source)
 # source (app + test apps) inside the runner and then publishes the
 # compiled .app files to BC and runs the tests.
 #
-# Powered by StefanMaron/MsDyn365Bc.On.Linux — runs unmodified Microsoft BC on Linux
+# Powered by aldevtools/MsDyn365Bc.On.Linux — runs unmodified Microsoft BC on Linux
 # via runtime patching of the Windows .NET service tier. Image:
-# ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest
+# ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest
 #
 # ──────────────────────────────────────────────────────────────────────
 # HOW TO USE
@@ -112,7 +112,7 @@ env:
   # --------------------------------------------------------------------
 
   # bc-linux runtime image (publicly available on GHCR).
-  BC_RUNNER_IMAGE: "ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest"
+  BC_RUNNER_IMAGE: "ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest"
 
   # Where the extracted BC artifacts are kept. Empty = <workspace>/artifact-cache,
   # which is correct for a GitHub-hosted runner: the VM is fresh every job, so
@@ -152,7 +152,7 @@ jobs:
       - name: Checkout bc-linux runtime
         uses: actions/checkout@v4
         with:
-          repository: StefanMaron/MsDyn365Bc.On.Linux
+          repository: aldevtools/MsDyn365Bc.On.Linux
           ref: master
           path: bc-linux
 
@@ -343,7 +343,7 @@ jobs:
           EFFECTIVE_RUNTIME="$RUNTIME_VERSION"
           BC_MAJOR=$(echo "$BC_VERSION" | cut -d. -f1)
           if [ -z "$EFFECTIVE_RUNTIME" ]; then
-            # Same BC-major-minus-11 rule as the compiler version.
+            # Same BC-to-AL major rule as the compiler version.
             if ! EFFECTIVE_RUNTIME=$(python3 bc-linux/scripts/resolve-al-tool-version.py "$BC_VERSION" --runtime); then
               echo "Could not resolve an AL runtime version for BC $BC_VERSION" >&2
               exit 1

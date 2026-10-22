@@ -21,15 +21,15 @@ services:
     #
     # Override with BC_SQL_IMAGE to use it, to go straight to mcr, to pull
     # from your own registry, or to pin a different SQL Server version:
-    #   BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022 docker compose up -d
+    #   BC_SQL_IMAGE=ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022 docker compose up -d
     #   BC_SQL_IMAGE=mcr.microsoft.com/mssql/server:2022-latest docker compose up -d
     #
     # Apps using AL's `OptimizeForTextSearch = true` need the Full-Text
     # Search component, which no official SQL Server Linux image ships.
     # Use the :2022-fts variant for those — opt-in because FTS adds ~550 MB
     # to the image. See KNOWN-LIMITATIONS.md (issue #20):
-    #   BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts docker compose up -d
-    image: ${BC_SQL_IMAGE:-ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd}
+    #   BC_SQL_IMAGE=ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-fts docker compose up -d
+    image: ${BC_SQL_IMAGE:-ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-zstd}
     environment:
       ACCEPT_EULA: "Y"
       SA_PASSWORD: ${SA_PASSWORD:-Passw0rd123!}
@@ -56,7 +56,7 @@ services:
       start_period: 20s
 
   bc:
-    image: ${BC_RUNNER_IMAGE:-ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest}
+    image: ${BC_RUNNER_IMAGE:-ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest}
     # Pull the published image if it's not already in the local cache. Because a
     # `build:` section is present, Compose would otherwise BUILD on first `up`
     # (the Build Spec default) — which forces every community user through a
@@ -149,6 +149,10 @@ services:
       # fill. Set to 1 only if a TestPage scenario needs the dispatcher pump this image
       # doesn't implement and hangs with the default (Async=true, matching Windows).
       BC_TESTPAGE_ASYNC_PATCH: ${BC_TESTPAGE_ASYNC_PATCH:-}
+      # Windows text behaviour (issue #113): CRLF line breaks, windows-1252 as the ANSI code
+      # page, a plain space before AM/PM. 1 (default) rewrites BC's assemblies in Step 2b;
+      # 0 leaves them as Microsoft shipped them. Part of the service-volume stamp.
+      BC_WINDOWS_TEXT: ${BC_WINDOWS_TEXT:-}
       # ---- Mono RDLC renderer (issue #73) -----------------------------------
       # `mono` runs Microsoft's real reporting service under Mono with our
       # Pango/HarfBuzz font and text bridge, so Report.SaveAs(Pdf) against an
@@ -176,6 +180,8 @@ services:
       BC_PROFILE_NST: ${BC_PROFILE_NST:-0}
       BC_ARTIFACT_URL: ${BC_ARTIFACT_URL:-}
       BC_TEST_APPS: ${BC_TEST_APPS:-}
+      # Seconds each dev-endpoint publish at boot may take (default 600).
+      BC_PUBLISH_TIMEOUT: ${BC_PUBLISH_TIMEOUT:-}
       # Opt-in: self-host Microsoft's real BC web client on Kestrel (port 8080).
       # EXPERIMENTAL PoC — see docs/WEBCLIENT-POC.md.
       BC_WEBCLIENT: ${BC_WEBCLIENT:-0}

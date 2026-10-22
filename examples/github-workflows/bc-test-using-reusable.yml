@@ -1,7 +1,7 @@
 name: BC Tests
 
 # Tiny consumer workflow that delegates to a reusable workflow hosted in
-# StefanMaron/MsDyn365Bc.On.Linux. Copy this file into your repo at
+# aldevtools/MsDyn365Bc.On.Linux. Copy this file into your repo at
 # .github/workflows/bc-test.yml, edit the `with:` block, commit, push.
 #
 # Two flavours are available, pick whichever fits:
@@ -21,7 +21,7 @@ on:
 
 jobs:
   bc-tests:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
     with:
       bc_version:     "27.5"
       bc_country:     "w1"
@@ -127,7 +127,7 @@ jobs:
   # ─── Prebuilt flavour example (commented out) ─────────────────────────
   #
   # bc-tests-prebuilt:
-  #   uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-prebuilt.yml@master
+  #   uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-prebuilt.yml@master
   #   with:
   #     bc_version:     "27.5"
   #     test_app_files: "tests/MyTests.app"

@@ -351,7 +351,9 @@ async Task<int> RunTests()
             // The session died mid-codeunit (BC recycled it, or the watchdog aborted a
             // hung one). The codeunit itself still ran, and its per-function results are
             // in the Test Method Line table, so read them and open a fresh session next
-            // time round.
+            // time round. Say why: a codeunit cut short shows up as SKIP rows with no
+            // other trace in the log (issue #125, codeunit 61202 on BC 27).
+            Console.Error.WriteLine($"[testrunner] session lost during codeunit {codeunitsRun + 1}: {ex.GetType().Name}: {ex.Message[..Math.Min(300, ex.Message.Length)]}");
             haveSession = false;
             codeunitsRun++;
             // Print live per-function results for the codeunit that just completed
@@ -607,7 +609,7 @@ async Task<(JsonRpc, ClientWebSocket, CancellationTokenSource)> ConnectOnce(
         rpc = new JsonRpc(new WebSocketMessageHandler(ws));
         rpc.TraceSource.Switch.Level = System.Diagnostics.SourceLevels.Verbose;
         rpc.TraceSource.Listeners.Add(tc);
-        var callbacks = new Callbacks(sessionEndedCts);
+        var callbacks = new Callbacks(sessionEndedCts) { DownloadBaseUrl = $"http://{host}/", AuthBytes = authBytes };
         rpc.AddLocalRpcTarget(callbacks);
         callbacks.Rpc = rpc;
         rpc.StartListening();
@@ -619,7 +621,11 @@ async Task<(JsonRpc, ClientWebSocket, CancellationTokenSource)> ConnectOnce(
         // requests are left exactly as before.
         var connectionRequest = JObject.FromObject(new { LCID = 1033, DefaultLCID = 1033, TimeZoneId = "UTC", ClientConnectionType = 115, Credentials = new { UserName = user, Password = tenant != "" ? tenant + "\\" + clientServicesPassword : clientServicesPassword } });
         if (tenant != "") connectionRequest["TenantId"] = tenant;
-        await rpc.InvokeWithCancellationAsync<JToken>("OpenConnection", new object[] { connectionRequest }, ct);
+        // The result is the session's UserSettings; its TenantId and ServerExternalSessionId
+        // are what the client-services HTTP endpoints identify the session by.
+        var userSettings = await rpc.InvokeWithCancellationAsync<JToken>("OpenConnection", new object[] { connectionRequest }, ct);
+        callbacks.TenantId = userSettings?["TenantId"]?.ToString();
+        callbacks.ServerExternalSessionId = userSettings?["ServerExternalSessionId"]?.ToString();
         Log("Connected.");
         return (rpc, ws, sessionEndedCts);
     }
@@ -707,6 +713,10 @@ class Callbacks
 {
     private readonly CancellationTokenSource _sessionEndedCts;
     public JsonRpc? Rpc { get; set; }
+    public string DownloadBaseUrl { get; set; } = "";
+    public byte[] AuthBytes { get; set; } = Array.Empty<byte>();
+    public string? TenantId { get; set; }
+    public string? ServerExternalSessionId { get; set; }
 
     public Callbacks(CancellationTokenSource sessionEndedCts) => _sessionEndedCts = sessionEndedCts;
 
@@ -736,7 +746,19 @@ class Callbacks
     [JsonRpcMethod("OnSessionTerminating")]
     public Task OnSessionTerminating() { _sessionEndedCts.Cancel(); return Task.CompletedTask; }
 
-    [JsonRpcMethod("Confirm")] public async Task Confirm(JToken r) => await AckCallback("Confirm");
+    // A Confirm that reaches the client (no handler took it, e.g. the "Your change might
+    // update related records" question when a TestPage renames its record) is answered with
+    // the request's default, as the hub's TestRunnerClientCallback does. NSClientCallback
+    // unboxes the result to bool, so the generic null ack was a NullReferenceException in AL,
+    // and on BC 27 it ended the session (issue #122). The Result goes through BC's
+    // ObjectWithTypeInfoConverter: {typeHint, value}, with 19 = JsonTypeHint.Bool.
+    [JsonRpcMethod("Confirm")] public async Task Confirm(JToken r)
+    {
+        var request = r.Type == JTokenType.Array ? r.First : r;
+        bool defaultValue = request?["DefaultValue"]?.Type == JTokenType.Boolean && request["DefaultValue"]!.Value<bool>();
+        if (Rpc != null)
+            try { await Rpc.InvokeAsync("EndClientCall", new object?[] { new JObject { ["Result"] = new JObject { ["typeHint"] = 19, ["value"] = defaultValue } } }); } catch { }
+    }
     [JsonRpcMethod("ProcessServerRequests")] public async Task ProcessServerRequests(JToken r) => await AckCallback("ProcessServerRequests");
     [JsonRpcMethod("FormRunModal")] public async Task FormRunModal(JToken r) => await AckCallback("FormRunModal");
     [JsonRpcMethod("FormClose")] public async Task FormClose(JToken r) => await AckCallback("FormClose");
@@ -748,16 +770,231 @@ class Callbacks
         if (Rpc != null)
             try { await Rpc.InvokeAsync("EndClientCall", new object?[] { 1 }); } catch { }
     }
-    [JsonRpcMethod("FileActionDialog")] public async Task FileActionDialog(JToken r) => await AckCallback("FileActionDialog");
+    [JsonRpcMethod("FileActionDialog")] public async Task FileActionDialog(JToken r)
+    {
+        // Answer the way the client of a Windows container's test run does (issue #122).
+        // That client is the web server's client-services session, whose file dialog
+        // provider hands a download to the caller as a link and refuses an upload. So
+        // File.Download / DownloadFromStream return true and leave ToFile as it was, and
+        // Database.ImportData / DataFileInformation raise NotSupportedFileDialogProvider.
+        // The generic ack below answers with a null result, which NSClientCallback casts
+        // to FileActionResponse and dereferences: a NullReferenceException in AL.
+        var action = FileActionOf(r);
+        if (Rpc != null && action == FileActionDownload)
+        {
+            await DrainDownloadStream();
+            var response = new JObject { ["FileActionRequest"] = r.DeepClone(), ["IsFileAccessed"] = true };
+            try { await Rpc.InvokeAsync("EndClientFileActionCall", new object?[] { response }); } catch { }
+            return;
+        }
+        if (Rpc != null && action == FileActionUpload)
+        {
+            try { await Rpc.InvokeAsync("SendClientException", new object?[] { ClientFault(NotSupportedFileDialogType, NotSupportedFileDialogMessage), NotSupportedFileDialogMessage }); } catch { }
+            return;
+        }
+        await AckCallback("FileActionDialog");
+    }
+
+    // A download hands the client a stream (Connection.DownloadStream) that it fetches from
+    // uploadDownload/download, as Microsoft's UploadDownloadClient does (it adds the instance
+    // and a client/ prefix; both routes reach the same controller). For a file that
+    // is only bookkeeping, but Database.ExportData writes its export on a background thread into
+    // a pipe that blocks until someone reads it: accepting the download without reading made
+    // every ExportData wait for the pipe's 60-second timeout and fail with an uncatchable
+    // TimeoutException (issue #125). The bytes are discarded; the test client has no file system
+    // the AL code could look at, which is also why ToFile stays as it was.
+    private async Task DrainDownloadStream()
+    {
+        if (string.IsNullOrEmpty(ServerExternalSessionId)) return;
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+            using var request = new HttpRequestMessage(HttpMethod.Get, DownloadBaseUrl + "uploadDownload/download");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(AuthBytes));
+            request.Headers.Add("server-tenant-id", TenantId ?? "default");
+            request.Headers.Add("server-session-id", ServerExternalSessionId);
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.Error.WriteLine($"[testrunner] download stream: HTTP {(int)response.StatusCode}");
+                return;
+            }
+            await using var body = await response.Content.ReadAsStreamAsync();
+            await body.CopyToAsync(System.IO.Stream.Null);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[testrunner] download stream: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // Microsoft.Dynamics.Nav.Types.FileAction
+    private const int FileActionUpload = 1;
+    private const int FileActionDownload = 2;
+
+    private static int FileActionOf(JToken r)
+    {
+        var request = r.Type == JTokenType.Array ? r.First : r;
+        var action = request?["Action"];
+        if (action == null) return -1;
+        if (action.Type == JTokenType.Integer) return action.Value<int>();
+        return action.ToString() switch { "Upload" => FileActionUpload, "Download" => FileActionDownload, _ => -1 };
+    }
+
+    // Lang.NavFileOperationsNotSupported, the message of NavNotSupportedFileDialogProviderException.
+    private const string NotSupportedFileDialogMessage =
+        "The operation cannot complete because it uses a feature that is not supported (AL File function.)";
+
+    private const string NotSupportedFileDialogType = "Microsoft.Dynamics.Nav.Types.Exceptions.NavNotSupportedFileDialogProviderException";
+
+    // A ServerFault carrying a Microsoft.Dynamics.Nav.Types exception, in the form
+    // ExceptionHandler.DeserializeFromByteArray reads: base64 of a JSON array of exceptions,
+    // each serialized through ISerializable with its $type. The server rethrows it as the
+    // original exception, so AL sees the same text and error code as on Windows.
+    private static JObject ClientFault(string typeName, string message)
+    {
+        var exception = new JObject
+        {
+            ["$type"] = typeName + ", Microsoft.Dynamics.Nav.Types",
+            ["SuppressMessage"] = false,
+            ["FatalityScope"] = 0,
+            ["errorLevel"] = 0,
+            ["DiagnosticsSuppress"] = false,
+            ["DiagnosticsMessage"] = null,
+            ["TransientDiagnosticsMessage"] = null,
+            ["SuppressExceptionCreatedEvent"] = false,
+            ["ALCallStack"] = null,
+            ["detailedErrorMessage"] = null,
+            ["EnglishLanguageDiagnosticsMessage"] = null,
+            ["UntrappableError"] = false,
+            ["ClassName"] = typeName,
+            ["Message"] = message,
+            ["Data"] = null,
+            ["InnerException"] = null,
+            ["HelpURL"] = null,
+            ["StackTraceString"] = null,
+            ["RemoteStackTraceString"] = null,
+            ["RemoteStackIndex"] = 0,
+            ["ExceptionMethod"] = null,
+            ["HResult"] = -2146233067,
+            ["Source"] = null,
+            ["WatsonBuckets"] = null,
+        };
+        var data = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(new JArray(exception).ToString(Newtonsoft.Json.Formatting.None)));
+        return new JObject { ["exceptionData"] = data, ["responseQueue"] = null };
+    }
     [JsonRpcMethod("FeedbackRequested")] public async Task FeedbackRequested(JToken r) => await AckCallback("FeedbackRequested");
-    [JsonRpcMethod("CreateDotNetHandle")] public async Task CreateDotNetHandle(JToken r) => await AckCallback("CreateDotNetHandle");
-    [JsonRpcMethod("GetDotNetObject")] public async Task GetDotNetObject(JToken r) => await AckCallback("GetDotNetObject");
+    // RunOnClient DotNet, answered the way the client of a Windows container's test run does
+    // (issue #125). That client is the web server's client-services session, whose
+    // ObservingAutomationHandler (Microsoft.Dynamics.Nav.Client.WebCommon) hands out a handle
+    // for a known client extension type when no instance is asked for, answers the static
+    // IsAvailable on it with whether the session supports the extension - which a session with
+    // no browser does not - and refuses everything else with NavDotNetFromAlNotSupportedException.
+    // So "if UserTours.IsAvailable() then" is false and the page opens, as on Windows. The
+    // generic null ack made NSClientCallback dereference a null AutomationMethodResponse: a
+    // NullReferenceException in AL, e.g. from "O365 Activities" OnInit when a TestPage opens
+    // the Business Manager Role Center, and on BC 27 the end of the session.
+    [JsonRpcMethod("CreateDotNetHandle")] public async Task CreateDotNetHandle(JToken r)
+    {
+        if (Rpc == null) return;
+        var request = r.Type == JTokenType.Array ? r.First : r;
+        var typeName = Field(request, "TypeName")?.ToString() ?? "";
+        var varName = Field(request, "VarName")?.ToString();
+        bool createInstance = Field(request, "CreateInstance")?.Type == JTokenType.Boolean && Field(request, "CreateInstance")!.Value<bool>();
+        try
+        {
+            if (Array.IndexOf(ClientExtensionTypes, typeName) >= 0 && !createInstance && string.IsNullOrEmpty(varName))
+            {
+                int handle = Interlocked.Increment(ref _nextExtensionHandle);
+                var returnValue = new JObject { ["typeHint"] = 17, ["value"] = new JObject { ["handle"] = handle, ["isComObject"] = false } };
+                await Rpc.InvokeAsync("EndClientAutomationMethodCall", new object?[] { AutomationResponse(returnValue, request) });
+                return;
+            }
+            await Rpc.InvokeAsync("SendClientException", new object?[] { ClientFault(DotNetFromAlNotSupportedType, DotNetFromAlNotSupportedMessage), DotNetFromAlNotSupportedMessage });
+        }
+        catch { /* connection may be closing */ }
+    }
+
+    // ObservingAutomationHandler.AllClientExtentionsTypes, BC 28.5.
+    private static readonly string[] ClientExtensionTypes =
+    {
+        "Microsoft.Dynamics.Nav.Client.Capabilities.LocationProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.CameraProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.CameraBarcodeScannerProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.BarcodeScannerProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.DeviceContactProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.Tour",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.UserTours",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.AppSource",
+        "Microsoft.Dynamics.Nav.Client.PageNotifier",
+        "Microsoft.Dynamics.Nav.Client.Hosts.OfficeHost",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.Designer",
+    };
+
+    private int _nextExtensionHandle = 1000;
+
+    // InvokeAutomationMethod on a handle from CreateDotNetHandle above (every other
+    // CreateDotNetHandle is refused, so no other handle exists). Static IsAvailable is false
+    // and #IsNull is false, as the web client answers for an extension object. Anything else
+    // (Create, a method of an instance) fails: the web client raises NavNCLDotNetCreateException
+    // there, whose message this runner does not have, so it refuses with the same
+    // NavDotNetFromAlNotSupportedException as above. A test only gets here by ignoring
+    // IsAvailable.
+    [JsonRpcMethod("InvokeAutomationMethod")] public async Task InvokeAutomationMethod(JToken r)
+    {
+        if (Rpc == null) return;
+        var request = r.Type == JTokenType.Array ? r.First : r;
+        var methodName = Field(request, "MethodName")?.ToString() ?? "";
+        try
+        {
+            if (methodName == "IsAvailable" || methodName == "#IsNull")
+            {
+                var returnValue = new JObject { ["typeHint"] = 19, ["value"] = false };
+                await Rpc.InvokeAsync("EndClientAutomationMethodCall", new object?[] { AutomationResponse(returnValue, request) });
+                return;
+            }
+            await Rpc.InvokeAsync("SendClientException", new object?[] { ClientFault(DotNetFromAlNotSupportedType, DotNetFromAlNotSupportedMessage), DotNetFromAlNotSupportedMessage });
+        }
+        catch { /* connection may be closing */ }
+    }
+
+    // Microsoft.Dynamics.Nav.Types.AutomationMethodResponse, by its [DataMember] field names.
+    // The server copies "arguments" back into the caller's by index, so they are echoed.
+    private static JObject AutomationResponse(JObject returnValue, JToken? request) => new()
+    {
+        ["returnValue"] = returnValue,
+        ["arguments"] = Field(request, "Arguments")?.DeepClone() ?? new JArray(),
+    };
+
+    private static JToken? Field(JToken? obj, string name) =>
+        (obj as JObject)?.GetValue(name, StringComparison.OrdinalIgnoreCase);
+
+    private const string DotNetFromAlNotSupportedType = "Microsoft.Dynamics.Nav.Types.Exceptions.NavDotNetFromAlNotSupportedException";
+    // Lang.NavDotNetFromAlNotSupportedException, the message of NavDotNetFromAlNotSupportedException.
+    private const string DotNetFromAlNotSupportedMessage =
+        "The operation cannot complete because it uses a feature that is not supported (.NET Framework Interoperability.)";
+    // A control add-in's instance, asked for when AL calls a procedure of a usercontrol
+    // (CurrPage.Ctl.Say(...)). A TestPage has no client form, so no add-in was ever created.
+    // The web client answers with an AutomationMethodResponse whose ReturnValue is null
+    // (ServiceClientCallback.OnGetDotNetObject, AutomationHandlerBase.GetDotNetObjectCore), and
+    // NavDotNet.CheckClientControlAddIn then raises "The control add-in on control X on page Y
+    // has not been instantiated." (DotNetControlAddInNotCreated), as on Windows. The generic
+    // null ack made NSClientCallback dereference a null response instead: a
+    // NullReferenceException, reported as "A call to Say failed" (issue #133).
+    [JsonRpcMethod("GetDotNetObject")] public async Task GetDotNetObject(JToken r)
+    {
+        if (Rpc == null) return;
+        var returnValue = new JObject { ["typeHint"] = 25, ["value"] = null }; // JsonTypeHint.Null
+        try { await Rpc.InvokeAsync("EndClientAutomationMethodCall", new object?[] { new JObject { ["returnValue"] = returnValue, ["arguments"] = new JArray() } }); }
+        catch { /* connection may be closing */ }
+    }
     // Dialog callbacks — BC sends these when AL code opens/closes dialogs
     [JsonRpcMethod("CloseDialog")] public async Task CloseDialog(JToken r) => await AckCallback("CloseDialog");
     [JsonRpcMethod("OpenDialog")] public async Task OpenDialog(JToken r) => await AckCallback("OpenDialog");
     [JsonRpcMethod("UpdateDialog")] public async Task UpdateDialog(JToken r) => await AckCallback("UpdateDialog");
-    [JsonRpcMethod("DisposeAutomationObject")] public Task DisposeAutomationObject(JToken r) => Task.CompletedTask;
-    [JsonRpcMethod("InvokeAutomationMethod")] public Task InvokeAutomationMethod(JToken r) => Task.CompletedTask;
+    // BC waits for this one (GetClientReturnValue: DisposeAutomationObject), so it needs the
+    // EndClientCall too. Before CreateDotNetHandle handed out handles it was never reached.
+    [JsonRpcMethod("DisposeAutomationObject")] public async Task DisposeAutomationObject(JToken r) => await AckCallback("DisposeAutomationObject");
     [JsonRpcMethod("DataSetPageReady")] public Task DataSetPageReady(JToken r) => Task.CompletedTask;
     [JsonRpcMethod("OpenProgressDialog")] public Task OpenProgressDialog(JToken r) => Task.CompletedTask;
     [JsonRpcMethod("CloseProgressDialog")] public Task CloseProgressDialog() => Task.CompletedTask;

@@ -11,7 +11,7 @@ name: BC test (prebuilt) [reusable]
 #   on: [push, pull_request, workflow_dispatch]
 #   jobs:
 #     test:
-#       uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-prebuilt.yml@master
+#       uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-prebuilt.yml@master
 #       with:
 #         bc_version:     "27.5"
 #         test_app_files: "tests/MyTests.app"
@@ -124,6 +124,22 @@ on:
             "50000..50100,130450,200000..210000" mixed
         required: true
         type: string
+      extra_apps:
+        description: >-
+          Newline-separated names of Microsoft apps from the BC artifact to
+          keep installed, together with their dependencies, although none of
+          your apps declares them (issue #125). The tier keeps only what your
+          apps need, so it can differ from a Windows container that has more
+          apps installed. Example: Tests-TestLibraries, whose codeunit 130011
+          "Backup Management" subscribes to GetDatabaseTableTriggerSetup and
+          so changes those results. A name that matches no app in the
+          artifact fails the job. Names are not case-sensitive. Each app that
+          is not already installed in the database costs a publish at boot:
+          Tests-TestLibraries ships no precompiled code and takes about 17s.
+          Empty (default) = no change.
+        required: false
+        type: string
+        default: ""
       runner_image:
         description: >-
           Override the bc-runner image. Blank (default) uses the repository variable
@@ -164,7 +180,7 @@ on:
         type: string
         default: ""
       bc_linux_ref:
-        description: "Git ref of StefanMaron/MsDyn365Bc.On.Linux to check out for scripts"
+        description: "Git ref of aldevtools/MsDyn365Bc.On.Linux to check out for scripts"
         required: false
         type: string
         default: "master"
@@ -227,7 +243,7 @@ jobs:
       - name: Checkout MsDyn365Bc.On.Linux
         uses: actions/checkout@v4
         with:
-          repository: ${{ vars.BC_LINUX_REPOSITORY || 'StefanMaron/MsDyn365Bc.On.Linux' }}
+          repository: ${{ vars.BC_LINUX_REPOSITORY || 'aldevtools/MsDyn365Bc.On.Linux' }}
           ref: ${{ inputs.bc_linux_ref }}
           path: bc-linux
 
@@ -266,6 +282,7 @@ jobs:
         env:
           APP_FILES: ${{ inputs.app_files }}
           TEST_APP_FILES: ${{ inputs.test_app_files }}
+          EXTRA_APPS: ${{ inputs.extra_apps }}
         run: |
           bash bc-linux/scripts/workflow-summary.sh begin RESOLVE "Resolve apps to keep"
           # Walk the consumer's .app files (not source dirs) AND bc-linux's
@@ -282,8 +299,17 @@ jobs:
               ARGS="$ARGS --app-file project/$f"
             fi
           done
+          # An array, because an app name can contain a space ("Data Archive").
+          EXTRA_ARGS=()
+          while IFS= read -r name; do
+            name="${name%$'\r'}"
+            if [ -n "${name//[[:space:]]/}" ]; then
+              EXTRA_ARGS+=(--extra-app-name "$name")
+            fi
+          done <<< "$EXTRA_APPS"
           KEEP_IDS=$(python3 bc-linux/scripts/resolve-keep-app-ids.py \
             $ARGS \
+            "${EXTRA_ARGS[@]}" \
             --artifact-dir "$BC_ARTIFACTS_DIR")
           echo "Resolved keep set: $KEEP_IDS"
           echo "BC_CLEAR_ALL_APPS=selective" >> "$GITHUB_ENV"

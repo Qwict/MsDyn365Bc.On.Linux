@@ -11,6 +11,10 @@ Inputs:
                          (e.g. .../artifact-cache/27.5)
   --extra-ids <list>    Comma-separated GUIDs to always include on top
                          of the baseline + dependency closure (optional)
+  --extra-app-name <n>  Name of an artifact app to keep, with its own
+                         dependencies (may be repeated). For apps that a
+                         Windows container has installed but no consumer
+                         declares, e.g. Tests-TestLibraries (issue #125).
 
 Output:
   Comma-separated lowercase GUIDs to stdout — feed straight into
@@ -135,7 +139,8 @@ def read_app_info(app_path: str) -> dict | None:
                                 deps = inner.get("dependencies", [])
                         except Exception:
                             pass
-                return {"id": app_id, "dependencies": deps, "path": app_path}
+                return {"id": app_id, "name": manifest.get("EmbeddedAppName", ""),
+                        "dependencies": deps, "path": app_path}
 
             if "NavxManifest.xml" in names:
                 xml = z.read("NavxManifest.xml").decode("utf-8", errors="replace")
@@ -149,7 +154,8 @@ def read_app_info(app_path: str) -> dict | None:
                     dep_id = (_xml_attr(dep_xml, "AppId") or _xml_attr(dep_xml, "Id") or "")
                     if dep_id:
                         deps.append({"id": dep_id.lower()})
-                return {"id": app_id, "dependencies": deps, "path": app_path}
+                return {"id": app_id, "name": _xml_attr(xml, "Name") or "",
+                        "dependencies": deps, "path": app_path}
 
             if "app.json" in names:
                 data = json.loads(z.read("app.json").decode("utf-8-sig"))
@@ -160,6 +166,7 @@ def read_app_info(app_path: str) -> dict | None:
                         deps.append({"id": dep_id})
                 return {
                     "id": (data.get("id") or "").lower(),
+                    "name": data.get("name") or "",
                     "dependencies": deps,
                     "path": app_path,
                 }
@@ -234,6 +241,34 @@ def read_consumer_seeds(app_json_paths, app_file_paths) -> set[str]:
     return seeds
 
 
+def declares_application(info: dict) -> bool:
+    """True when the app's NavxManifest has a non-empty Application attribute.
+
+    Read on demand, only for apps in the closure: an R2R package keeps the
+    manifest in a nested .app, and opening that for every artifact app would
+    make load_artifact_apps much slower for no gain.
+    """
+    path = info.get("path")
+    if not path:
+        return False
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            if "NavxManifest.xml" not in names:
+                inner = [n for n in names if n.endswith(".app")]
+                if not inner:
+                    return False
+                z = zipfile.ZipFile(io.BytesIO(z.read(inner[0])))
+                names = z.namelist()
+                if "NavxManifest.xml" not in names:
+                    return False
+            xml = z.read("NavxManifest.xml").decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    app_tag = re.search(r"<App\s[^>]*>", xml)
+    return bool(app_tag and _xml_attr(app_tag.group(0), "Application"))
+
+
 def walk_closure(seed_ids: set[str], apps: dict) -> set[str]:
     """Walk the transitive dependency closure starting from seed_ids.
 
@@ -252,6 +287,14 @@ def walk_closure(seed_ids: set[str], apps: dict) -> set[str]:
         out.add(aid)
         for dep in apps[aid].get("dependencies", []):
             visit(dep["id"])
+        # An artifact app's manifest can say Application="x" instead of
+        # listing Base Application as a dependency, the same shorthand as
+        # app.json's "application". Tests-TestLibraries and Data Archive both
+        # do. Without this, Base Application falls out of the closure and the
+        # selective filter removes it from under them.
+        if declares_application(apps[aid]):
+            for app_id in APPLICATION_IDS:
+                visit(app_id)
 
     for sid in seed_ids:
         visit(sid)
@@ -269,6 +312,9 @@ def main():
                         help="BC artifact root (e.g. artifact-cache/27.5)")
     parser.add_argument("--extra-ids", default="",
                         help="Comma-separated extra GUIDs to always include")
+    parser.add_argument("--extra-app-name", action="append", default=[],
+                        help="Name of an artifact app to keep together with "
+                             "its dependencies (repeatable, case-insensitive)")
     parser.add_argument("--no-test-runner-seed", action="store_true",
                         help="Don't auto-seed bc-linux's TestRunnerExtension "
                              "app.json into the closure (see below). Only use "
@@ -312,8 +358,27 @@ def main():
     seeds = read_consumer_seeds(args.app_json, args.app_file)
     print(f"consumer seeds: {len(seeds)}", file=sys.stderr)
 
-    if seeds:
+    # Apps named with --extra-app-name are seeds like a declared dependency,
+    # so their own dependencies are kept too. A name that matches no app in
+    # this artifact is an error: silently dropping it would give a tier that
+    # differs from what the caller asked for, with nothing saying so.
+    extra_names = [n.strip() for n in args.extra_app_name if n.strip()]
+    artifact_apps = None
+    if extra_names:
         artifact_apps = load_artifact_apps(args.artifact_dir)
+        for name in extra_names:
+            ids = {aid for aid, info in artifact_apps.items()
+                   if (info.get("name") or "").lower() == name.lower()}
+            if not ids:
+                print(f"ERROR: --extra-app-name '{name}' matches no app in "
+                      f"{args.artifact_dir}", file=sys.stderr)
+                sys.exit(1)
+            print(f"+ extra app '{name}': {sorted(ids)}", file=sys.stderr)
+            seeds |= ids
+
+    if seeds:
+        if artifact_apps is None:
+            artifact_apps = load_artifact_apps(args.artifact_dir)
         print(f"artifact apps loaded: {len(artifact_apps)}", file=sys.stderr)
         closure = walk_closure(seeds, artifact_apps)
         print(f"transitive closure: {len(closure)}", file=sys.stderr)

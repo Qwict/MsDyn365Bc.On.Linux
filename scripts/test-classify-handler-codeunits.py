@@ -59,7 +59,60 @@ CASES = [
      "Disabled", True, "rule (b) still fires"),
     (6, "        Host.OpenView();",
      "Restrictive", True, "rule (c) still fires"),
+    (7, "        asserterror NumberSequence.Insert('X');\n        Assert.ExpectedError('already exists');",
+     "Disabled", True, "issue #120: a sequence error under asserterror"),
+    (8, "        NumberSequence.Insert('X');\n        NumberSequence.Delete('X');",
+     "Disabled", False, "a sequence without asserterror stays fast"),
+    (9, "        asserterror Error('x');\n        Assert.ExpectedError('x');",
+     "Disabled", False, "asserterror without a sequence stays fast"),
+    (10, "        asserterror RR.Open(80301);\n        Assert.ExpectedError('from the object Test Runner - Mgt. An object');",
+     "Disabled", True, "issue #140: names the test runner codeunit"),
+    (11, "        asserterror RR.Open(80301);\n        Assert.ExpectedErrorCode('AL:MetadataNotFound');",
+     "Disabled", False, "the same open without the runner's name stays fast"),
 ]
+
+
+PREPROCESSOR_CASES = [
+    # (symbols, expected needs_websocket, why)
+    (None, True, "no symbols: every branch is scanned"),
+    ({"BC28PLUS"}, False, "the BC 27 #else branch is not compiled, its runner name does not count"),
+    (set(), True, "no symbol set: the #else branch is the compiled one"),
+    ({"BC28PLUS", "BC27PLUS"}, False, "#if with && and !, nested"),
+]
+
+PREPROCESSOR_SOURCE = """codeunit 90166 "Case 90166"
+{
+    Subtype = Test;
+    TestPermissions = Disabled;
+
+    [Test]
+    procedure T()
+    begin
+#if BC28PLUS
+        Expect('from the object Case 90166.');
+#else
+        Expect('from the object Test Runner - Mgt. An object');
+#endif
+#if BC27PLUS && !BC28PLUS
+        Expect('Test Runner - Isol. Disabled');
+#endif
+    end;
+}
+"""
+
+
+def preprocessor_cases() -> int:
+    failures = 0
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "90166.al"), "w") as f:
+            f.write(PREPROCESSOR_SOURCE)
+        for symbols, expected, why in PREPROCESSOR_CASES:
+            info = classify.classify_al_source([d], symbols)
+            got = info.get(90166, {}).get("needs_websocket")
+            ok = got is expected
+            print(f"{'ok  ' if ok else 'FAIL'} #if symbols={symbols}: needs_websocket={got} (want {expected}) — {why}")
+            failures += 0 if ok else 1
+    return failures
 
 
 def main() -> int:
@@ -75,7 +128,8 @@ def main() -> int:
             print(f"{'ok  ' if ok else 'FAIL'} cu {cuid}: needs_websocket={got} (want {expected}) — {why}")
             failures += 0 if ok else 1
     print(f"{len(CASES) - failures}/{len(CASES)} cases passed")
-    return 1 if failures else 0
+    pre_failures = preprocessor_cases()
+    return 1 if failures or pre_failures else 0
 
 
 if __name__ == "__main__":

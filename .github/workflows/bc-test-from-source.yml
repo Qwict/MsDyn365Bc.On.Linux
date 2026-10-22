@@ -9,7 +9,7 @@ name: BC test (from source) [reusable]
 #   on: [push, pull_request, workflow_dispatch]
 #   jobs:
 #     test:
-#       uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+#       uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
 #       with:
 #         bc_version:     "27.5"
 #         app_dirs:       "app"
@@ -180,6 +180,42 @@ on:
         required: false
         type: string
         default: ""
+      extra_apps:
+        description: >-
+          Newline-separated names of Microsoft apps from the BC artifact to
+          keep installed, together with their dependencies, although none of
+          your apps declares them (issue #125). The tier keeps only what your
+          apps need, so it can differ from a Windows container that has more
+          apps installed. Example: Tests-TestLibraries, whose codeunit 130011
+          "Backup Management" subscribes to GetDatabaseTableTriggerSetup and
+          so changes those results. A name that matches no app in the
+          artifact fails the job. Names are not case-sensitive. Each app that
+          is not already installed in the database costs a publish at boot:
+          Tests-TestLibraries ships no precompiled code and takes about 17s.
+          Empty (default) = no change.
+        required: false
+        type: string
+        default: ""
+      assembly_probing_paths:
+        description: >-
+          Newline-separated folders passed to the compiler as
+          /assemblyprobingpaths for every app it compiles, so an OnPrem app
+          can declare a DotNet assembly that ships in the BC artifact
+          (issue #123). app.json's assemblyProbingPaths is no help here:
+          recent compilers refuse it (AL0124). A relative entry is resolved
+          against the job's extracted artifact folder, so one setting works
+          for every BC version; an absolute entry is used as is. Shell globs
+          are expanded, which covers the version-numbered service folder.
+          The compiler searches each folder's subfolders too. An entry that
+          matches no folder fails the step. Example:
+            platform/Test Assemblies
+            platform/ServiceTier/PFiles64/Microsoft Dynamics NAV/*/Service
+          The first holds Newtonsoft.Json; the second holds
+          Microsoft.Dynamics.Nav.NavUserAccount and the Timer, NavEtwReceiver
+          and ClientExtensions add-ins. Empty = no flag passed.
+        required: false
+        type: string
+        default: ""
       runtime_version:
         description: >-
           Opt-in rewrite of app.json "runtime" before compile. Blank
@@ -230,10 +266,10 @@ on:
           (Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux on
           nuget.org). Accepts a policy keyword or an exact version.
           "matching" (default, same as blank): newest stable of the AL major
-          that matches bc_version (AL major = BC major - 11), falling back to
-          that major's newest prerelease when no stable exists — required for
-          a BC version still in preview, since BC 29 needs AL 18.x and there
-          is no stable 18.x.
+          that matches bc_version (AL major = BC major - 11 up to BC 29, and
+          AL major = BC major from BC 30), falling back to that major's newest
+          prerelease when no stable exists — required for a BC version still
+          in preview, such as BC 30, which has only 30.x betas.
           "latest": newest stable across all majors, regardless of bc_version.
           Use this when an app declares a runtime its own major's compiler
           rejects — runtime 16.1 is refused by AL 16.2.28.57946 (which accepts
@@ -284,6 +320,17 @@ on:
         required: false
         type: string
         default: "auto"
+      altool_transport:
+        description: >-
+          How the altool leg of test_runner=auto reaches the TestRunnerHub.
+          "auto" (default): one persistent connection for the whole leg, and
+          the per-codeunit `al runtests` process only if the hub cannot be
+          reached. "hub": the persistent connection, no fallback. "cli": a
+          new `al runtests` process, login and connection for every codeunit,
+          which was the default before and costs about 0.76 s per codeunit.
+        required: false
+        type: string
+        default: "auto"
       altool_version:
         description: >-
           Version of the Microsoft.Dynamics.BusinessCentral.Development.Tools
@@ -318,8 +365,26 @@ on:
         required: false
         type: string
         default: ""
+      rdlc_renderer:
+        description: >-
+          Turn on the opt-in Mono RDLC renderer (issue #73): sets BC_RDLC_RENDERER=mono for
+          the bc container and pulls the bc-runner:rdlc image (built with BC_WITH_RDLC=1)
+          unless runner_image is set. Needs rdlc_trust_layouts: true as well, or the job
+          fails.
+        required: false
+        type: boolean
+        default: false
+      rdlc_trust_layouts:
+        description: >-
+          Required with rdlc_renderer: true. The acknowledgement that the VB code in an
+          RDLC layout runs with the renderer's privileges (root in the bc container), since
+          Mono does not sandbox it. Sets BC_RDLC_TRUST_LAYOUTS=1. Kept as a separate input
+          on purpose, so turning on the renderer is never also the acknowledgement.
+        required: false
+        type: boolean
+        default: false
       bc_linux_ref:
-        description: "Git ref of StefanMaron/MsDyn365Bc.On.Linux to check out for scripts (master, a tag, or a commit SHA)"
+        description: "Git ref of aldevtools/MsDyn365Bc.On.Linux to check out for scripts (master, a tag, or a commit SHA)"
         required: false
         type: string
         default: "master"
@@ -328,6 +393,14 @@ on:
         required: false
         type: number
         default: 45
+      test_timeout_minutes:
+        description: >-
+          Overall time limit, in minutes, for each test phase (the --timeout of the
+          test runner scripts). Default 30. Raise it for a suite whose phase runs
+          longer; keep it below timeout_minutes.
+        required: false
+        type: number
+        default: 30
       health_timeout_minutes:
         description: >-
           How long to wait for the BC container to report healthy. Default 30.
@@ -461,7 +534,9 @@ jobs:
     # can't live on the calling job.
     continue-on-error: ${{ inputs.continue_on_error }}
     env:
-      BC_RUNNER_IMAGE: ${{ inputs.runner_image || (vars.IMAGE_NAMESPACE && format('ghcr.io/{0}/bc-runner:latest', vars.IMAGE_NAMESPACE)) || '' }}
+      BC_RUNNER_IMAGE: ${{ inputs.runner_image || (inputs.rdlc_renderer && format('ghcr.io/{0}/bc-runner:rdlc', vars.IMAGE_NAMESPACE || 'aldevtools/msdyn365bc.on.linux')) || (vars.IMAGE_NAMESPACE && format('ghcr.io/{0}/bc-runner:latest', vars.IMAGE_NAMESPACE)) || '' }}
+      BC_RDLC_RENDERER: ${{ inputs.rdlc_renderer && 'mono' || '' }}
+      BC_RDLC_TRUST_LAYOUTS: ${{ inputs.rdlc_renderer && inputs.rdlc_trust_layouts && '1' || '' }}
       # Blank passes through to docker-compose's `${BC_SQL_IMAGE:-<mirror>}`
       # default — `:-` treats empty and unset alike, so an unset input keeps
       # the mirror rather than resolving to an empty image name.
@@ -503,7 +578,7 @@ jobs:
       - name: Checkout MsDyn365Bc.On.Linux
         uses: actions/checkout@v4
         with:
-          repository: ${{ vars.BC_LINUX_REPOSITORY || 'StefanMaron/MsDyn365Bc.On.Linux' }}
+          repository: ${{ vars.BC_LINUX_REPOSITORY || 'aldevtools/MsDyn365Bc.On.Linux' }}
           ref: ${{ inputs.bc_linux_ref }}
           path: bc-linux
 
@@ -516,9 +591,15 @@ jobs:
       # operations on different hosts. Run them in parallel inside one
       # shell step to overlap their wall time (~50s artifacts ⊕ ~30s pull
       # ⇒ ~50s instead of ~80s sequential).
+      - name: Check the RDLC trust acknowledgement
+        if: ${{ inputs.rdlc_renderer && !inputs.rdlc_trust_layouts }}
+        run: |
+          echo "::error::rdlc_renderer: true also needs rdlc_trust_layouts: true. RDLC layout code runs unsandboxed as root in the bc container (see CLAUDE.md, RDLC rendering)."
+          exit 1
+
       - name: Download BC artifacts + pull docker images (parallel)
         env:
-          BC_RUNNER_IMAGE: ${{ inputs.runner_image || (vars.IMAGE_NAMESPACE && format('ghcr.io/{0}/bc-runner:latest', vars.IMAGE_NAMESPACE)) || '' }}
+          BC_RUNNER_IMAGE: ${{ inputs.runner_image || (inputs.rdlc_renderer && format('ghcr.io/{0}/bc-runner:rdlc', vars.IMAGE_NAMESPACE || 'aldevtools/msdyn365bc.on.linux')) || (vars.IMAGE_NAMESPACE && format('ghcr.io/{0}/bc-runner:latest', vars.IMAGE_NAMESPACE)) || '' }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
@@ -562,6 +643,7 @@ jobs:
         env:
           APP_DIRS: ${{ inputs.app_dirs }}
           TEST_APP_DIRS: ${{ inputs.test_app_dirs }}
+          EXTRA_APPS: ${{ inputs.extra_apps }}
         run: |
           bash bc-linux/scripts/workflow-summary.sh begin RESOLVE "Resolve apps to keep"
           # Walk the consumer's app.json files (production + test) AND
@@ -585,6 +667,12 @@ jobs:
               ARGS+=(--app-json "project/$d/app.json")
             fi
           done <<< "$APP_DIRS"$'\n'"$TEST_APP_DIRS"
+          while IFS= read -r name; do
+            name="${name%$'\r'}"
+            if [ -n "${name//[[:space:]]/}" ]; then
+              ARGS+=(--extra-app-name "$name")
+            fi
+          done <<< "$EXTRA_APPS"
           KEEP_IDS=$(python3 bc-linux/scripts/resolve-keep-app-ids.py \
             "${ARGS[@]}" \
             --artifact-dir "$BC_ARTIFACTS_DIR")
@@ -841,7 +929,7 @@ jobs:
           EFFECTIVE_RUNTIME="$RUNTIME_VERSION"
           BC_MAJOR=$(echo "${{ inputs.bc_version }}" | cut -d. -f1)
           if [ "$EFFECTIVE_RUNTIME" = "auto" ]; then
-            # Same BC-major-minus-11 rule as the compiler version; no network
+            # Same BC-to-AL major rule as the compiler version; no network
             # call needed for this one. The old table's fallback to 14.0 for
             # an unknown major was silently wrong for anything newer than 28.
             if ! EFFECTIVE_RUNTIME=$(python3 bc-linux/scripts/resolve-al-tool-version.py "${{ inputs.bc_version }}" --runtime); then
@@ -930,6 +1018,7 @@ jobs:
           ENABLE_EXTERNAL_RULESETS: ${{ inputs.enable_external_rulesets }}
           ENABLE_CODE_ANALYZERS_ON_TEST_APPS: ${{ inputs.enable_code_analyzers_on_test_apps }}
           PREPROCESSOR_SYMBOLS: ${{ inputs.preprocessor_symbols }}
+          ASSEMBLY_PROBING_PATHS: ${{ inputs.assembly_probing_paths }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin COMPILE "Compile AL apps"
@@ -988,6 +1077,39 @@ jobs:
 
           PP_FLAG=()
           [ -n "$PREPROCESSOR_SYMBOLS" ] && PP_FLAG=("/define:$PREPROCESSOR_SYMBOLS")
+
+          # Resolve each probing-path entry to existing folders and join them
+          # with ';' into one flag. An entry that matches nothing fails here:
+          # the compiler would only report AL0451 for the assembly, with no
+          # hint that the folder was wrong.
+          if [ -n "$ASSEMBLY_PROBING_PATHS" ]; then
+            PROBE_DIRS=()
+            while IFS= read -r entry; do
+              entry="${entry%$'\r'}"
+              [ -z "${entry//[[:space:]]/}" ] && continue
+              case "$entry" in
+                /*) pattern="$entry" ;;
+                *)  pattern="$BC_ARTIFACTS_DIR/$entry" ;;
+              esac
+              # Unquoted so the glob expands; IFS= so the spaces in
+              # "Test Assemblies" and "Microsoft Dynamics NAV" do not split it.
+              matched=0
+              mapfile -t candidates < <(IFS=; shopt -s nullglob; m=($pattern); [ ${#m[@]} -gt 0 ] && printf '%s\n' "${m[@]}")
+              for dir in "${candidates[@]}"; do
+                [ -d "$dir" ] || continue
+                PROBE_DIRS+=("$dir")
+                matched=1
+              done
+              if [ "$matched" -eq 0 ]; then
+                echo "ERROR: assembly_probing_paths entry '$entry' matches no folder (looked for '$pattern')" >&2
+                exit 1
+              fi
+            done <<< "$ASSEMBLY_PROBING_PATHS"
+            PROBE_JOINED=$(IFS=';'; echo "${PROBE_DIRS[*]}")
+            PP_FLAG+=("/assemblyprobingpaths:$PROBE_JOINED")
+            echo "Assembly probing paths:"
+            printf '  %s\n' "${PROBE_DIRS[@]}"
+          fi
 
           compile_dir() {
             local src="$1"
@@ -1243,15 +1365,17 @@ jobs:
               python3 -u scripts/run-tests-hybrid.py \
                 --app "$app" \
                 --al-source-dir "../project/$d" \
+                --preprocessor-symbols "${{ inputs.preprocessor_symbols }}" \
                 --codeunit-range "${{ inputs.codeunit_range }}" \
                 --junit-output "$junit_file" \
                 --altool-cmd "$HOME/.dotnet/tools/al" \
+                --altool-transport "${{ inputs.altool_transport }}" \
                 --port "$BC_DEV_PORT" \
                 --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
                 --dev-url "http://localhost:${BC_DEV_PORT}/BC/dev" \
                 --api-port "$BC_API_PORT" \
                 "${COMPANY_ARGS[@]}" \
-                --timeout 30 2>&1 | tee "$tmplog"
+                --timeout ${{ inputs.test_timeout_minutes }} 2>&1 | tee "$tmplog"
             elif [ "$EFFECTIVE_RUNNER" = "altool" ]; then
               # test_runner=altool (explicit force): EVERY codeunit through
               # the hub, no split — this is the "catch hub regressions"
@@ -1273,7 +1397,7 @@ jobs:
                 --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
                 --api-port "$BC_API_PORT" \
                 "${COMPANY_ARGS[@]}" \
-                --timeout 30 2>&1 | tee "$tmplog"
+                --timeout ${{ inputs.test_timeout_minutes }} 2>&1 | tee "$tmplog"
             else
               ./scripts/run-tests.sh \
                 --app "$app" \
@@ -1282,7 +1406,7 @@ jobs:
                 --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
                 --dev-url "http://localhost:${BC_DEV_PORT}/BC/dev" \
                 "${COMPANY_ARGS[@]}" \
-                --timeout 30 2>&1 | tee "$tmplog"
+                --timeout ${{ inputs.test_timeout_minutes }} 2>&1 | tee "$tmplog"
             fi
             RUN_TESTS_RC=${PIPESTATUS[0]}
             if [ "$RUN_TESTS_RC" -ne 0 ]; then

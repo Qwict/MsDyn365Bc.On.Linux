@@ -21,7 +21,10 @@ env:
   # silently invisible to every CI run because of this mismatch. Don't move
   # this without simultaneously updating docker-compose.yml and any
   # downstream consumer.
-  IMAGE_NAME: stefanmaron/msdyn365bc.on.linux/bc-runner
+  # The repo moved from StefanMaron to the aldevtools org on 2026-10-21. GHCR
+  # packages stay with the old account, so new pushes go to aldevtools. Never
+  # delete the old ghcr.io/stefanmaron/... images: old pins still pull them.
+  IMAGE_NAME: aldevtools/msdyn365bc.on.linux/bc-runner
 
 jobs:
   build-push:
@@ -58,3 +61,20 @@ jobs:
         # so it caches to type=gha instead.
         cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache
         cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache,mode=max
+
+    - name: Build and push the RDLC variant (BC_WITH_RDLC=1)
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: src/Dockerfile
+        push: true
+        build-args: BC_WITH_RDLC=1
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:rdlc
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:rdlc-${{ github.sha }}
+        # Its own cache ref, so the Mono stage is not reinstalled on every
+        # push. Reads the default cache too, for the layers both builds share.
+        cache-from: |
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache-rdlc
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache
+        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache-rdlc,mode=max
