@@ -253,7 +253,7 @@ ${LOG_SNIPPET}
 
         SUMMARY="$SUMMARY
 
-> bc-linux \`workflow-summary.sh\` — see [StefanMaron/MsDyn365Bc.On.Linux](https://github.com/StefanMaron/MsDyn365Bc.On.Linux)"
+> bc-linux \`workflow-summary.sh\` — see [aldevtools/MsDyn365Bc.On.Linux](https://github.com/aldevtools/MsDyn365Bc.On.Linux)"
 
         # Write to whichever CI summary surface is available.
         if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

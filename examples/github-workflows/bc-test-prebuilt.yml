@@ -10,9 +10,9 @@ name: BC tests on Linux (pre-built .app files)
 #   - You commit pre-compiled .app files to the repo
 #   - Your AL is built by a tool that doesn't fit in this workflow
 #
-# Powered by StefanMaron/MsDyn365Bc.On.Linux — runs unmodified Microsoft BC on Linux
+# Powered by aldevtools/MsDyn365Bc.On.Linux — runs unmodified Microsoft BC on Linux
 # via runtime patching of the Windows .NET service tier. Image:
-# ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest
+# ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest
 #
 # ──────────────────────────────────────────────────────────────────────
 # HOW TO USE
@@ -65,7 +65,7 @@ env:
   # --------------------------------------------------------------------
 
   # bc-linux runtime image (publicly available on GHCR).
-  BC_RUNNER_IMAGE: "ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest"
+  BC_RUNNER_IMAGE: "ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest"
 
   # Where the extracted BC artifacts are kept. Empty = <workspace>/artifact-cache,
   # which is correct for a GitHub-hosted runner: the VM is fresh every job, so
@@ -102,7 +102,7 @@ jobs:
       - name: Checkout bc-linux runtime
         uses: actions/checkout@v4
         with:
-          repository: StefanMaron/MsDyn365Bc.On.Linux
+          repository: aldevtools/MsDyn365Bc.On.Linux
           ref: master
           path: bc-linux
 

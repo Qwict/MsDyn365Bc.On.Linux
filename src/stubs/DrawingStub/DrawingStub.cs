@@ -247,6 +247,351 @@ namespace System.Drawing
         }
     }
 
+    // PNG to PNG the way Windows GDI+ writes it (issue #135). GDI+ decodes a grayscale or
+    // truecolor PNG into a 32-bit ARGB bitmap, and its PNG encoder (libpng) writes that back
+    // as 8-bit RGBA with an sRGB chunk (intent 0) and a gAMA chunk (45455), no pHYs. The
+    // pixel rows go through libpng 1.6's adaptive filter choice and classic zlib with the
+    // window libpng sizes to the image.
+    //
+    // Measured against Windows (BC 27.5 and 29.0, official containers) for one image only:
+    // the corpus's 1x1 grayscale PNG, which comes out byte for byte the same here. zlib
+    // levels 2 to 5 all give that output; the level GDI+ uses is not known, so larger images
+    // may compress differently. Only 8-bit, non-interlaced gray, gray+alpha, RGB and RGBA
+    // sources are handled, and only without colour-management chunks (gAMA other than
+    // 45455, cHRM, iCCP), which GDI+ applies while decoding. Everything else returns null
+    // and takes the older path.
+    internal static class GdiPlusPng
+    {
+        private static readonly byte[] Signature = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+
+        internal static byte[]? TryReencode(byte[] source)
+        {
+            try
+            {
+                var rgba = Decode(source, out int width, out int height);
+                if (rgba == null) return null;
+                return Encode(rgba, width, height);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        // Returns straight (not premultiplied) RGBA, or null for anything out of scope.
+        private static byte[]? Decode(byte[] d, out int width, out int height)
+        {
+            width = height = 0;
+            if (d.Length < 8) return null;
+            for (int i = 0; i < 8; i++) if (d[i] != Signature[i]) return null;
+
+            int depth = -1, colorType = -1, interlace = -1;
+            byte[]? trns = null;
+            using var idat = new MemoryStream();
+            int p = 8;
+            while (p + 12 <= d.Length)
+            {
+                int len = BE32(d, p);
+                if (len < 0 || p + 12 + len > d.Length) return null;
+                string type = System.Text.Encoding.ASCII.GetString(d, p + 4, 4);
+                int data = p + 8;
+                switch (type)
+                {
+                    case "IHDR":
+                        if (len != 13) return null;
+                        width = BE32(d, data);
+                        height = BE32(d, data + 4);
+                        depth = d[data + 8];
+                        colorType = d[data + 9];
+                        interlace = d[data + 12];
+                        break;
+                    case "IDAT":
+                        idat.Write(d, data, len);
+                        break;
+                    case "tRNS":
+                        trns = new byte[len];
+                        Buffer.BlockCopy(d, data, trns, 0, len);
+                        break;
+                    case "gAMA":
+                        if (len != 4 || BE32(d, data) != 45455) return null;
+                        break;
+                    case "cHRM":
+                    case "iCCP":
+                        return null;
+                }
+                p += 12 + len;
+                if (type == "IEND") break;
+            }
+
+            if (depth != 8 || interlace != 0 || width <= 0 || height <= 0) return null;
+            int channels = colorType switch { 0 => 1, 2 => 3, 4 => 2, 6 => 4, _ => 0 };
+            if (channels == 0) return null;
+            if ((long)width * height > 16_000_000) return null;
+
+            int stride = width * channels;
+            var raw = new byte[(long)height * (stride + 1)];
+            idat.Position = 0;
+            using (var z = new System.IO.Compression.ZLibStream(idat, System.IO.Compression.CompressionMode.Decompress))
+            {
+                // Image data that ends early leaves the rest of the image zero, as GDI+
+                // accepts it (issue #161: a 1x1 RGBA PNG whose IDAT holds 4 of its 5 bytes is
+                // stored as 99 bytes on Windows). Only the length was compared with Windows;
+                // the pixel values GDI+ fills in are not known.
+                int read = 0;
+                while (read < raw.Length)
+                {
+                    int n = z.Read(raw, read, raw.Length - read);
+                    if (n <= 0) break;
+                    read += n;
+                }
+                if (read == 0) return null;
+            }
+
+            var prev = new byte[stride];
+            var cur = new byte[stride];
+            var rgba = new byte[(long)width * height * 4];
+            for (int y = 0; y < height; y++)
+            {
+                int rowStart = y * (stride + 1);
+                byte filter = raw[rowStart];
+                Buffer.BlockCopy(raw, rowStart + 1, cur, 0, stride);
+                if (!Unfilter(filter, cur, prev, channels)) return null;
+
+                for (int x = 0; x < width; x++)
+                {
+                    int o = (y * width + x) * 4;
+                    int s = x * channels;
+                    switch (colorType)
+                    {
+                        case 0:
+                            rgba[o] = rgba[o + 1] = rgba[o + 2] = cur[s];
+                            rgba[o + 3] = (trns != null && trns.Length >= 2 && cur[s] == trns[1] && trns[0] == 0) ? (byte)0 : (byte)255;
+                            break;
+                        case 4:
+                            rgba[o] = rgba[o + 1] = rgba[o + 2] = cur[s];
+                            rgba[o + 3] = cur[s + 1];
+                            break;
+                        case 2:
+                            rgba[o] = cur[s]; rgba[o + 1] = cur[s + 1]; rgba[o + 2] = cur[s + 2];
+                            bool transparent = trns != null && trns.Length >= 6
+                                && trns[0] == 0 && trns[1] == cur[s] && trns[2] == 0 && trns[3] == cur[s + 1]
+                                && trns[4] == 0 && trns[5] == cur[s + 2];
+                            rgba[o + 3] = transparent ? (byte)0 : (byte)255;
+                            break;
+                        default:
+                            rgba[o] = cur[s]; rgba[o + 1] = cur[s + 1]; rgba[o + 2] = cur[s + 2]; rgba[o + 3] = cur[s + 3];
+                            break;
+                    }
+                }
+                (prev, cur) = (cur, prev);
+            }
+            return rgba;
+        }
+
+        private static bool Unfilter(byte filter, byte[] cur, byte[] prev, int bpp)
+        {
+            int n = cur.Length;
+            switch (filter)
+            {
+                case 0: return true;
+                case 1:
+                    for (int i = bpp; i < n; i++) cur[i] = (byte)(cur[i] + cur[i - bpp]);
+                    return true;
+                case 2:
+                    for (int i = 0; i < n; i++) cur[i] = (byte)(cur[i] + prev[i]);
+                    return true;
+                case 3:
+                    for (int i = 0; i < n; i++)
+                        cur[i] = (byte)(cur[i] + (((i >= bpp ? cur[i - bpp] : 0) + prev[i]) >> 1));
+                    return true;
+                case 4:
+                    for (int i = 0; i < n; i++)
+                        cur[i] = (byte)(cur[i] + Paeth(i >= bpp ? cur[i - bpp] : 0, prev[i], i >= bpp ? prev[i - bpp] : 0));
+                    return true;
+                default: return false;
+            }
+        }
+
+        private static int Paeth(int a, int b, int c)
+        {
+            int p = b - c, pc = a - c;
+            int pa = Math.Abs(p), pb = Math.Abs(pc);
+            pc = Math.Abs(p + pc);
+            return (pa <= pb && pa <= pc) ? a : (pb <= pc) ? b : c;
+        }
+
+        private static byte[] Encode(byte[] rgba, int width, int height)
+        {
+            const int bpp = 4;
+            int rowBytes = width * bpp;
+
+            // libpng 1.6 png_write_start_row: filters that need a row above are dropped for a
+            // one-row image, filters that need a pixel to the left for a one-column image.
+            bool sub = width > 1, up = height > 1, avg = width > 1 && height > 1, paeth = avg;
+
+            var filtered = new byte[(long)height * (rowBytes + 1)];
+            var prev = new byte[rowBytes];
+            var row = new byte[rowBytes];
+            var best = new byte[rowBytes];
+            var trial = new byte[rowBytes];
+            for (int y = 0; y < height; y++)
+            {
+                Buffer.BlockCopy(rgba, y * rowBytes, row, 0, rowBytes);
+                // png_write_find_filter: smallest sum of the bytes read as signed, ties keep
+                // the earlier filter in the order None, Sub, Up, Average, Paeth.
+                byte bestFilter = 0;
+                Buffer.BlockCopy(row, 0, best, 0, rowBytes);
+                long mins = Sum(best);
+                for (byte f = 1; f <= 4; f++)
+                {
+                    if ((f == 1 && !sub) || (f == 2 && !up) || (f == 3 && !avg) || (f == 4 && !paeth)) continue;
+                    for (int i = 0; i < rowBytes; i++)
+                    {
+                        int a = i >= bpp ? row[i - bpp] : 0, b = prev[i], c = i >= bpp ? prev[i - bpp] : 0;
+                        int pred = f switch { 1 => a, 2 => b, 3 => (a + b) >> 1, _ => Paeth(a, b, c) };
+                        trial[i] = (byte)(row[i] - pred);
+                    }
+                    long sum = Sum(trial);
+                    if (sum < mins)
+                    {
+                        mins = sum;
+                        bestFilter = f;
+                        (best, trial) = (trial, best);
+                    }
+                }
+                long at = (long)y * (rowBytes + 1);
+                filtered[at] = bestFilter;
+                Buffer.BlockCopy(best, 0, filtered, (int)at + 1, rowBytes);
+                (prev, row) = (row, prev);
+            }
+
+            // png_deflate_claim: the smallest window that still covers the image data.
+            int windowBits = 15;
+            long dataSize = filtered.Length;
+            if (dataSize <= 16384)
+            {
+                long half = 1L << (windowBits - 1);
+                while (dataSize + 262 <= half) { half >>= 1; windowBits--; }
+            }
+            if (windowBits == 8) windowBits = 9;
+
+            byte[] zdata = Zlib.Deflate(filtered, Level, windowBits, 8, ZFiltered);
+
+            var ihdr = new byte[13];
+            PutBE32(ihdr, 0, width);
+            PutBE32(ihdr, 4, height);
+            ihdr[8] = 8;  // bit depth
+            ihdr[9] = 6;  // RGBA
+
+            using var png = new MemoryStream();
+            png.Write(Signature, 0, Signature.Length);
+            Chunk(png, "IHDR", ihdr, 0, ihdr.Length);
+            Chunk(png, "sRGB", new byte[] { 0 }, 0, 1);
+            Chunk(png, "gAMA", new byte[] { 0, 0, 0xB1, 0x8F }, 0, 4);
+            // libpng writes IDAT whenever its 8 KiB compression buffer is full.
+            for (int o = 0; o < zdata.Length; o += 8192)
+                Chunk(png, "IDAT", zdata, o, Math.Min(8192, zdata.Length - o));
+            Chunk(png, "IEND", Array.Empty<byte>(), 0, 0);
+            return png.ToArray();
+        }
+
+        // zlib level. Levels 2 to 5 give the same bytes on the one image measured on Windows.
+        private const int Level = 5;
+        private const int ZFiltered = 1;
+
+        private static long Sum(byte[] row)
+        {
+            long s = 0;
+            foreach (byte v in row) s += v < 128 ? v : 256 - v;
+            return s;
+        }
+
+        private static int BE32(byte[] d, int i) => (d[i] << 24) | (d[i + 1] << 16) | (d[i + 2] << 8) | d[i + 3];
+
+        private static void PutBE32(byte[] d, int i, int v)
+        {
+            d[i] = (byte)(v >> 24); d[i + 1] = (byte)(v >> 16); d[i + 2] = (byte)(v >> 8); d[i + 3] = (byte)v;
+        }
+
+        private static void Chunk(Stream s, string type, byte[] data, int offset, int length)
+        {
+            var t = System.Text.Encoding.ASCII.GetBytes(type);
+            var len = new byte[4];
+            PutBE32(len, 0, length);
+            s.Write(len, 0, 4);
+            s.Write(t, 0, 4);
+            s.Write(data, offset, length);
+            var body = new byte[length];
+            Buffer.BlockCopy(data, offset, body, 0, length);
+            uint crc = StubImageWriter.Crc32(t, body);
+            var c = new byte[4];
+            PutBE32(c, 0, (int)crc);
+            s.Write(c, 0, 4);
+        }
+    }
+
+    // Classic zlib (libz.so.1), because libpng uses it and its output is what GDI+ writes.
+    // .NET's own deflate is a different implementation and compresses to different bytes.
+    // When libz cannot be loaded, the caller gets an exception and falls back.
+    internal static class Zlib
+    {
+        [Runtime.InteropServices.StructLayout(Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct ZStream
+        {
+            public IntPtr next_in; public uint avail_in; public UIntPtr total_in;
+            public IntPtr next_out; public uint avail_out; public UIntPtr total_out;
+            public IntPtr msg; public IntPtr state;
+            public IntPtr zalloc; public IntPtr zfree; public IntPtr opaque;
+            public int data_type; public UIntPtr adler; public UIntPtr reserved;
+        }
+
+        [Runtime.InteropServices.DllImport("libz.so.1", EntryPoint = "deflateInit2_")]
+        private static extern int DeflateInit2(ref ZStream strm, int level, int method, int windowBits, int memLevel, int strategy,
+            [Runtime.InteropServices.MarshalAs(Runtime.InteropServices.UnmanagedType.LPStr)] string version, int streamSize);
+        [Runtime.InteropServices.DllImport("libz.so.1", EntryPoint = "deflate")]
+        private static extern int DeflateCall(ref ZStream strm, int flush);
+        [Runtime.InteropServices.DllImport("libz.so.1", EntryPoint = "deflateEnd")]
+        private static extern int DeflateEnd(ref ZStream strm);
+        [Runtime.InteropServices.DllImport("libz.so.1", EntryPoint = "zlibVersion")]
+        private static extern IntPtr ZlibVersion();
+
+        internal static byte[] Deflate(byte[] input, int level, int windowBits, int memLevel, int strategy)
+        {
+            var output = new byte[input.Length + input.Length / 1000 + 64 + 16];
+            var inHandle = Runtime.InteropServices.GCHandle.Alloc(input, Runtime.InteropServices.GCHandleType.Pinned);
+            var outHandle = Runtime.InteropServices.GCHandle.Alloc(output, Runtime.InteropServices.GCHandleType.Pinned);
+            try
+            {
+                var z = new ZStream
+                {
+                    next_in = inHandle.AddrOfPinnedObject(), avail_in = (uint)input.Length,
+                    next_out = outHandle.AddrOfPinnedObject(), avail_out = (uint)output.Length,
+                };
+                string version = Runtime.InteropServices.Marshal.PtrToStringAnsi(ZlibVersion()) ?? "1.2.11";
+                int rc = DeflateInit2(ref z, level, 8, windowBits, memLevel, strategy, version,
+                    Runtime.InteropServices.Marshal.SizeOf<ZStream>());
+                if (rc != 0) throw new InvalidOperationException("deflateInit2_ returned " + rc);
+                try
+                {
+                    rc = DeflateCall(ref z, 4); // Z_FINISH
+                    if (rc != 1) throw new InvalidOperationException("deflate returned " + rc); // Z_STREAM_END
+                    var result = new byte[(long)z.total_out];
+                    Buffer.BlockCopy(output, 0, result, 0, result.Length);
+                    return result;
+                }
+                finally
+                {
+                    DeflateEnd(ref z);
+                }
+            }
+            finally
+            {
+                inHandle.Free();
+                outHandle.Free();
+            }
+        }
+    }
+
     // Re-encodes through SkiaSharp when it is available, so a Save() round-trip
     // behaves the way GDI+ does: the bytes that come out are a fresh encode, not the
     // bytes that went in. Falls back to writing the source bytes verbatim when Skia
@@ -262,13 +607,14 @@ namespace System.Drawing
     // Windows — a test asserting "ExportStream returns what I imported" passed here
     // and failed on a real tier.
     //
-    // This does NOT reproduce GDI+ byte-for-byte; Skia's PNG encoder is its own. The
-    // observable class of behaviour matches (the stream is re-encoded), the exact
-    // length does not. A test pinning an exact byte count is pinning a GDI+ version.
+    // PNG saved as PNG goes through GdiPlusPng first, which writes what GDI+ writes for the
+    // sources it handles (issue #135). Everything else goes through Skia, whose encoder is
+    // its own: the stream is re-encoded, but the bytes differ from GDI+'s.
     internal static class StubImageWriter
     {
         private static readonly Guid JpegGuid = new Guid("b96b3cae-0728-11d3-9d7b-0000f81ef32e");
         private static readonly Guid ExifGuid = new Guid("b96b3cb2-0728-11d3-9d7b-0000f81ef32e");
+        private static readonly Guid PngGuid = new Guid("b96b3caf-0728-11d3-9d7b-0000f81ef32e");
 
         // Smallest well-formed baseline JPEG (1×1 white). Synthesizing JPEG at arbitrary
         // dimensions isn't worth a DCT encoder — consumers that care about dimensions get
@@ -283,7 +629,8 @@ namespace System.Drawing
             var src = image?.SourceBytes;
             if (src != null && src.Length > 0)
             {
-                var reencoded = SkiaCodec.TryReencode(src, formatGuid);
+                var reencoded = (formatGuid == PngGuid ? GdiPlusPng.TryReencode(src) : null)
+                                ?? SkiaCodec.TryReencode(src, formatGuid);
                 var outBytes = reencoded ?? src;
                 stream.Write(outBytes, 0, outBytes.Length);
                 return;
@@ -412,7 +759,7 @@ namespace System.Drawing
         }
 
         private static uint[]? _crcTable;
-        private static uint Crc32(byte[] type, byte[] data)
+        internal static uint Crc32(byte[] type, byte[] data)
         {
             if (_crcTable == null)
             {
@@ -686,6 +1033,174 @@ namespace System.Drawing.Drawing2D
     {
         SourceOver = 0,
         SourceCopy = 1,
+    }
+
+    public enum MatrixOrder
+    {
+        Prepend = 0,
+        Append = 1,
+    }
+
+    // A real implementation, not a no-op: Aspose.PDF (in Microsoft's DocumentProcessor) uses it
+    // for image placement while it makes a PDF compliant, and a missing type made every Word
+    // layout with section breaks leave "Unable to merge pdf streams" as the last error (#155).
+    // GDI+'s 3x2 affine matrix in float math, row-vector convention (p' = p * M), with
+    // MatrixOrder.Prepend as the default order, as System.Drawing.Common has it.
+    public sealed class Matrix : MarshalByRefObject, IDisposable
+    {
+        private float _m11, _m12, _m21, _m22, _dx, _dy;
+
+        public Matrix() { _m11 = 1; _m22 = 1; }
+
+        public Matrix(float m11, float m12, float m21, float m22, float dx, float dy)
+        {
+            _m11 = m11; _m12 = m12; _m21 = m21; _m22 = m22; _dx = dx; _dy = dy;
+        }
+
+        public Matrix(System.Numerics.Matrix3x2 matrix)
+            : this(matrix.M11, matrix.M12, matrix.M21, matrix.M22, matrix.M31, matrix.M32) { }
+
+        public Matrix(RectangleF rect, PointF[] plgpts)
+        {
+            ArgumentNullException.ThrowIfNull(plgpts);
+            if (plgpts.Length != 3) throw new ArgumentException("Invalid parameter.", nameof(plgpts));
+            if (rect.Width == 0 || rect.Height == 0) throw new ArgumentException("Invalid parameter.", nameof(rect));
+            _m11 = (plgpts[1].X - plgpts[0].X) / rect.Width;
+            _m12 = (plgpts[1].Y - plgpts[0].Y) / rect.Width;
+            _m21 = (plgpts[2].X - plgpts[0].X) / rect.Height;
+            _m22 = (plgpts[2].Y - plgpts[0].Y) / rect.Height;
+            _dx = plgpts[0].X - _m11 * rect.X - _m21 * rect.Y;
+            _dy = plgpts[0].Y - _m12 * rect.X - _m22 * rect.Y;
+        }
+
+        public Matrix(Rectangle rect, Point[] plgpts)
+            : this(new RectangleF(rect.X, rect.Y, rect.Width, rect.Height),
+                   (plgpts ?? throw new ArgumentNullException(nameof(plgpts))).Select(p => new PointF(p.X, p.Y)).ToArray()) { }
+
+        public float[] Elements => new[] { _m11, _m12, _m21, _m22, _dx, _dy };
+
+        public System.Numerics.Matrix3x2 MatrixElements
+        {
+            get => new System.Numerics.Matrix3x2(_m11, _m12, _m21, _m22, _dx, _dy);
+            set { _m11 = value.M11; _m12 = value.M12; _m21 = value.M21; _m22 = value.M22; _dx = value.M31; _dy = value.M32; }
+        }
+
+        public float OffsetX => _dx;
+        public float OffsetY => _dy;
+        public bool IsIdentity => _m11 == 1 && _m12 == 0 && _m21 == 0 && _m22 == 1 && _dx == 0 && _dy == 0;
+        public bool IsInvertible => _m11 * _m22 - _m12 * _m21 != 0;
+
+        public Matrix Clone() => new Matrix(_m11, _m12, _m21, _m22, _dx, _dy);
+        public void Dispose() { }
+
+        public void Reset() { _m11 = 1; _m12 = 0; _m21 = 0; _m22 = 1; _dx = 0; _dy = 0; }
+
+        public void Multiply(Matrix matrix) => Multiply(matrix, MatrixOrder.Prepend);
+
+        public void Multiply(Matrix matrix, MatrixOrder order)
+        {
+            ArgumentNullException.ThrowIfNull(matrix);
+            if (ReferenceEquals(matrix, this)) throw new InvalidOperationException("The matrix cannot be multiplied by itself.");
+            Apply(matrix._m11, matrix._m12, matrix._m21, matrix._m22, matrix._dx, matrix._dy, order);
+        }
+
+        public void Translate(float offsetX, float offsetY) => Translate(offsetX, offsetY, MatrixOrder.Prepend);
+        public void Translate(float offsetX, float offsetY, MatrixOrder order) => Apply(1, 0, 0, 1, offsetX, offsetY, order);
+
+        public void Scale(float scaleX, float scaleY) => Scale(scaleX, scaleY, MatrixOrder.Prepend);
+        public void Scale(float scaleX, float scaleY, MatrixOrder order) => Apply(scaleX, 0, 0, scaleY, 0, 0, order);
+
+        public void Shear(float shearX, float shearY) => Shear(shearX, shearY, MatrixOrder.Prepend);
+        public void Shear(float shearX, float shearY, MatrixOrder order) => Apply(1, shearY, shearX, 1, 0, 0, order);
+
+        public void Rotate(float angle) => Rotate(angle, MatrixOrder.Prepend);
+
+        public void Rotate(float angle, MatrixOrder order)
+        {
+            double radians = angle * Math.PI / 180.0;
+            float cos = (float)Math.Cos(radians), sin = (float)Math.Sin(radians);
+            Apply(cos, sin, -sin, cos, 0, 0, order);
+        }
+
+        public void RotateAt(float angle, PointF point) => RotateAt(angle, point, MatrixOrder.Prepend);
+
+        public void RotateAt(float angle, PointF point, MatrixOrder order)
+        {
+            // Translate the point to the origin, rotate, translate back.
+            var op = new Matrix(1, 0, 0, 1, -point.X, -point.Y);
+            op.Rotate(angle, MatrixOrder.Append);
+            op.Translate(point.X, point.Y, MatrixOrder.Append);
+            Apply(op._m11, op._m12, op._m21, op._m22, op._dx, op._dy, order);
+        }
+
+        public void Invert()
+        {
+            float det = _m11 * _m22 - _m12 * _m21;
+            if (det == 0) throw new ArgumentException("Invalid parameter.");
+            float m11 = _m22 / det, m12 = -_m12 / det, m21 = -_m21 / det, m22 = _m11 / det;
+            float dx = -(_dx * m11 + _dy * m21), dy = -(_dx * m12 + _dy * m22);
+            _m11 = m11; _m12 = m12; _m21 = m21; _m22 = m22; _dx = dx; _dy = dy;
+        }
+
+        public void TransformPoints(PointF[] pts)
+        {
+            ArgumentNullException.ThrowIfNull(pts);
+            for (int i = 0; i < pts.Length; i++)
+                pts[i] = new PointF(pts[i].X * _m11 + pts[i].Y * _m21 + _dx, pts[i].X * _m12 + pts[i].Y * _m22 + _dy);
+        }
+
+        public void TransformPoints(Point[] pts)
+        {
+            ArgumentNullException.ThrowIfNull(pts);
+            for (int i = 0; i < pts.Length; i++)
+                pts[i] = new Point(Round(pts[i].X * _m11 + pts[i].Y * _m21 + _dx), Round(pts[i].X * _m12 + pts[i].Y * _m22 + _dy));
+        }
+
+        public void TransformVectors(PointF[] pts)
+        {
+            ArgumentNullException.ThrowIfNull(pts);
+            for (int i = 0; i < pts.Length; i++)
+                pts[i] = new PointF(pts[i].X * _m11 + pts[i].Y * _m21, pts[i].X * _m12 + pts[i].Y * _m22);
+        }
+
+        public void TransformVectors(Point[] pts)
+        {
+            ArgumentNullException.ThrowIfNull(pts);
+            for (int i = 0; i < pts.Length; i++)
+                pts[i] = new Point(Round(pts[i].X * _m11 + pts[i].Y * _m21), Round(pts[i].X * _m12 + pts[i].Y * _m22));
+        }
+
+        public void VectorTransformPoints(Point[] pts) => TransformVectors(pts);
+
+        public override bool Equals(object? obj) =>
+            obj is Matrix m && m._m11 == _m11 && m._m12 == _m12 && m._m21 == _m21 && m._m22 == _m22 && m._dx == _dx && m._dy == _dy;
+
+        public override int GetHashCode() => base.GetHashCode();
+
+        // this = op * this (Prepend) or this * op (Append), row-vector convention.
+        private void Apply(float a11, float a12, float a21, float a22, float adx, float ady, MatrixOrder order)
+        {
+            float l11, l12, l21, l22, ldx, ldy, r11, r12, r21, r22, rdx, rdy;
+            if (order == MatrixOrder.Append)
+            {
+                l11 = _m11; l12 = _m12; l21 = _m21; l22 = _m22; ldx = _dx; ldy = _dy;
+                r11 = a11; r12 = a12; r21 = a21; r22 = a22; rdx = adx; rdy = ady;
+            }
+            else
+            {
+                l11 = a11; l12 = a12; l21 = a21; l22 = a22; ldx = adx; ldy = ady;
+                r11 = _m11; r12 = _m12; r21 = _m21; r22 = _m22; rdx = _dx; rdy = _dy;
+            }
+            _m11 = l11 * r11 + l12 * r21;
+            _m12 = l11 * r12 + l12 * r22;
+            _m21 = l21 * r11 + l22 * r21;
+            _m22 = l21 * r12 + l22 * r22;
+            _dx = ldx * r11 + ldy * r21 + rdx;
+            _dy = ldx * r12 + ldy * r22 + rdy;
+        }
+
+        // GDI+'s GpRound.
+        private static int Round(float value) => (int)MathF.Floor(value + 0.5f);
     }
 }
 

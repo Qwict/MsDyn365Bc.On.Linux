@@ -29,7 +29,7 @@ on:
 
 env:
   UPSTREAM: mcr.microsoft.com/mssql/server:2022-latest
-  MIRROR: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022
+  MIRROR: ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022
   # Same image content, layers recompressed with zstd instead of the
   # gzip blobs mcr ships. Pulling 625 MB from GHCR still took ~45s on a
   # private repo's 2-vCPU runner — GHCR shouldn't be network-limited
@@ -37,7 +37,7 @@ env:
   # several times faster for a similar ratio. Published alongside the
   # byte-identical :2022 tag so there's an instant rollback if a
   # consumer's Docker can't handle zstd layers.
-  MIRROR_ZSTD: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd
+  MIRROR_ZSTD: ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-zstd
   # Same image plus the SQL Server Full-Text Search component. No official
   # SQL Server Linux image ships FTS — it's a separate mssql-server-fts
   # package — so AL's `OptimizeForTextSearch = true` cannot be installed on
@@ -45,7 +45,7 @@ env:
   # deliberately NOT the compose default: FTS adds ~550 MB (1.68 GB → 2.23 GB
   # uncompressed, measured), and the SQL pull is on the critical path of every
   # CI run. Only pay for it if your apps need it.
-  MIRROR_FTS: ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-fts
+  MIRROR_FTS: ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-fts
 
 jobs:
   mirror:
@@ -141,7 +141,7 @@ jobs:
           set -e
           docker buildx imagetools create \
             --tag "$MIRROR" \
-            --tag "ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-latest" \
+            --tag "ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-latest" \
             "$UPSTREAM"
 
       - name: Verify the mirror serves the same image

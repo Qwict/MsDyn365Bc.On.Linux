@@ -2,9 +2,9 @@
 # running on Linux. Compiles your AL source (app + test apps) inside the
 # pipeline and publishes the compiled .app files to BC.
 #
-# Powered by StefanMaron/MsDyn365Bc.On.Linux — runs unmodified Microsoft BC
+# Powered by aldevtools/MsDyn365Bc.On.Linux — runs unmodified Microsoft BC
 # on Linux via runtime patching of the Windows .NET service tier.
-# Image: ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest (public).
+# Image: ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest (public).
 #
 # ──────────────────────────────────────────────────────────────────────
 # HOW TO USE
@@ -114,7 +114,7 @@ variables:
   # --------------------------------------------------------------------
 
   # bc-linux runtime image (publicly available on GHCR — no auth needed).
-  BC_RUNNER_IMAGE: 'ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest'
+  BC_RUNNER_IMAGE: 'ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest'
 
   # Where the extracted BC artifacts are kept. The default is inside the
   # pipeline workspace, which is correct for a Microsoft-hosted agent: the VM
@@ -139,7 +139,7 @@ steps:
   - bash: |
       set -e
       git clone --depth 1 --branch "$(BC_LINUX_REF)" \
-        https://github.com/StefanMaron/MsDyn365Bc.On.Linux.git \
+        https://github.com/aldevtools/MsDyn365Bc.On.Linux.git \
         "$(Agent.BuildDirectory)/bc-linux"
       ls "$(Agent.BuildDirectory)/bc-linux"
     displayName: 'Clone MsDyn365Bc.On.Linux'
@@ -343,7 +343,7 @@ steps:
       EFFECTIVE_RUNTIME="$(RUNTIME_VERSION)"
       BC_MAJOR=$(echo "$(BC_VERSION)" | cut -d. -f1)
       if [ -z "$EFFECTIVE_RUNTIME" ]; then
-        # Same BC-major-minus-11 rule as the compiler version.
+        # Same BC-to-AL major rule as the compiler version.
         if ! EFFECTIVE_RUNTIME=$(python3 "$(Agent.BuildDirectory)/bc-linux/scripts/resolve-al-tool-version.py" "$(BC_VERSION)" --runtime); then
           echo "##vso[task.logissue type=error]Could not resolve an AL runtime version for BC $(BC_VERSION)"
           exit 1

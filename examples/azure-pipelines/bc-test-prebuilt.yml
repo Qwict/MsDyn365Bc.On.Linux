@@ -3,9 +3,9 @@
 # live in your repo (or were produced by an upstream build job) and
 # publishes them to BC.
 #
-# Powered by StefanMaron/MsDyn365Bc.On.Linux — runs unmodified Microsoft BC
+# Powered by aldevtools/MsDyn365Bc.On.Linux — runs unmodified Microsoft BC
 # on Linux via runtime patching of the Windows .NET service tier.
-# Image: ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest (public).
+# Image: ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest (public).
 #
 # Use this variant when:
 #   - You build .app files in a separate pipeline / build server
@@ -69,7 +69,7 @@ variables:
   # --------------------------------------------------------------------
 
   # bc-linux runtime image (publicly available on GHCR — no auth needed).
-  BC_RUNNER_IMAGE: 'ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest'
+  BC_RUNNER_IMAGE: 'ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest'
 
   # Where the extracted BC artifacts are kept. The default is inside the
   # pipeline workspace, which is correct for a Microsoft-hosted agent: the VM
@@ -94,7 +94,7 @@ steps:
   - bash: |
       set -e
       git clone --depth 1 --branch "$(BC_LINUX_REF)" \
-        https://github.com/StefanMaron/MsDyn365Bc.On.Linux.git \
+        https://github.com/aldevtools/MsDyn365Bc.On.Linux.git \
         "$(Agent.BuildDirectory)/bc-linux"
     displayName: 'Clone MsDyn365Bc.On.Linux'
 

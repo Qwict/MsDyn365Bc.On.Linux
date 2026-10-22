@@ -2,7 +2,7 @@
 
 Two copy-paste Azure DevOps pipelines that run AL tests against a Business
 Central NST on Linux. Both pull the public
-`ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner` image (no GHCR auth
+`ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner` image (no GHCR auth
 needed) and use the bc-linux scripts to boot BC, publish your apps, and
 execute tests via the bundled TestRunnerExtension.
 
@@ -46,7 +46,7 @@ preinstalled — no service connection or self-hosted agent required.
 
 ## What's running under the hood
 
-- **Image**: `ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest` —
+- **Image**: `ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest` —
   multi-stage Docker image that downloads Microsoft BC artifacts at boot,
   copies the .NET 8 service tier into place, applies a startup-hook patch
   set, restores the CRONUS demo DB, and exposes BC on the standard
@@ -129,7 +129,7 @@ bc-linux repo.
 ## Reporting issues
 
 If a pipeline fails on the bc-linux side (not your AL code), open an issue
-at <https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues> with:
+at <https://github.com/aldevtools/MsDyn365Bc.On.Linux/issues> with:
 
 - Your `variables:` block
 - The BC version you targeted
