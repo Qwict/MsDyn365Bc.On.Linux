@@ -2014,42 +2014,7 @@ PYEOF
         # is set; this block covers the interactive / Codespace case.
         if [ -z "${BC_KEEP_APP_IDS:-}" ]; then
             echo "[entrypoint] Publishing test toolkit apps (default flow)..."
-            TF_INSTALL_ORDER=$(python3 - "$ARTIFACTS" << 'PYEOF'
-import sys
-sys.path.insert(0, "/bc/scripts")
-from _bcapp import load_artifact_apps
-apps = load_artifact_apps(sys.argv[1])
-# Core test framework (wiped from SQL, need republish) + test toolkit
-# apps that aren't in the sandbox DB but most test apps depend on.
-# This list rarely changes — last change was ~5 years ago.
-NAMES = {
-    "Test Runner", "Library Assert", "Library Variable Storage",
-    "Permissions Mock", "Any",
-    "System Application Test Library", "Business Foundation Test Libraries",
-    "Tests-TestLibraries",
-}
-by_name = {}
-for aid, info in apps.items():
-    if info.get("name") in NAMES:
-        by_name[aid] = info
-visited, ordered = set(), []
-def visit(aid):
-    if aid in visited:
-        return
-    visited.add(aid)
-    info = apps.get(aid)
-    if info is None:
-        return
-    for dep in info.get("dependencies", []):
-        visit(dep["id"])
-    if aid in by_name:
-        ordered.append(info["path"])
-for aid in by_name:
-    visit(aid)
-for path in ordered:
-    print(path)
-PYEOF
-            )
+            TF_INSTALL_ORDER=$(python3 /bc/scripts/test-toolkit-order.py "$ARTIFACTS")
             while IFS= read -r APP_PATH; do
                 [ -z "$APP_PATH" ] && continue
                 NAME=$(basename "$APP_PATH")
