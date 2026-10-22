@@ -110,9 +110,19 @@ and dev URLs. Without a tenant `GET /BC/dev/metadata` answers 200, OData and
   referenced nowhere else) is derived from the original and the tenant;
   `bc_publish_app` does this itself. Any other publisher has to do the same.
 
-The stock apps (System Application, Base Application, the test framework the
-artifact ships) are global and shared; the Test Runner Extension and any test app
-are per tenant and have to be published into every tenant that runs tests.
+The stock apps (System Application, Base Application, the global test apps such
+as Application Test Library and AI Test Toolkit) are global and shared. The core
+test framework is not: the boot wipes it from the app database like it does for a
+single-tenant instance, and `tenant.sh add` publishes the same test toolkit a
+single-tenant boot does (`scripts/test-toolkit-order.py`: Test Runner, Library
+Assert, Library Variable Storage, Permissions Mock, Any, the System Application /
+Business Foundation test libraries, Tests-TestLibraries) plus the Test Runner
+Extension into each new tenant. The global test apps depend on that framework, so
+without it a tenant compiles no ordinary test app (AL1024) and refuses a later
+Test Runner publish ("A tenant cannot be specified when unpublishing this type of
+extension"). It adds ~55 s to an add (Tests-TestLibraries compiles from source,
+~30 s); `BC_TENANT_TEST_TOOLKIT=0` skips it. A test app itself is published per
+tenant.
 
 ## Timings and memory (BC 28.1 BE sandbox, 40-core host)
 
@@ -121,7 +131,7 @@ are per tenant and have to be published into every tenant that runs tests.
 | cold boot to healthy (incl. 48 s split) | 90 s |
 | restart of an already split instance | 26 s |
 | first `tenant.sh add` after an NST start (the NST loads the tenant's 97 apps) | ~120 s |
-| further `tenant.sh add` | 6-16 s |
+| further `tenant.sh add` | 6-16 s (+ ~55 s test toolkit, BC 28.1 dev host) |
 | `tenant.sh remove` | 15-20 s |
 | NST RSS, no tenant / 5 tenants mounted and tested, 4 GC heaps | 0.45 GB / 2.7 GB |
 | same with 40 GC heaps (the .NET default) | 0.45 GB / 7.7 GB |

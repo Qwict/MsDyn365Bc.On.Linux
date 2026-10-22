@@ -21,16 +21,19 @@
 # 3 timed out waiting for the NST, 4 SQL error, 5 not a ready multitenant
 # instance (BC_MULTITENANT off, or the template backup is not there yet),
 # 6 the NST dropped the tenant's mount twice (the tenant database is kept for
-# inspection; run remove to clean it up).
+# inspection; run remove to clean it up), 7 the tenant is mounted but its test
+# toolkit could not be published (running add again retries only that).
 #
 # Environment (all optional, defaults come from the container):
 #   BC_TENANT_ADD_TIMEOUT     seconds to wait for a mount (default 180)
 #   BC_TENANT_REMOVE_TIMEOUT  seconds to wait for the NST to dismount (default 60)
 #   BC_TENANT_TEMPLATE_DB     template name (default tenant_template)
+#   BC_TENANT_TEST_TOOLKIT    0 skips publishing the test toolkit into a new tenant
 
 set -uo pipefail
 
 SQLCMD_BIN=/opt/mssql-tools18/bin/sqlcmd
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SQL_SERVER="${SQL_SERVER:-sql}"
 BC_DB_USER="${BC_DB_USER:-bctest}"
 BC_DB_PASSWORD="${BC_DB_PASSWORD:-Test1234}"
@@ -42,6 +45,7 @@ DATA_DIR="/var/opt/mssql/data"
 ADD_TIMEOUT="${BC_TENANT_ADD_TIMEOUT:-180}"
 REMOVE_TIMEOUT="${BC_TENANT_REMOVE_TIMEOUT:-60}"
 ODATA_URL="http://localhost:7048/BC/ODataV4/Company"
+DEV_URL="http://localhost:7049/BC/dev"
 CONFIG="/bc/service/CustomSettings.config"
 export SQLCMDPASSWORD="${SA_PASSWORD:-Passw0rd123!}"
 
@@ -56,6 +60,8 @@ fail() { # fail <code> <reason>
     exit "$1"
 }
 ok() { echo "tenant.sh $CMD ok id=$ID status=$1 seconds=$(elapsed)"; exit 0; }
+# A mounted tenant is only done once it has its test toolkit.
+mounted() { publish_test_toolkit "$ID" || fail 7 "test-toolkit-failed"; ok "$1"; }
 
 # sa sqlcmd. Fails the caller on a SQL error (-b), prints nothing extra.
 sql() { "$SQLCMD_BIN" -S "$SQL_SERVER" -U sa -C -No -b "$@"; }
@@ -175,6 +181,39 @@ purge_tenant_apps() {
     DELETE FROM [$APP_DB].dbo.[NAV App] WHERE [Tenant ID] = N'$id'" >/dev/null
 }
 
+# The test toolkit a single-tenant boot publishes (scripts/test-toolkit-order.py)
+# plus the TestRunnerExtension, published into the tenant itself. The boot wipes
+# the core test framework from the app database (BC ships it published as Global
+# and installed nowhere), while global test apps that stay installed in every
+# tenant (Application Test Library, AI Test Toolkit, ...) depend on it. Without
+# this a tenant can neither compile an ordinary test app (AL1024 on Library
+# Assert, Any, ...) nor take a Test Runner publish: BC then tries to reinstall
+# those global dependents for one tenant and refuses ("A tenant cannot be
+# specified when unpublishing this type of extension"). The extension is
+# published last and only once everything before it went in, so its presence
+# marks a complete toolkit and a repeated add skips the work.
+toolkit_installed() {
+    [ -n "$(scalar "SELECT TOP 1 N'x' FROM [$APP_DB].dbo.[Installed Application] ia
+        JOIN [$APP_DB].dbo.[Published Application] pa ON pa.[Package ID] = ia.[Package ID]
+        WHERE ia.[Tenant ID] = N'$1' AND pa.[Name] = N'Test Runner Extension'")" ]
+}
+
+publish_test_toolkit() {
+    local id="$1" app apps
+    [ "${BC_TENANT_TEST_TOOLKIT:-1}" = "0" ] && return 0
+    toolkit_installed "$id" && return 0
+    # shellcheck source=publish-app.sh
+    source "$SCRIPT_DIR/publish-app.sh"
+    apps=$(python3 "$SCRIPT_DIR/test-toolkit-order.py" /bc/artifacts) || return 1
+    [ -n "$apps" ] || { log "no test toolkit apps found under /bc/artifacts"; return 1; }
+    log "publishing the test toolkit into $id"
+    while IFS= read -r app; do
+        [ -n "$app" ] || continue
+        bc_publish_app "$app" "$DEV_URL" "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" "$id" >&2 || return 1
+    done <<< "$apps"
+    bc_publish_app /bc/testrunner/TestRunner.app "$DEV_URL" "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" "$id" >&2
+}
+
 restore_db() {
     local id="$1" data_name log_name list
     list=$(sql -h -1 -s $'\t' -W -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK = N'$TEMPLATE_BAK'" 2>/dev/null) || return 1
@@ -202,8 +241,8 @@ cmd_add() {
         sleep 2
     done
 
-    # Already serving: nothing to do.
-    if [ "$(row_state "$ID")" = "0" ] && [ "$(probe "$ID")" = "200" ]; then ok already-mounted; fi
+    # Already serving: at most the test toolkit is still missing.
+    if [ "$(row_state "$ID")" = "0" ] && [ "$(probe "$ID")" = "200" ]; then mounted already-mounted; fi
 
     local state
     state=$(db_state "$ID")
@@ -225,7 +264,7 @@ cmd_add() {
     local deadline=$(( $(date +%s) + ADD_TIMEOUT )) reinserts=0 code
     while :; do
         code=$(probe "$ID")
-        if [ "$code" = "200" ]; then ok mounted; fi
+        if [ "$code" = "200" ]; then mounted mounted; fi
         if ! row_exists "$ID"; then
             # The NST drops a tenant whose mount failed. One retry covers a mount
             # that raced the restore; a second drop is a real failure.
