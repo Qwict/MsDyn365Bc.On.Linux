@@ -18,10 +18,33 @@ Single-tenant behaviour is unchanged unless `BC_MULTITENANT=1`.
 | `DOTNET_GCHeapCount` | `4` in this mode | Server-GC heap count (hex). The .NET default is one heap per core. |
 | `BC_TENANT_ADD_TIMEOUT` | `180` | tenant.sh: seconds to wait for a mount. The first tenant after an NST start needs about 2 minutes, see Timings. |
 | `BC_TENANT_REMOVE_TIMEOUT` | `60` | tenant.sh: seconds to wait for the NST to dismount. |
+| `BC_MGMT_API` | unset | `1` enables the NST Management API (`ManagementApiServicesEnabled=true`). Honoured only together with `BC_MULTITENANT=1`; otherwise it stays off. Reconciled on every boot, but the NST reads it at start, so set it when the container is created. |
 
 `BC_SKIP_APP_PUBLISH` is forced to `true`: the container publishes nothing at boot.
 Extensions (the Test Runner Extension, test apps) are published per tenant through
 the dev endpoint, see below.
+
+## Management API (global publish)
+
+With `BC_MGMT_API=1` the NST serves its v3.0 Management API (`/v3.0/apps/publish?scope=Global`,
+`/v3.0/tenants/<id>/apps/<id>:sync|:install|:upgrade|:uninstall`, `/v3.0/operations/<id>`,
+`DELETE /v3.0/apps/<id>?version=`). An extension published with global scope is compiled
+once for the whole instance; each tenant then only syncs and installs it. Compared with a
+per-tenant publish (about 5-9 minutes of server-side compile and metadata per tenant) that is
+one compile plus about 2 minutes per tenant.
+
+- `ManagementApiServicesPort` is configured as `7086`. BC starts two endpoints on it; the
+  HttpSysStub moves the second up by one, and that second one answers `/v3.0` on **7087**
+  (measured on BC 28.4). Clients use 7087. The control plane's agent has this as one
+  constant (`MGMT_API_PORT`) and probes `/v3.0/openapi.json` once per host.
+- Authentication is basic, with the `BC_SERVER_USERNAME` / `BC_SERVER_PASSWORD` already in the
+  container environment.
+- The port is never published and is not mapped in any compose file; call it from inside the
+  container (`curl` is in the image), for example
+  `docker exec <bc> sh -c 'curl -s -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" http://localhost:7087/v3.0/apps'`.
+- Deleting a global app answers 422 while any tenant still has it installed.
+- Uninstalling Base App with data deletion (`uninstallAndDeleteExtensionData`) always fails on a
+  tenant that has it installed, with or without this flag; remove the tenant instead.
 
 ## Boot sequence
 

@@ -126,6 +126,9 @@ services:
       # usual single-tenant instance. BC_TENANT_TEMPLATE_DB names the template
       # whose backup tenants are restored from.
       BC_MULTITENANT: ${BC_MULTITENANT:-}
+      # Opt-in NST Management API for global-scope publishes; honoured only with
+      # BC_MULTITENANT=1 and never published to the host (see MULTITENANT.md).
+      BC_MGMT_API: ${BC_MGMT_API:-}
       BC_TENANT_TEMPLATE_DB: ${BC_TENANT_TEMPLATE_DB:-tenant_template}
       BC_SKIP_APP_PUBLISH: ${BC_SKIP_APP_PUBLISH:-false}
       BC_KEEP_APP_IDS: ${BC_KEEP_APP_IDS:-}
