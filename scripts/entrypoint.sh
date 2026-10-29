@@ -66,6 +66,18 @@ if [ "$BC_MULTITENANT" = "1" ]; then
     BC_SERVER_USERNAME="${BC_SERVER_USERNAME:-BCRUNNER}"
     BC_SERVER_PASSWORD="${BC_SERVER_PASSWORD:-Admin123!}"
 fi
+# Management API (BC_MGMT_API=1, multitenant only): the NST's v3.0 REST API, used
+# to publish an extension once with global scope and then sync/install it per
+# tenant (see MULTITENANT.md). Never published to the host: callers run curl
+# inside the container. Ignored unless BC_MULTITENANT=1.
+case "${BC_MGMT_API:-}" in
+    1|true|TRUE|True|yes|YES) BC_MGMT_API=1 ;;
+    *) BC_MGMT_API=0 ;;
+esac
+[ "$BC_MULTITENANT" = "1" ] || BC_MGMT_API=0
+# ManagementApiServicesPort is the base port; the second endpoint bound on it is
+# moved up by one (HttpSysStub), and that second one serves /v3.0 (measured on
+# BC 28.4: 7086 and 7087). Clients use 7087, see MULTITENANT.md.
 ARTIFACTS="/bc/artifacts"
 SERVICE_DIR="/bc/service"
 
@@ -310,7 +322,7 @@ if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
         -e "s|ManagementServicesPort\" value=\"[^\"]*\"|ManagementServicesPort\" value=\"7045\"|" \
         -e "s|ManagementApiServicesPort\" value=\"[^\"]*\"|ManagementApiServicesPort\" value=\"7086\"|" \
         -e "s|ManagementServicesEnabled\" value=\"[^\"]*\"|ManagementServicesEnabled\" value=\"false\"|" \
-        -e "s|ManagementApiServicesEnabled\" value=\"[^\"]*\"|ManagementApiServicesEnabled\" value=\"false\"|" \
+        -e "s|ManagementApiServicesEnabled\" value=\"[^\"]*\"|ManagementApiServicesEnabled\" value=\"$([ "$BC_MGMT_API" = "1" ] && echo true || echo false)\"|" \
         -e "s|DeveloperServicesPort\" value=\"[^\"]*\"|DeveloperServicesPort\" value=\"7049\"|" \
         -e "s|ServerInstance\" value=\"[^\"]*\"|ServerInstance\" value=\"BC\"|" \
         -e "s|ExtensionAllowedTargetLevel\" value=\"[^\"]*\"|ExtensionAllowedTargetLevel\" value=\"OnPrem\"|" \
@@ -383,6 +395,21 @@ if [ -f "$NST_CONFIG" ]; then
     elif grep -q '<add key="Multitenant" value="true"' "$NST_CONFIG"; then
         sed -i 's|<add key="Multitenant" value="true"|<add key="Multitenant" value="false"|' "$NST_CONFIG"
         log_step "Multitenant=false (BC_MULTITENANT is off)"
+    fi
+fi
+
+# Management API switch, reconciled every boot (only ever touched when the key
+# exists, so an instance that never had it is left alone). The flag has to be
+# present from the first boot of a container; the NST reads it at start.
+if [ -f "$NST_CONFIG" ]; then
+    if [ "$BC_MGMT_API" = "1" ]; then
+        if grep -q '<add key="ManagementApiServicesEnabled" value="false"' "$NST_CONFIG"; then
+            sed -i 's|<add key="ManagementApiServicesEnabled" value="false"|<add key="ManagementApiServicesEnabled" value="true"|' "$NST_CONFIG"
+            log_step "ManagementApiServicesEnabled=true (BC_MGMT_API=1)"
+        fi
+    elif grep -q '<add key="ManagementApiServicesEnabled" value="true"' "$NST_CONFIG"; then
+        sed -i 's|<add key="ManagementApiServicesEnabled" value="true"|<add key="ManagementApiServicesEnabled" value="false"|' "$NST_CONFIG"
+        log_step "ManagementApiServicesEnabled=false (BC_MGMT_API is off)"
     fi
 fi
 
